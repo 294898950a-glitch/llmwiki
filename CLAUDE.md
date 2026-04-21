@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-21.r2
+> **Version**: 2026-04-22.r3
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -25,20 +25,27 @@
 llmwiki/
 ├── .env                             # Notion 凭证（不入 git）
 ├── .env.example                     # 模板
-├── .gitignore
+├── .gitignore                       # 忽略 .env、raw/notion_dumps/*.jsonl 等
 ├── CLAUDE.md                        # 本文件
-├── DESIGN_REVIEW.md                 # 设计与实现差距评审
+├── DESIGN_REVIEW.md                 # 设计与实现差距评审（含 v1 八条清单）
+├── LLM_EXTRACTION_DESIGN.md         # LLM 抽取归属与执行策略决策书
+├── MERGE_STRATEGY.md                # 候选排序、冲突分级与合并策略
 ├── README.MD                        # 项目状态说明
 ├── README_REVIEW.md                 # README 与实际状态一致性评审
 ├── raw/
-│   └── notion_dumps/                # 原始资料或页面快照（本地缓存，可选）
+│   └── notion_dumps/                # 运行期产物：
+│                                    #   - YYYY-MM-DDTHHmmSSZ-inspect-schema-<role>.json（入库）
+│                                    #   - YYYY-MM-DD-audit-log.jsonl（本地，.gitignore 忽略）
+│                                    #   - YYYY-MM-DD-compile-log.jsonl（本地，.gitignore 忽略）
 ├── schema/
 │   └── notion_wiki_mapping.example.json
 ├── scripts/
-│   └── notion_wiki_compiler.py      # 最小脚本骨架
+│   └── notion_wiki_compiler.py      # Notion API 执行层，含 6 个子命令
 └── wiki/
     └── index.md                     # 历史调试遗留目录，当前不是主产物
 ```
+
+注：仓库中还存在 `.clinerules-*` 系列文件（早期 cline 角色规则），与本项目无实际绑定，未来可裁剪。
 
 ## 主流程
 
@@ -52,10 +59,11 @@ llmwiki/
 默认工作方式：
 1. 用户在 `Raw Inbox` 数据库中新建一条 page。
 2. 用户把原始材料粘贴或保存到该 page 的正文中。
-3. 系统扫描 `Status = New` 的 raw 记录。
-4. 系统自动补全或修正索引字段，例如 `Captured At`、`Type`、`Priority`、`Source URL`。
-5. 系统读取该 page body 的原始内容，送入 Wiki 编译流程。
-6. 编译完成后，系统回写 raw 记录的处理状态与目标 Wiki 页面 relation。
+3. 用户或脚本把 `Status` 置为待处理态（当前约定为 `Not started`），并可手工补 `Source URL` 等索引字段。
+4. 脚本按 `Status` 过滤出队列，递归读取 page body 原始内容，送入 Wiki 编译流程。
+5. 编译完成后，脚本回写 raw 记录的 `Status = Done` / `Processed At` / `Target Wiki Page`，并在本地 `raw/notion_dumps/*-compile-log.jsonl` 登记本次编译的 `body_hash`，用于后续 `body_hash` 幂等跳过。
+
+当前脚本**尚未**自动补 `Captured At` / `Type` / `Priority` 等索引字段——这些仍由用户在 Notion 中维护。
 
 这意味着 raw 层不是“一个字段装全部内容”，而是“数据库属性管索引，page 正文管内容本体”。
 
@@ -137,21 +145,26 @@ llmwiki/
 
 系统按下面的顺序运行：
 
-1. 用户把 raw 内容保存到 `Raw Inbox` 的某条 page 正文。
-2. 系统识别到新增或待处理记录，自动补索引字段。
-3. 系统根据 raw 的 `Status`、`Type`、`Priority` 决定是否进入编译队列。
-4. 系统读取 raw page body，提取实体、别名、主题、时间范围。
-5. 系统去 `Wiki Database` 搜索候选页面。
-6. 若命中同一知识对象，则更新已有 Wiki 页面；若未命中，则新建页面。
-7. 系统更新 Wiki 页面的属性和正文内容。
-8. 系统回写 raw 记录：
-   - `Status = Compiled`
-   - `Processed At = 当前时间`
-   - `Target Wiki Page = 对应 Wiki 页面`
+1. 用户把 raw 内容保存到 `Raw Inbox` 的某条 page 正文，并把 `Status` 置为 `Not started`（或其他约定的待处理态）。
+2. 脚本 `compile-queue --status "Not started" --limit N` 按状态过滤，逐条进入编译流程。未来计划按 `Type` / `Priority` 加筛（当前未实现）。
+3. 脚本递归读取 raw page body 全文，计算 `body_hash`。若与上次成功编译的 hash 一致则跳过（并将 `Status` 推进到 `Done`，避免 queue 重复拉取）。
+4. 脚本按 `Canonical ID → 标题 → Aliases` 顺序在 `Wiki Database` 中查询候选；多候选同策略命中直接报错停止。
+5. 命中同一知识对象时更新现有页面（追加 `增量更新` block + 可选 `--auto-refine` 启发式整理）；未命中则新建。
+6. 脚本回写 raw 记录：
+   - `Status = Done`（由 `raw_compiled_status` 配置）
+   - `Processed At = 今日日期`
+   - `Target Wiki Page = 对应 Wiki 页面 relation`
+7. 脚本把运行事件 append 到本地 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl` 与 `YYYY-MM-DD-compile-log.jsonl`，作为可回放的审计日志。
+
+**语义判断归属**：
+- 脚本层负责 Notion API、字段映射、候选查询、幂等判断等**确定性动作**。
+- 主题级判断（"这条是同一实体吗？"、"新旧结论冲突怎么处理？"、"摘要怎么写？"）归 **Claude Code 会话层**承担；详见 `LLM_EXTRACTION_DESIGN.md`。
+- `--auto-refine` 启用时脚本会用硬编码规则填一版"启发式正文"，但**不等于** LLM 判断；真正的永久笔记化仍须会话层介入。
 
 简化理解：
-- 你负责把 raw 材料放进 page body。
-- 系统负责补索引、排队、编译、回写状态。
+- 你负责把 raw 材料放进 page body 并置 `Not started`。
+- 脚本负责过滤队列、编译、幂等、回写状态、落盘日志。
+- 会话层负责主题判断、冲突解释、精修内容。
 
 ## Agent 指令基线
 
@@ -182,14 +195,18 @@ llmwiki/
 
 ## 当前可用脚本
 
-`scripts/notion_wiki_compiler.py` 提供最小能力：
-- `inspect-schema`
-- `search`
-- `compile-from-raw`
-- `upsert-note`
-- `lint`
+`scripts/notion_wiki_compiler.py` 提供 6 个子命令：
 
-第一版只追求把 Notion API 的最小闭环打通，不追求自动摘要质量。
+- `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
+- `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
+- `upsert-note`：显式传入 title/note/canonical 等直接写入 Wiki
+- `compile-from-raw <raw_page_id>`：从指定 raw page 编译到 Wiki，含 `body_hash` 幂等、raw 状态回写、可选 `--auto-refine`
+- `compile-queue --status <S> --limit N`：按 Raw Inbox Status 批量编译，失败不中断
+- `lint`：按 `Verification` 列出 Expired / Needs Review 的 Wiki 页
+
+所有子命令均写 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`（含 error 记录）。
+
+脚本本身不调用 LLM API；主题级判断由 Claude Code 会话层承担（见 `LLM_EXTRACTION_DESIGN.md`）。
 
 ## 设计评审
 
