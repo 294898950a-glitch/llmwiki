@@ -606,3 +606,94 @@ Codex v7 没捕捉到"LLM 抽取位置"从连续 6 版挂账晋升为首位 next
 - 未独立验证「幂等性与回滚」章节手工步骤在真实 Notion UI 下是否完整（尤其 Target Wiki Page relation 清空的操作路径）。
 - 未评估 Codex v7 的其它观察是否有更多漂移——本版只对"下一步顺序"做了精确复核。
 - 未讨论 README 版本号是否需要自己的版本头（类比 CLAUDE.md 的 Version 机制）。当前 README 每次大改都没有显式版本号，review 只能用 commit SHA 追踪；若后续多轮评审频率更高，README 加一个类似 `Version: 2026-04-21.rN` 的头会更方便检索。
+
+---
+
+## v9 · 2026-04-22
+
+- **评审对象**：两份新设计文档 + README.MD 未提交部分
+  - `LLM_EXTRACTION_DESIGN.md`（全新，未追踪）
+  - `MERGE_STRATEGY.md`（全新，未追踪）
+  - `README.MD`（工作树，未提交 —— 在"当前关键文件"中引用新两份文档）
+- **对照对象**：
+  - `scripts/notion_wiki_compiler.py`（`ecdfddc`，未变）
+  - `schema/notion_wiki_mapping.example.json`（`ecdfddc`，未变）
+  - DESIGN_REVIEW v1 / README_REVIEW v1-v8
+- **锚定 git 状态**：`ecdfddc`（HEAD，v8 后 Codex 又推了一笔「refine idempotency and next steps」） + 2 个未追踪新文件 + README.MD 未提交
+- **评审者**：Claude Opus 4.7 (1M context)，模型 ID `claude-opus-4-7`
+- **本版定位**：对 Codex 本轮产出的两份设计文档做内容审核 + DESIGN_REVIEW v1 回归。这是**v1 提出的 8 条意见里第一次同时推进⑤⑧两条长期挂账的版本**。
+
+### 1. DESIGN_REVIEW v1 第⑤⑧两条长期挂账已获文档层解
+
+| v1 意见 | v8 状态 | v9 状态 | 变化 |
+|---|---|---|---|
+| ⑤ 明确 LLM 抽取位置 | ⚠️ 进行中 | ✅ **决策文档已产出** | `LLM_EXTRACTION_DESIGN.md` 正式定调："LLM 放在 Claude Code 会话层，脚本不接入模型 API" |
+| ⑧ 冲突 diff | ⚠️ 文档层部分回应 | ✅ **策略文档已产出** | `MERGE_STRATEGY.md` 给出 4 tier 候选排序 + 3 档风险等级 + 停下来问用户条件；代码层未实现，但判据已稳定 |
+
+**DESIGN_REVIEW v1 完成率**：
+- 文档层：**7/8**（剩 ⑦ CLAUDE.md 目录树未修）
+- 代码层硬完成：5/8（①②③④⑥；⑤ 明确不做进脚本所以"代码层不必做"；⑧ 策略已定但代码未实现）
+
+### 2. `LLM_EXTRACTION_DESIGN.md` 内容审核
+
+**正面**：
+- 决策立场清晰：脚本层确定性 I/O / LLM 层语义判断，分层干净。
+- "暂不把 LLM 调用写死进脚本"的理由（prompt 不稳、schema 变化快、策略未定）有说服力——符合当前项目阶段。
+- 模式 A（人审 + agent 执行）→ 模式 B（agent 自动判断）的演进路径合理。
+- 明确了"什么时候再把 LLM 下沉到脚本"的四条退出条件，避免决策永远挂着。
+
+**值得收紧的点**：
+- **"Claude Code 会话" = 哪个模型？** 文档把 LLM 层放在 "Claude Code 会话"，但本仓库当前实际是 **Opus 4.7（review）+ GPT-5 Codex（主产物）** 并存。候选判断、冲突解释在不同模型上结果会不一样。建议补一句"LLM 抽取层的模型选择、模型版本需在每次写入时记录到 raw/notion_dumps/ 或 smoke log"，对齐 review 文档已经在做的"每版标注模型 ID"实践。
+- **无法使用 Claude Code 会话时的 fallback 未定义**：模式 B 隐含假设永远有会话在；但若未来要 cron / CI / webhook 触发，"LLM 层 = Claude Code 会话" 这个等式会断裂。文档可以加一句"离线触发场景显式不支持，需经模式 B 演进后另行设计"。
+- **决策的生效时间 / 有效期未写**：每条都是"当前阶段"。若 2026-06 回看，怎么知道这份决策是否过期？建议加 `Decision Date: 2026-04-22` 与 `Revisit Trigger: smoke 跑过 N 条后 / 脚本做批量队列时`。
+
+### 3. `MERGE_STRATEGY.md` 内容审核
+
+**正面**：
+- 4 tier 候选排序（Canonical ID → 标题精确 → Aliases → 主题相近）与当前 `upsert_note_to_wiki:393-416` 的查找顺序**一致**。
+- 3 档风险等级 + 3 种行为（append / append 标差异 / 停下来问）分层清楚，可执行。
+- "幂等性前置定义" 明确要求 raw body hash + 上次成功 wiki page id，把幂等实现的前置条件写出来了——这是 README step 3 的真正设计稿。
+
+**与脚本现状的冲突**（需在 review 里标出）：
+- **脚本当前行为违反 MERGE_STRATEGY 多条约束**：
+  - 策略 tier 3（Aliases 命中）说"需要结合主题上下文做二次判断，不能只因为 alias 命中就盲目合并"；脚本 `upsert_note_to_wiki:411-414` 里 `page_matches_query` 命中 alias 就直接当 `exact_match` 进 append 路径，没有二次判断。
+  - 策略"高风险冲突停止自动写入"；脚本里没有任何"停止"分支，upsert 永远会 append 或新建。
+  - 策略"同一个 raw 可能应拆成多个页面要停下来问用户"；脚本不支持一对多，所有 compile-from-raw 只产出一个 wiki 页。
+- **建议的收敛方向**：MERGE_STRATEGY.md 应明确声明"当前脚本仅实现 tier 1-3 的查找，tier 3 的二次判断与高风险停止目前由 Claude Code 会话承担"。现在的文档措辞"当前系统不做自动 diff merge"偏弱，读者容易误以为脚本已经在执行策略；实际上脚本只是不做 diff，其他约束（二次判断、停下来问）也没做。
+
+**值得收紧的点**：
+- "raw page 的 body hash" 未指明是 markdown 序列化后 hash、还是 rich_text block 原文 hash、还是 retrieve_block_children 原始 JSON hash。三者对同一页面可能产生不同 hash（空格、换行、富文本标记差异），需要在下次实现前定死。
+- "记录该 raw page 最近一次成功写入的 wiki page id" —— 脚本已经会把 `Target Wiki Page` 回写到 raw 记录了（`:500-503`），这已经是 wiki page id 的登记。可以直接复用，不需要新建字段。MERGE_STRATEGY.md 可以点名这一点，避免将来误加新字段。
+- tier 4（主题相近但无明确标识）的"优先停下来让 Claude Code 会话解释候选页差异"——若要能停下来，脚本需要一个 `--interactive` 或 `--dry-run` 模式，目前没有。这是 MERGE_STRATEGY 真正落地前要加的脚手架。
+
+### 4. README 新的漂移（由两份设计文档的出现引起）
+
+- README「下一步」step 1（"明确真正的 LLM 抽取放在哪一层执行"）**已完成**，LLM_EXTRACTION_DESIGN.md 就是答案。下一次 Codex 改 README 时应把 step 1 删除，或改为"执行 LLM_EXTRACTION_DESIGN.md 里模式 A 的首轮 smoke"。
+- README「下一步」step 2（"补更强的候选排序、冲突处理与合并策略"）**文档层已完成**，MERGE_STRATEGY.md 就是策略。但代码层尚未按策略加 tier 3 二次判断 / tier 4 停下来问的能力。step 2 应拆成 2a（策略文档 ✅）和 2b（脚本按策略增加停顿点 ❌）。
+- README「限制」段未反映两份新文档的存在。"还没有自动回滚能力"这句现在应该补一句"但候选排序 / 冲突处理 / LLM 归属已有书面策略，见 MERGE_STRATEGY / LLM_EXTRACTION_DESIGN"。
+
+### 5. `ecdfddc` 的 review 回填
+
+v8 指出当前工作树的 README 改动归 Codex 提交；Codex 已在 `ecdfddc docs: refine idempotency and next steps` 完成提交，分工边界被尊重。review 文档里不需要为这条补充，仅此标注。
+
+### 6. 仍未修的旧挂账
+
+- **CLAUDE.md 目录树**（v1/v2/v3/v5/v6/v8/v9 连续挂账）：`raw/.sync_state.json` 仍列但不存在；目录树仍未列 `DESIGN_REVIEW.md` / `README.MD` / `README_REVIEW.md` / `LLM_EXTRACTION_DESIGN.md`（新增）/ `MERGE_STRATEGY.md`（新增）/ `.clinerules-*` / `wiki/index.md`。这份清单越来越长，建议 Codex 下一轮 CLAUDE.md 编辑时统一扫一遍。
+- **`raw/notion_dumps/` 仍为空**（v2/v3/v5/v6/v8/v9 挂账）：现在有了 LLM_EXTRACTION_DESIGN 的决策，就**更应该**开始把会话层判断的 prompt / 输入 / 模型 ID / 判断结果落盘，否则模式 A 跑几轮就无法回放。
+- **commit 粒度示例 vs 实际**（v2/v3/v5/v8/v9 挂账）。
+- **代码层技术债**（v6/v8 标注）：`find_pages_by_canonical_id` 全表扫 / `search_in_database` aliases 假设 rich_text / `query_database_pages` 无熔断 / `extract_property_text` 多类型静默返空。以上四条自 v6 起仍未偿还。
+
+### 7. 分工下的建议：记 LLM 层执行日志
+
+`LLM_EXTRACTION_DESIGN.md` 把 LLM 抽取固定在 Claude Code 会话层，但没说明每次会话判断如何留痕。建议约定：
+
+- 每次对 raw 做判断（选候选 / 合并 or 新建 / 标风险），在 `raw/notion_dumps/` 下落一份 `YYYY-MM-DD-<raw-page-short>.jsonl`，每行记录：模型 ID / 判断时间 / 输入（raw page id、候选 page ids）/ 决策（tier 几、更新还是新建、风险等级）/ 输出（写入的 wiki page id）。
+- 这样模式 A 跑到模式 B 切换时，有一批真实案例可作回归基准。
+
+如果 Codex 同意，MERGE_STRATEGY.md 和 LLM_EXTRACTION_DESIGN.md 可以各加一节 "执行日志约定" 指向 `raw/notion_dumps/` —— 也顺手把空目录挂账清了。
+
+### 8. 本版未覆盖
+
+- 未实测 MERGE_STRATEGY 策略下的某条真实 raw：比如"aliases 命中需二次判断"场景脚本会不会误合并（静读推断会误合并，但未实跑）。
+- 未评估 LLM_EXTRACTION_DESIGN 的 "模式 B 退出条件" 是否可量化（"smoke test 不止一轮"需多少轮？"schema 基本固定"由谁判断？）。
+- 未对 `.clinerules-*` 5 个文件做独立审核 —— 这组文件自 `cd4d3ee` 起一直在仓库里但从未被任何 review 引用过，可能已失效或与本项目脱钩。
