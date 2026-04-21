@@ -25,6 +25,7 @@
 - 字段映射模板已建立：
   - [`schema/notion_wiki_mapping.example.json`](./schema/notion_wiki_mapping.example.json)
 - Raw / Wiki 两个 Notion 数据库的 schema 已完成首次探测
+- 第一次真实 `compile-from-raw` smoke test 已通过
 
 当前脚本支持的命令：
 
@@ -87,6 +88,10 @@
   - `Compounded Level`: `number`
   - `Last Compounded At`: `date`
   - `Verification`: `status`
+- 已完成一次真实 smoke test：
+  - Raw page：`3496e2cd-6e4f-81a2-988a-c9fd757c1b42`
+  - Wiki page：`3496e2cd-6e4f-816e-919b-fd80753dcc9b`
+  - 闭环已验证：`raw -> wiki -> raw 回写`
 
 ## 当前限制
 
@@ -105,19 +110,19 @@
   - 还没有递归处理深层嵌套 block
 - 还没有批量编译队列：
   - 目前是 `compile-from-raw <page_id>` 单条运行
-- 虽然已经完成 schema 对齐，但第一次真实写入还没跑：
-  - 还没有做过真实 `compile-from-raw` 的烟雾测试
-  - 还没有验证 raw -> wiki -> raw 回写的端到端行为
+- 虽然 smoke test 已通过，但还存在实现层限制：
+  - `search_in_database` 仍使用全局 `/search`，不是 `query_database`
+  - 仍未实现 `Canonical ID + Aliases` 优先匹配
+  - 还没有幂等性与冲突处理策略
 
 ## 下一步
 
 建议按这个顺序继续：
 
-1. 根据真实字段名更新 `schema/notion_wiki_mapping.example.json`。
-2. 选一条 raw page 做第一次真实 `compile-from-raw`
-3. 将 `search_in_database` 改成 `query_database` 属性过滤
-4. 补 `Canonical ID` 和 `Aliases` 匹配
-5. 再决定是否接入真正的 LLM 抽取与冲突处理
+1. 将 `search_in_database` 改成 `query_database` 属性过滤
+2. 补 `Canonical ID` 和 `Aliases` 匹配
+3. 增加 smoke test 的幂等性检查与回滚说明
+4. 再决定是否接入真正的 LLM 抽取与冲突处理
 
 ## 版本控制
 
