@@ -93,6 +93,9 @@ class NotionClient:
     def append_block_children(self, block_id: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
         return self.request("PATCH", f"blocks/{block_id}/children", {"children": children})
 
+    def delete_block(self, block_id: str) -> Dict[str, Any]:
+        return self.request("DELETE", f"blocks/{block_id}")
+
 
 def require_env(env: Dict[str, str], key: str) -> str:
     value = env.get(key, "").strip()
@@ -397,6 +400,34 @@ def find_last_successful_compile(raw_page_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def find_prior_compile_by_body_hash(body_hash: str, exclude_raw_page_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    dump_dir = ensure_raw_dumps_dir()
+    exclude_norm = normalize_notion_id(exclude_raw_page_id) if exclude_raw_page_id else ""
+    for path in sorted(dump_dir.glob("*-audit-log.jsonl"), reverse=True):
+        for event in reversed(load_jsonl(path)):
+            if event.get("command") != "compile-from-raw":
+                continue
+            if event.get("status") != "success":
+                continue
+            if event.get("body_hash") != body_hash:
+                continue
+            if exclude_norm and normalize_notion_id(event.get("raw_page_id")) == exclude_norm:
+                continue
+            return event
+    return None
+
+
+def find_last_compile_queue_failures() -> List[str]:
+    dump_dir = ensure_raw_dumps_dir()
+    for path in sorted(dump_dir.glob("*-audit-log.jsonl"), reverse=True):
+        for event in reversed(load_jsonl(path)):
+            if event.get("command") != "compile-queue":
+                continue
+            failures = event.get("failures") or []
+            return [f.get("raw_page_id") for f in failures if f.get("raw_page_id")]
+    return []
+
+
 def detect_command_name(argv: List[str]) -> str:
     known_commands = {
         "inspect-schema",
@@ -405,6 +436,8 @@ def detect_command_name(argv: List[str]) -> str:
         "compile-queue",
         "upsert-note",
         "lint",
+        "log-session-event",
+        "cleanup-wiki-page",
     }
     for token in argv:
         if token in known_commands:
@@ -1065,6 +1098,18 @@ def upsert_note_to_wiki(
     exact_match = matched_candidates[0][0] if matched_candidates else None
     match_strategy = matched_candidates[0][1] if matched_candidates else "created"
 
+    if match_strategy == "alias" and getattr(args, "strict_alias", False):
+        raise NotionError(
+            f"Alias match on wiki page {exact_match.get('id')!r} requires explicit confirmation; "
+            "rerun without --strict-alias, or adjust Canonical ID/title first."
+        )
+    if match_strategy == "alias":
+        print(
+            f"WARN: matched via alias on wiki page {exact_match.get('id')!r}; "
+            "review_required=true recorded. Use --strict-alias to hard-stop on alias hits.",
+            file=sys.stderr,
+        )
+
     append_heading = args.append_heading or mapping.get("append_heading", "增量更新")
     if exact_match:
         properties = build_properties(database, mapping, args)
@@ -1082,6 +1127,7 @@ def upsert_note_to_wiki(
             "title": args.title,
             "match_strategy": match_strategy,
             "candidate_count": len(candidates),
+            "review_required": match_strategy == "alias",
         }
 
     payload: Dict[str, Any] = {
@@ -1241,6 +1287,38 @@ def compile_raw_page(
                 "reason": "body_hash_unchanged",
             }
 
+    if not getattr(args, "force", False):
+        cross_match = find_prior_compile_by_body_hash(body_hash, exclude_raw_page_id=raw_page_id)
+        if cross_match:
+            raw_props_meta = raw_database.get("properties", {})
+            status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
+            compiled_status = args.raw_compiled_status or mapping.get("raw_compiled_status", "Compiled")
+            skipped_raw_updates: Dict[str, Any] = {}
+            if status_prop_name and status_prop_name in raw_props_meta:
+                current_status = extract_property_text(raw_page, status_prop_name)
+                if current_status != compiled_status:
+                    skipped_raw_updates[status_prop_name] = property_payload_for_value(
+                        raw_props_meta[status_prop_name], compiled_status
+                    )
+            if skipped_raw_updates:
+                client.update_page(raw_page_id, {"properties": skipped_raw_updates})
+            print(
+                f"WARN: body_hash already compiled from raw {cross_match.get('raw_page_id')!r}; "
+                "skipping to avoid duplicate write. Use --force to override.",
+                file=sys.stderr,
+            )
+            return {
+                "timestamp": iso_now(),
+                "action": "skipped_duplicate_body",
+                "raw_page_id": raw_page_id,
+                "raw_title": title,
+                "body_hash": body_hash,
+                "wiki": cross_match.get("wiki"),
+                "raw_updates": list(skipped_raw_updates.keys()),
+                "originating_raw_page_id": cross_match.get("raw_page_id"),
+                "reason": "body_hash_matches_different_raw",
+            }
+
     source_prop_name = args.raw_source_url_property or mapping.get("raw_source_url_property")
     source_url = extract_property_text(raw_page, source_prop_name) if source_prop_name else None
 
@@ -1259,6 +1337,7 @@ def compile_raw_page(
         verification_property=args.verification_property,
         compounded_level_property=args.compounded_level_property,
         last_compounded_at_property=args.last_compounded_at_property,
+        strict_alias=getattr(args, "strict_alias", False),
     )
     wiki_result = upsert_note_to_wiki(client, wiki_database_id, mapping, upsert_args)
 
@@ -1421,21 +1500,48 @@ def command_compile_queue(
     args: argparse.Namespace,
 ) -> int:
     raw_database = client.retrieve_database(raw_database_id)
-    status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
-    status_prop_meta = raw_database.get("properties", {}).get(status_prop_name, {})
-    status_prop_type = status_prop_meta.get("type")
-    if not status_prop_name or not status_prop_type:
-        raise NotionError("Raw status property not found; pass --raw-status-property or update mapping")
+    raw_page_ids: List[str] = []
+    filter_description: Dict[str, Any] = {}
 
-    filter_body = {"property": status_prop_name, status_prop_type: {"equals": args.status}}
-    raw_pages = query_database_pages(client, raw_database_id, filter_body, page_size=min(args.limit, 20) if args.limit else 20)
-    if args.limit:
-        raw_pages = raw_pages[: args.limit]
+    if getattr(args, "retry_failed", False):
+        raw_page_ids = find_last_compile_queue_failures()
+        filter_description = {"mode": "retry_failed", "source": "last compile-queue audit entry"}
+        if not raw_page_ids:
+            print(
+                json.dumps(
+                    audit_success(
+                        "compile-queue",
+                        {
+                            **filter_description,
+                            "compiled_count": 0,
+                            "failure_count": 0,
+                            "results": [],
+                            "failures": [],
+                            "note": "no prior failures found in audit-log",
+                        },
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+    else:
+        status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
+        status_prop_meta = raw_database.get("properties", {}).get(status_prop_name, {})
+        status_prop_type = status_prop_meta.get("type")
+        if not status_prop_name or not status_prop_type:
+            raise NotionError("Raw status property not found; pass --raw-status-property or update mapping")
+
+        filter_body = {"property": status_prop_name, status_prop_type: {"equals": args.status}}
+        raw_pages = query_database_pages(client, raw_database_id, filter_body, page_size=min(args.limit, 20) if args.limit else 20)
+        if args.limit:
+            raw_pages = raw_pages[: args.limit]
+        raw_page_ids = [page.get("id") for page in raw_pages if page.get("id")]
+        filter_description = {"status_filter": args.status, "requested_limit": args.limit}
 
     results: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
-    for page in raw_pages:
-        page_id = page.get("id")
+    for page_id in raw_page_ids:
         if not page_id:
             continue
         try:
@@ -1449,8 +1555,7 @@ def command_compile_queue(
             audit_success(
                 "compile-queue",
                 {
-                    "status_filter": args.status,
-                    "requested_limit": args.limit,
+                    **filter_description,
                     "compiled_count": len(results),
                     "failure_count": len(failures),
                     "results": results,
@@ -1510,6 +1615,104 @@ def command_lint(client: NotionClient, database_id: str, mapping: Dict[str, Any]
     return 0
 
 
+def command_log_session_event(args: argparse.Namespace) -> int:
+    allowed_tiers = {"canonical_id", "title", "alias", "fuzzy", "none"}
+    allowed_decisions = {"update", "create", "ask_user", "skip"}
+    allowed_risks = {"low", "medium", "high"}
+    if args.tier not in allowed_tiers:
+        raise NotionError(f"--tier must be one of {sorted(allowed_tiers)}")
+    if args.decision not in allowed_decisions:
+        raise NotionError(f"--decision must be one of {sorted(allowed_decisions)}")
+    if args.risk not in allowed_risks:
+        raise NotionError(f"--risk must be one of {sorted(allowed_risks)}")
+
+    event: Dict[str, Any] = {
+        "timestamp": iso_now(),
+        "model": args.model,
+        "raw_page_id": args.raw_page_id,
+        "wiki_page_id": args.wiki_page_id,
+        "tier": args.tier,
+        "decision": args.decision,
+        "risk": args.risk,
+        "notes": args.notes or "",
+    }
+    if args.input_json:
+        try:
+            event["input"] = json.loads(args.input_json)
+        except json.JSONDecodeError as exc:
+            raise NotionError(f"--input-json is not valid JSON: {exc}") from exc
+
+    log_path = append_jsonl_log(daily_log_filename("session-log.jsonl"), event)
+    event["log_path"] = str(log_path)
+    print(json.dumps(audit_success("log-session-event", event), ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) -> int:
+    page_id = args.page_id
+    append_heading_prefix = args.heading_prefix or "增量更新"
+    blocks = iterate_block_children(client, page_id)
+
+    sections: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]] = []
+    current: Optional[Tuple[Dict[str, Any], List[Dict[str, Any]]]] = None
+    for block in blocks:
+        heading_text = ""
+        if block.get("type") == "heading_2":
+            heading_text = rich_text_plain_text(block.get("heading_2", {}).get("rich_text", []))
+        if heading_text.startswith(append_heading_prefix):
+            if current is not None:
+                sections.append(current)
+            current = (block, [])
+        elif current is not None:
+            current[1].append(block)
+    if current is not None:
+        sections.append(current)
+
+    seen: Dict[str, int] = {}
+    to_delete: List[Dict[str, Any]] = []
+    kept_indices: List[int] = []
+    for idx, (heading, body) in enumerate(sections):
+        key_parts = [extract_block_text(b) for b in body]
+        key = "\n".join(p for p in key_parts if p).strip()
+        if not key:
+            kept_indices.append(idx)
+            continue
+        if key in seen:
+            older_idx = seen[key]
+            older_heading, older_body = sections[older_idx]
+            to_delete.append(older_heading)
+            to_delete.extend(older_body)
+            if older_idx in kept_indices:
+                kept_indices.remove(older_idx)
+        seen[key] = idx
+        kept_indices.append(idx)
+
+    deleted_ids: List[str] = []
+    for block in to_delete:
+        block_id = block.get("id")
+        if not block_id:
+            continue
+        if getattr(args, "dry_run", False):
+            deleted_ids.append(block_id)
+            continue
+        try:
+            client.delete_block(block_id)
+            deleted_ids.append(block_id)
+        except NotionError as exc:
+            print(f"WARN: failed to delete block {block_id}: {exc}", file=sys.stderr)
+
+    payload = {
+        "wiki_page_id": page_id,
+        "dry_run": getattr(args, "dry_run", False),
+        "sections_total": len(sections),
+        "sections_kept": len(kept_indices),
+        "blocks_removed": len(deleted_ids),
+        "removed_block_ids": deleted_ids,
+    }
+    print(json.dumps(audit_success("cleanup-wiki-page", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal Notion Wiki compiler for llmwiki")
     parser.add_argument("--env-file", default=str(ENV_PATH), help="Path to .env file")
@@ -1545,6 +1748,7 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--raw-compiled-status")
     compile_parser.add_argument("--force", action="store_true")
     compile_parser.add_argument("--auto-refine", action="store_true")
+    compile_parser.add_argument("--strict-alias", action="store_true")
 
     queue_parser = subparsers.add_parser("compile-queue")
     queue_parser.add_argument("--status", default="Not started")
@@ -1568,6 +1772,8 @@ def build_parser() -> argparse.ArgumentParser:
     queue_parser.add_argument("--raw-compiled-status")
     queue_parser.add_argument("--force", action="store_true")
     queue_parser.add_argument("--auto-refine", action="store_true")
+    queue_parser.add_argument("--strict-alias", action="store_true")
+    queue_parser.add_argument("--retry-failed", action="store_true")
 
     upsert_parser = subparsers.add_parser("upsert-note")
     upsert_parser.add_argument("--title", required=True)
@@ -1584,6 +1790,22 @@ def build_parser() -> argparse.ArgumentParser:
     upsert_parser.add_argument("--verification-property")
     upsert_parser.add_argument("--compounded-level-property")
     upsert_parser.add_argument("--last-compounded-at-property")
+    upsert_parser.add_argument("--strict-alias", action="store_true")
+
+    session_parser = subparsers.add_parser("log-session-event")
+    session_parser.add_argument("--model", required=True, help="Model id making the decision (e.g. claude-opus-4-7)")
+    session_parser.add_argument("--raw-page-id", default="", help="Raw Inbox page id the decision concerns (optional)")
+    session_parser.add_argument("--wiki-page-id", default="", help="Wiki page id the decision concerns (optional)")
+    session_parser.add_argument("--tier", required=True, help="Match tier: canonical_id|title|alias|fuzzy|none")
+    session_parser.add_argument("--decision", required=True, help="Action taken: update|create|ask_user|skip")
+    session_parser.add_argument("--risk", default="low", help="Risk level: low|medium|high")
+    session_parser.add_argument("--notes", default="", help="Free-form explanation")
+    session_parser.add_argument("--input-json", default="", help="Optional JSON blob of input context (candidates, excerpts)")
+
+    cleanup_parser = subparsers.add_parser("cleanup-wiki-page")
+    cleanup_parser.add_argument("page_id")
+    cleanup_parser.add_argument("--heading-prefix", default="增量更新", help="Only de-duplicate sections whose heading_2 starts with this prefix")
+    cleanup_parser.add_argument("--dry-run", action="store_true", help="Report what would be deleted without calling Notion delete API")
 
     lint_parser = subparsers.add_parser("lint")
     lint_parser.add_argument("--title-property")
@@ -1627,6 +1849,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if args.command == "upsert-note":
         return command_upsert(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "log-session-event":
+        return command_log_session_event(args)
+    if args.command == "cleanup-wiki-page":
+        return command_cleanup_wiki_page(client, args)
     if args.command == "lint":
         return command_lint(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     parser.error(f"Unknown command: {args.command}")
