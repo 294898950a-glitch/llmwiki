@@ -261,3 +261,131 @@ README 现列的 5 步：
 - 未调用 Notion API 验证新 Wiki 8 个字段的真实类型是否与 README 声明一致（尤其是 `Aliases` / `Topic` 的类型未在 README 里点明 —— 可能是 multi_select、rich_text、relation 之一）。
 - 未实际跑 `compile-from-raw` smoke test。
 - 未评估 `Compounded Level` 升级为 `number` 后，若已有历史 `rich_text` 数据会如何迁移。
+
+---
+
+## v4 · 2026-04-21
+
+- **评审对象**：`README.MD`（工作树，未提交 —— 已纳入 smoke test 实测结果）
+- **对照对象**：
+  - `CLAUDE.md` (Version 2026-04-21.r2)
+  - `scripts/notion_wiki_compiler.py`（工作树）
+  - `schema/notion_wiki_mapping.example.json`（工作树）
+  - Notion API 实测结果（raw/wiki schema + 一次真实 `compile-from-raw`）
+- **锚定 git 状态**：`cb0b27c`（HEAD） + `README.MD` / `README_REVIEW.md` / `schema/notion_wiki_mapping.example.json` / `scripts/notion_wiki_compiler.py` 未提交
+- **评审者**：GPT-5 Codex
+
+### 1. 本版新增事实
+
+- 一次真实 smoke test 已完成，且闭环成功：
+  - raw page：`3496e2cd-6e4f-81a2-988a-c9fd757c1b42`
+  - wiki page：`3496e2cd-6e4f-816e-919b-fd80753dcc9b`
+- raw 回写成功覆盖：
+  - `Status`
+  - `Processed At`
+  - `Target Wiki Page`
+- `raw_compiled_status` 已从 `Compiled` 修正为 `Done`，以匹配 Raw Inbox 当前 status 选项。
+- `compile-from-raw` 暴露并修复了一处实现 bug：
+  - `.env` 中无连字符数据库 ID 与 Notion API 返回的带连字符 parent id 做字符串直比较，导致误判“Raw page does not belong to NOTION_RAW_INBOX_DB_ID”
+  - 现已通过 `normalize_notion_id()` 修复
+
+### 2. README 声明 vs 实际核对
+
+| README 声明 | 实际状态 | 判定 |
+|---|---|---|
+| 第一次真实 `compile-from-raw` smoke test 已通过 | 已由 Notion API 实测验证 | ✅ |
+| 闭环 `raw -> wiki -> raw 回写` 已验证 | 已由实测结果验证 | ✅ |
+| `raw_compiled_status` 对应 Raw 状态选项 | 当前 mapping 已写成 `Done`，与 Raw status 选项一致 | ✅ |
+
+### 3. 剩余关键问题
+
+按优先级排序：
+
+1. **搜索仍用全局 `/search`**：这仍是下一阶段最该改的点，否则 canonical/aliases 匹配会继续受限。
+2. **匹配仍以标题为主**：虽然 schema 已就位，但 `Canonical ID + Aliases` 逻辑还没实现。
+3. **幂等性策略还没定义**：同一 raw page 重跑会更新既有 wiki 页，但 README 还没说明 smoke test 的回滚/复跑约定。
+4. **LLM 抽取位置仍未定**：这条旧问题仍然存在。
+
+### 4. README 当前是否准确
+
+当前 README 已从“准备 smoke test”更新为“smoke test 已通过”，这比 v3 更接近真实状态。未发现新的虚报。
+
+---
+
+## v5 · 2026-04-21
+
+- **评审对象**：`README.MD`（工作树，未提交 —— 含 smoke test 通过记录与限制/下一步改写）
+- **对照对象**：
+  - `CLAUDE.md` (Version 2026-04-21.r2)
+  - `scripts/notion_wiki_compiler.py`（工作树 —— 新增 `normalize_notion_id`）
+  - `schema/notion_wiki_mapping.example.json`（工作树 —— `raw_compiled_status` 改为 `Done`）
+  - `README_REVIEW.md` v4（由 GPT-5 Codex 追加）
+  - Notion API 实测结果（由 v4 报告）
+- **锚定 git 状态**：`a833892`（HEAD） + 4 个未提交修改（`README.MD` / `README_REVIEW.md` / `schema/...` / `scripts/...`）
+- **评审者**：Claude Opus 4.7 (1M context)，模型 ID `claude-opus-4-7`
+- **相对 v4 定位**：v4（Codex）已记录 smoke test 事实、ID 归一化 bug 修复、`raw_compiled_status` 调整；本版以 Opus 4.7 视角**补全 v4 未覆盖的部分**——DESIGN_REVIEW 八条清单进度、旧挂账债务回归、smoke artifact 持久化缺口、代码细节复核。两版并存、互为补充。
+
+### 1. 对 v4 事实的独立复核
+
+- ✅ `normalize_notion_id` 函数确已在脚本中落地（`:134-137`）。
+- ✅ 应用点有两处：`search_in_database:204`（顺带加固，未在 v4 提及）和 `command_compile_from_raw:376`（v4 记录的 bug 修复点）。这是**正确的扩展**——原 `/search` 路径也会遭遇相同比较问题，提前修好。
+- ✅ `raw_compiled_status: "Done"` 在 `schema/notion_wiki_mapping.example.json:15`。
+- ⚠️ v4 未评估的一点：`compile-from-raw` 里 `source_url` 如果是 relation 或 rollup 类型属性，`extract_property_text:156-171` 会静默返回空串。这在 smoke test 对 `Source URL`（rich_text 或 url）场景下不会暴露，但换一个 raw page 可能会踩到。
+
+### 2. DESIGN_REVIEW v1 八条清单进度（v5 回归）
+
+| v1 意见 | v3 状态 | v5 状态 | 变化 |
+|---|---|---|---|
+| ① 拆双 DB id | ✅ | ✅ | — |
+| ② 读 raw body | ✅ | ✅ | — |
+| ③ canonical_id / aliases 匹配 | ❌ | ❌ | README 步骤 2 |
+| ④ Raw 状态回写 | ✅✅ | ✅✅✅ | smoke test 真机验证通过，质量再提升 |
+| ⑤ 明确 LLM 抽取位置 | ❌ | ❌ | README 步骤 4 仍"再决定"；**连续四版挂账** |
+| ⑥ `/search` → `query_database` | ❌ | ❌ | README 步骤 1 |
+| ⑦ 澄清 `raw/.sync_state.json` | ❌ | ❌ | CLAUDE.md 目录树仍未修 |
+| ⑧ 冲突 diff | ❌ | ❌ | README 限制段新增"幂等性与冲突处理策略"，间接认账 |
+
+**完成率**：仍 3/8，但 ④ 从"代码支持"进化到"真机验证"，质量继续提升。
+
+### 3. smoke test 后暴露的审计缺口
+
+README 把 smoke test 的 raw page id / wiki page id 写进了正文（`README.MD:93-95`），但：
+
+- **没有落盘原始输出**：`compile-from-raw` 的 stdout JSON、`inspect-schema` 的 schema 快照都应该按时间戳写到 `raw/notion_dumps/` 或新建 `schema/snapshots/`。`raw/notion_dumps/` 目前仍空（v1/v2/v3 挂账），这违反 CLAUDE.md「三级编译 / raw 层审计」的设计本意。
+- **smoke test 的复现路径不存在**：README 只记录了 page id 和"已通过"，没有记录输入数据、环境变量、命令参数、执行时间。下次有人想复跑（或验证是否回归），只能重新摸索。建议补一个 `SMOKE_TESTS.md` 或把这次运行日志直接贴进 `raw/notion_dumps/2026-04-21-smoke.json`。
+
+### 4. 「下一步」4 步方案合理性
+
+README 新列的 4 步：
+
+1. `search_in_database` 改 `query_database`
+2. 补 `Canonical ID` / `Aliases` 匹配
+3. 增加 smoke test 的幂等性检查与回滚说明
+4. 再决定是否接入真正的 LLM 抽取与冲突处理
+
+**合理的部分**：
+- 步骤顺序严格继承了 v1 / v2 / v3 review 的建议——`query_database` 前置于 canonical 匹配。
+- 新增步骤 3（幂等性 + 回滚）是直接回应 v3 review 的"smoke test rollback 锚点"建议，已落地。
+
+**需要收紧的部分**：
+- **步骤 3 的"回滚说明"应包含具体的反向操作**：重跑同一 raw page 会怎样？是 upsert 语义（同标题更新）还是重复建页？这里依赖 `upsert_note_to_wiki` 只按 normalize-equal 标题匹配——如果 smoke 产生的 wiki 页标题 = raw 标题，重跑会命中并 append 新的 `增量更新` 段，不会重建；但 append-only 语义本身就是 DESIGN_REVIEW v1 第⑧条(冲突 diff)的债。建议步骤 3 先明确「reset 方式 = 手工到 Notion 删除指定 page id」或「软回滚 = 把 Raw Status 改回 New 后重跑」。
+- **步骤 4「再决定」已连续四版挂账**（v1-v5 都提）：到步骤 2 完成前必须定，否则 v6 review 继续重复这条。可以考虑直接开一张 `LLM_EXTRACTION_DESIGN.md` 来收敛决策。
+
+### 5. 仍未修的旧漂移（独立挂账清单）
+
+- **CLAUDE.md 目录树**（v1/v2/v3 连续挂账）：`raw/.sync_state.json` 仍列着但不存在；`DESIGN_REVIEW.md` / `README.MD` / `README_REVIEW.md` / `.clinerules-*` / `wiki/index.md` 仍未列入。此次 README 改动未动 CLAUDE.md，目录树继续漂。
+- **`raw/notion_dumps/` 仍为空**（v2/v3/v5 挂账）：见本版第 3 节。
+- **commit 粒度示例 vs 实际 git log**（v2/v3 挂账）：README 示例的 4 条 fake commit 仍在，与实际 `a833892` / `ab534f7` / `cb0b27c` / `d6fe4dd` / `86e75bc` 不对应。
+
+### 6. 关于多模型评审
+
+本文档现已同时存在 Opus 4.7（v1/v2/v3/v5）与 GPT-5 Codex（v4）的评审。建议：
+
+- **保留多模型视角**：不同模型的覆盖盲点不同。v4 专注事实记录，v1-v3/v5 更重进度表与挂账追踪。并存是信号，不是冗余。
+- **评审者字段应包含模型标识**：v4 写的是"GPT-5 Codex"，v1-v3/v5 是"Claude Opus 4.7"，目前已做到。后续评审建议统一补充具体模型 ID / 日期 / 会话锚定，方便追溯每条意见的出处。
+
+### 7. 本版未覆盖
+
+- 未独立验证 smoke test 成功的 page id 是否真存在于 Notion（信任 v4 的实测结论）。
+- 未评估 `normalize_notion_id` 是否覆盖其他 ID 比较路径（如 `wiki_result["page_id"]` 作为 relation 传回时是否需要归一化—— Notion API 接收 relation id 时两种格式都接受，所以应该不需要，但值得 smoke 多条后再确认）。
+- 未评估重跑同一 raw page 时 `Target Wiki Page` relation 回写是否会生成重复项（Notion relation 默认是 set 语义，应当自动去重，但未实测）。
