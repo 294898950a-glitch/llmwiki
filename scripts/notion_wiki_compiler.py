@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import difflib
 import hashlib
 import json
 import re
@@ -372,6 +373,29 @@ def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
+BODY_TEXT_SNAPSHOT_LIMIT = 8000
+
+
+def truncate_body_text(value: str, limit: int = BODY_TEXT_SNAPSHOT_LIMIT) -> str:
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n…[truncated]"
+
+
+def compute_paragraph_diff(old_body: str, new_body: str, context: int = 1) -> str:
+    old_paras = [p.strip() for p in re.split(r"\n\s*\n", old_body) if p.strip()]
+    new_paras = [p.strip() for p in re.split(r"\n\s*\n", new_body) if p.strip()]
+    diff_iter = difflib.unified_diff(
+        old_paras,
+        new_paras,
+        fromfile="raw@prev",
+        tofile="raw@now",
+        lineterm="",
+        n=context,
+    )
+    return "\n".join(diff_iter)
+
+
 def today_iso_date() -> str:
     return dt.datetime.now(dt.timezone.utc).date().isoformat()
 
@@ -549,6 +573,46 @@ def classify_page_match(
         if normalize(title) in split_aliases(aliases_text):
             return "alias"
     return None
+
+
+def find_fuzzy_candidates(
+    client: NotionClient,
+    database_id: str,
+    title: str,
+    title_property: str,
+    title_property_type: str,
+    exclude_page_ids: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
+    tokens: List[str] = []
+    seen_tokens: set = set()
+    for raw in re.split(r"\s+|[,;、，；/:：]+", title):
+        tok = raw.strip()
+        if len(tok) < 2:
+            continue
+        key = normalize(tok)
+        if key in seen_tokens:
+            continue
+        seen_tokens.add(key)
+        tokens.append(tok)
+    if not tokens:
+        return []
+    exclude_norm = {normalize_notion_id(p) for p in (exclude_page_ids or [])}
+    collected: Dict[str, Dict[str, Any]] = {}
+    for tok in tokens[:5]:
+        filter_body = build_contains_filter(title_property, title_property_type, tok)
+        if not filter_body:
+            continue
+        try:
+            pages = query_database_pages(client, database_id, filter_body, page_size=10, max_pages=3)
+        except NotionError:
+            continue
+        for page in pages:
+            pid = page.get("id")
+            if not pid or normalize_notion_id(pid) in exclude_norm:
+                continue
+            if pid not in collected:
+                collected[pid] = page
+    return list(collected.values())
 
 
 def find_pages_by_canonical_id(
@@ -1110,6 +1174,32 @@ def upsert_note_to_wiki(
             file=sys.stderr,
         )
 
+    fuzzy_candidate_ids: List[str] = []
+    if not exact_match:
+        fuzzy_candidates = find_fuzzy_candidates(
+            client,
+            database_id,
+            args.title,
+            title_prop,
+            title_prop_type,
+            exclude_page_ids=[p.get("id") for p, _ in matched_candidates],
+        )
+        fuzzy_candidate_ids = [p.get("id") for p in fuzzy_candidates if p.get("id")]
+        if fuzzy_candidates and getattr(args, "strict_fuzzy", False):
+            preview = ", ".join(
+                f"{extract_title(p, title_prop)}<{p.get('id')}>" for p in fuzzy_candidates[:5]
+            )
+            raise NotionError(
+                f"No tier 1-3 match for {args.title!r} but {len(fuzzy_candidates)} fuzzy candidate(s) exist: "
+                f"{preview}. Rerun without --strict-fuzzy after review or set Canonical ID/title first."
+            )
+        if fuzzy_candidates:
+            print(
+                f"WARN: no tier 1-3 match but {len(fuzzy_candidates)} fuzzy candidate(s) exist; "
+                "proceeding to create new page. Use --strict-fuzzy to hard-stop.",
+                file=sys.stderr,
+            )
+
     append_heading = args.append_heading or mapping.get("append_heading", "增量更新")
     if exact_match:
         properties = build_properties(database, mapping, args)
@@ -1142,6 +1232,7 @@ def upsert_note_to_wiki(
         "title": args.title,
         "match_strategy": match_strategy,
         "candidate_count": len(candidates),
+        "fuzzy_candidate_ids": fuzzy_candidate_ids,
     }
 
 
@@ -1338,6 +1429,7 @@ def compile_raw_page(
         compounded_level_property=args.compounded_level_property,
         last_compounded_at_property=args.last_compounded_at_property,
         strict_alias=getattr(args, "strict_alias", False),
+        strict_fuzzy=getattr(args, "strict_fuzzy", False),
     )
     wiki_result = upsert_note_to_wiki(client, wiki_database_id, mapping, upsert_args)
 
@@ -1383,17 +1475,48 @@ def compile_raw_page(
         )
         refinement["skipped"] = False
 
+    diff_appended = False
+    diff_summary: Optional[str] = None
+    if getattr(args, "emit_diff", False) and wiki_result.get("action") == "updated":
+        prev_body = last_compile.get("body_text") if last_compile else None
+        if prev_body:
+            diff_text = compute_paragraph_diff(prev_body, note)
+            if diff_text.strip():
+                diff_summary = diff_text
+                diff_blocks: List[Dict[str, Any]] = [
+                    {
+                        "object": "block",
+                        "type": "heading_3",
+                        "heading_3": {"rich_text": rich_text_value(f"差异分析 {today_iso_date()}")},
+                    }
+                ]
+                for chunk in chunk_text(diff_text):
+                    diff_blocks.append(
+                        {
+                            "object": "block",
+                            "type": "code",
+                            "code": {"rich_text": rich_text_value(chunk), "language": "plain text"},
+                        }
+                    )
+                client.append_block_children(wiki_result["page_id"], diff_blocks)
+                diff_appended = True
+        else:
+            warnings.append("--emit-diff skipped: no previous body_text in compile-log")
+
     return {
         "timestamp": iso_now(),
         "action": "compiled",
         "raw_page_id": raw_page_id,
         "raw_title": title,
         "body_hash": body_hash,
+        "body_text": truncate_body_text(note),
         "wiki": wiki_result,
         "raw_updates": list(raw_updates.keys()),
         "source_url": source_url,
         "low_risk_refinement": refinement,
         "warnings": warnings,
+        "diff_appended": diff_appended,
+        "diff_summary": diff_summary[:400] if diff_summary else None,
     }
 
 
@@ -1527,17 +1650,66 @@ def command_compile_queue(
             return 0
     else:
         status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
-        status_prop_meta = raw_database.get("properties", {}).get(status_prop_name, {})
+        raw_props_meta = raw_database.get("properties", {})
+        status_prop_meta = raw_props_meta.get(status_prop_name, {})
         status_prop_type = status_prop_meta.get("type")
         if not status_prop_name or not status_prop_type:
             raise NotionError("Raw status property not found; pass --raw-status-property or update mapping")
 
-        filter_body = {"property": status_prop_name, status_prop_type: {"equals": args.status}}
+        and_filters: List[Dict[str, Any]] = [
+            {"property": status_prop_name, status_prop_type: {"equals": args.status}}
+        ]
+        extra_filter_desc: List[Dict[str, str]] = []
+        skipped_filters: List[Dict[str, str]] = []
+        for raw_expr in getattr(args, "filter", []) or []:
+            if "=" not in raw_expr:
+                raise NotionError(f"--filter must be PROP=VALUE, got {raw_expr!r}")
+            prop_name, raw_val = raw_expr.split("=", 1)
+            prop_name = prop_name.strip()
+            raw_val = raw_val.strip()
+            prop_meta = raw_props_meta.get(prop_name)
+            if not prop_meta:
+                skipped_filters.append({"property": prop_name, "reason": "property not found in raw schema"})
+                continue
+            ptype = prop_meta.get("type")
+            filter_fragment: Optional[Dict[str, Any]] = None
+            if ptype in {"status", "select"}:
+                filter_fragment = {"property": prop_name, ptype: {"equals": raw_val}}
+            elif ptype in {"rich_text", "title"}:
+                filter_fragment = {"property": prop_name, ptype: {"equals": raw_val}}
+            elif ptype == "checkbox":
+                filter_fragment = {"property": prop_name, "checkbox": {"equals": raw_val.lower() in {"true", "1", "yes"}}}
+            elif ptype == "number":
+                try:
+                    num = float(raw_val)
+                except ValueError as exc:
+                    raise NotionError(f"--filter {prop_name}={raw_val}: value is not a number") from exc
+                filter_fragment = {"property": prop_name, "number": {"equals": num}}
+            elif ptype == "multi_select":
+                filter_fragment = {"property": prop_name, "multi_select": {"contains": raw_val}}
+            else:
+                skipped_filters.append({"property": prop_name, "reason": f"unsupported type {ptype!r}"})
+                continue
+            and_filters.append(filter_fragment)
+            extra_filter_desc.append({"property": prop_name, "value": raw_val})
+
+        filter_body: Dict[str, Any] = and_filters[0] if len(and_filters) == 1 else {"and": and_filters}
         raw_pages = query_database_pages(client, raw_database_id, filter_body, page_size=min(args.limit, 20) if args.limit else 20)
         if args.limit:
             raw_pages = raw_pages[: args.limit]
         raw_page_ids = [page.get("id") for page in raw_pages if page.get("id")]
-        filter_description = {"status_filter": args.status, "requested_limit": args.limit}
+        filter_description = {
+            "status_filter": args.status,
+            "requested_limit": args.limit,
+            "extra_filters": extra_filter_desc,
+        }
+        if skipped_filters:
+            filter_description["skipped_filters"] = skipped_filters
+            for s in skipped_filters:
+                print(
+                    f"WARN: --filter {s['property']!r} skipped: {s['reason']}",
+                    file=sys.stderr,
+                )
 
     results: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
@@ -1749,6 +1921,8 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--force", action="store_true")
     compile_parser.add_argument("--auto-refine", action="store_true")
     compile_parser.add_argument("--strict-alias", action="store_true")
+    compile_parser.add_argument("--strict-fuzzy", action="store_true")
+    compile_parser.add_argument("--emit-diff", action="store_true")
 
     queue_parser = subparsers.add_parser("compile-queue")
     queue_parser.add_argument("--status", default="Not started")
@@ -1773,7 +1947,10 @@ def build_parser() -> argparse.ArgumentParser:
     queue_parser.add_argument("--force", action="store_true")
     queue_parser.add_argument("--auto-refine", action="store_true")
     queue_parser.add_argument("--strict-alias", action="store_true")
+    queue_parser.add_argument("--strict-fuzzy", action="store_true")
+    queue_parser.add_argument("--emit-diff", action="store_true")
     queue_parser.add_argument("--retry-failed", action="store_true")
+    queue_parser.add_argument("--filter", action="append", default=[], help="Repeatable; additional Raw Inbox filter as PROP=VALUE")
 
     upsert_parser = subparsers.add_parser("upsert-note")
     upsert_parser.add_argument("--title", required=True)
@@ -1791,6 +1968,7 @@ def build_parser() -> argparse.ArgumentParser:
     upsert_parser.add_argument("--compounded-level-property")
     upsert_parser.add_argument("--last-compounded-at-property")
     upsert_parser.add_argument("--strict-alias", action="store_true")
+    upsert_parser.add_argument("--strict-fuzzy", action="store_true")
 
     session_parser = subparsers.add_parser("log-session-event")
     session_parser.add_argument("--model", required=True, help="Model id making the decision (e.g. claude-opus-4-7)")
