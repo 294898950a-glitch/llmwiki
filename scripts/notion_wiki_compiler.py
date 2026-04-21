@@ -13,7 +13,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = ROOT / ".env"
+RAW_DUMPS_DIR = ROOT / "raw" / "notion_dumps"
 DEFAULT_NOTION_VERSION = "2022-06-28"
+DEFAULT_MAX_QUERY_PAGES = 25
 
 
 class NotionError(RuntimeError):
@@ -105,6 +107,35 @@ def optional_env(env: Dict[str, str], key: str) -> Optional[str]:
 
 def iso_now() -> str:
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0).isoformat()
+
+
+def timestamp_slug() -> str:
+    return dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
+
+
+def short_notion_id(value: str) -> str:
+    normalized = normalize_notion_id(value)
+    return normalized[:8] if normalized else "unknown"
+
+
+def ensure_raw_dumps_dir() -> Path:
+    RAW_DUMPS_DIR.mkdir(parents=True, exist_ok=True)
+    return RAW_DUMPS_DIR
+
+
+def write_json_snapshot(filename: str, payload: Dict[str, Any]) -> Path:
+    dump_dir = ensure_raw_dumps_dir()
+    path = dump_dir / filename
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def append_jsonl_log(filename: str, payload: Dict[str, Any]) -> Path:
+    dump_dir = ensure_raw_dumps_dir()
+    path = dump_dir / filename
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    return path
 
 
 def load_mapping(path: Optional[str]) -> Dict[str, Any]:
@@ -212,16 +243,24 @@ def query_database_pages(
     database_id: str,
     filter_body: Optional[Dict[str, Any]],
     page_size: int = 20,
+    max_pages: int = DEFAULT_MAX_QUERY_PAGES,
 ) -> List[Dict[str, Any]]:
     payload: Dict[str, Any] = {"page_size": page_size}
     if filter_body:
         payload["filter"] = filter_body
     results: List[Dict[str, Any]] = []
+    page_count = 0
     while True:
         response = client.query_database(database_id, payload)
         results.extend(response.get("results", []))
+        page_count += 1
         if not response.get("has_more"):
             break
+        if page_count >= max_pages:
+            raise NotionError(
+                f"Exceeded query page limit ({max_pages}) for database {database_id}; "
+                "refine the filter or raise the max_pages limit"
+            )
         payload["start_cursor"] = response.get("next_cursor")
     return results
 
@@ -278,18 +317,36 @@ def find_pages_by_canonical_id(
     return dedupe_pages(matches)
 
 
+def build_contains_filter(property_name: str, property_type: str, query: str) -> Optional[Dict[str, Any]]:
+    if property_type == "title":
+        return {"property": property_name, "title": {"contains": query}}
+    if property_type == "rich_text":
+        return {"property": property_name, "rich_text": {"contains": query}}
+    if property_type == "multi_select":
+        return {"property": property_name, "multi_select": {"contains": query}}
+    return None
+
+
 def search_in_database(
     client: NotionClient,
     database_id: str,
     query: str,
     title_property: str,
+    title_property_type: str = "title",
     aliases_property: Optional[str] = None,
+    aliases_property_type: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    filters: List[Dict[str, Any]] = [
-        {"property": title_property, "title": {"contains": query}},
-    ]
-    if aliases_property:
-        filters.append({"property": aliases_property, "rich_text": {"contains": query}})
+    filters: List[Dict[str, Any]] = []
+    title_filter = build_contains_filter(title_property, title_property_type, query)
+    if title_filter:
+        filters.append(title_filter)
+    if aliases_property and aliases_property_type:
+        aliases_filter = build_contains_filter(aliases_property, aliases_property_type, query)
+        if aliases_filter:
+            filters.append(aliases_filter)
+
+    if not filters:
+        return []
 
     pages = dedupe_pages(
         query_database_pages(client, database_id, {"or": filters})
@@ -393,9 +450,13 @@ def upsert_note_to_wiki(
 ) -> Dict[str, Any]:
     database = client.retrieve_database(database_id)
     title_prop = resolve_title_property_name(database, mapping, args.title_property)
+    title_prop_type = database.get("properties", {}).get(title_prop, {}).get("type", "title")
     aliases_prop = mapping.get("aliases_property")
+    aliases_prop_type = None
     if aliases_prop not in database.get("properties", {}):
         aliases_prop = None
+    else:
+        aliases_prop_type = database.get("properties", {}).get(aliases_prop, {}).get("type")
     canonical_prop = args.canonical_id_property or mapping.get("canonical_id_property")
     if canonical_prop not in database.get("properties", {}):
         canonical_prop = None
@@ -404,7 +465,15 @@ def upsert_note_to_wiki(
     if args.canonical_id and canonical_prop:
         candidates = find_pages_by_canonical_id(client, database_id, args.canonical_id, canonical_prop)
     if not candidates:
-        candidates = search_in_database(client, database_id, args.title, title_prop, aliases_prop)
+        candidates = search_in_database(
+            client,
+            database_id,
+            args.title,
+            title_prop,
+            title_prop_type,
+            aliases_prop,
+            aliases_prop_type,
+        )
 
     exact_match = None
     for page in candidates:
@@ -441,28 +510,40 @@ def upsert_note_to_wiki(
 def inspect_schema(client: NotionClient, database_id: str, database_role: str) -> int:
     database = client.retrieve_database(database_id)
     title_prop = detect_title_property(database)
-    print(
-        json.dumps(
-            {
-                "database_role": database_role,
-                "database_id": database.get("id"),
-                "title_property": title_prop,
-                "properties": {name: meta.get("type") for name, meta in database.get("properties", {}).items()},
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    payload = {
+        "database_role": database_role,
+        "database_id": database.get("id"),
+        "title_property": title_prop,
+        "properties": {name: meta.get("type") for name, meta in database.get("properties", {}).items()},
+    }
+    snapshot_path = write_json_snapshot(
+        f"{timestamp_slug()}-inspect-schema-{database_role}.json",
+        payload,
     )
+    payload["snapshot_path"] = str(snapshot_path)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 
 def command_search(client: NotionClient, database_id: str, mapping: Dict[str, Any], args: argparse.Namespace) -> int:
     database = client.retrieve_database(database_id)
     title_prop = resolve_title_property_name(database, mapping, args.title_property)
+    title_prop_type = database.get("properties", {}).get(title_prop, {}).get("type", "title")
     aliases_prop = mapping.get("aliases_property")
+    aliases_prop_type = None
     if aliases_prop not in database.get("properties", {}):
         aliases_prop = None
-    results = search_in_database(client, database_id, args.query, title_prop, aliases_prop)
+    else:
+        aliases_prop_type = database.get("properties", {}).get(aliases_prop, {}).get("type")
+    results = search_in_database(
+        client,
+        database_id,
+        args.query,
+        title_prop,
+        title_prop_type,
+        aliases_prop,
+        aliases_prop_type,
+    )
     summary = [
         {
             "page_id": page.get("id"),
@@ -543,18 +624,21 @@ def command_compile_from_raw(
     if raw_updates:
         client.update_page(args.page_id, {"properties": raw_updates})
 
-    print(
-        json.dumps(
-            {
-                "action": "compiled",
-                "raw_page_id": args.page_id,
-                "wiki": wiki_result,
-                "raw_updates": list(raw_updates.keys()),
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
+    payload = {
+        "timestamp": iso_now(),
+        "action": "compiled",
+        "raw_page_id": args.page_id,
+        "raw_title": title,
+        "wiki": wiki_result,
+        "raw_updates": list(raw_updates.keys()),
+        "source_url": source_url,
+    }
+    log_path = append_jsonl_log(
+        f"{dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d')}-compile-log.jsonl",
+        payload,
     )
+    payload["log_path"] = str(log_path)
+    print(json.dumps(payload, ensure_ascii=False, indent=2))
     return 0
 
 

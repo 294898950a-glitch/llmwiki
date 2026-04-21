@@ -9,7 +9,7 @@
 
 ## 当前状态
 
-截至 `2026-04-21`，项目已经完成：
+截至 `2026-04-22`，项目已经完成：
 
 - 双库配置已建立：
   - `NOTION_RAW_INBOX_DB_ID`
@@ -26,6 +26,7 @@
   - [`schema/notion_wiki_mapping.example.json`](./schema/notion_wiki_mapping.example.json)
 - Raw / Wiki 两个 Notion 数据库的 schema 已完成首次探测
 - 第一次真实 `compile-from-raw` smoke test 已通过
+- `raw/notion_dumps/` 已开始落盘 schema 快照
 
 当前脚本支持的命令：
 
@@ -76,6 +77,7 @@
   - `Status`
   - `Processed At`
   - `Target Wiki Page`
+- 将 `inspect-schema` 的结果落盘到 `raw/notion_dumps/`
 
 说明：
 
@@ -94,6 +96,10 @@
   - Raw page：`3496e2cd-6e4f-81a2-988a-c9fd757c1b42`
   - Wiki page：`3496e2cd-6e4f-816e-919b-fd80753dcc9b`
   - 闭环已验证：`raw -> wiki -> raw 回写`
+- 查询层当前能力：
+  - `query_database` 已替代全局 `/search`
+  - `Aliases` 查询会根据真实字段类型构造过滤（`rich_text` / `multi_select`）
+  - 分页查询已带基础熔断上限
 
 ## 幂等性与回滚
 
@@ -149,7 +155,8 @@
   - 目前是 `compile-from-raw <page_id>` 单条运行
 - 虽然 smoke test 已通过，但还存在实现层限制：
   - `query_database` 已替代全局 `/search`
-  - 但匹配仍缺少更强的判定与冲突处理
+  - `find_pages_by_canonical_id` 仍是全表扫，尚未下推到 Notion 端属性过滤
+  - 匹配仍缺少更强的判定与冲突处理
   - 目前只有文档层的幂等性与回滚约定，还没有代码层的严格幂等策略
   - LLM 归属与合并策略已在文档层明确：
     - [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)
@@ -158,6 +165,9 @@
     - tier 3 的二次判断
     - tier 4 的停下来问用户
     - 自动 diff / 冲突保留证据
+  - `raw/notion_dumps/` 目前只落了 schema 快照，还没有完整沉淀：
+    - 每次 compile 的可回放运行日志
+    - LLM 判断日志
 
 ## 下一步
 
@@ -168,9 +178,10 @@
    - tier 4 停下来问用户
    - 冲突保留证据
 2. 把“文档约定”升级成代码层幂等策略
-3. 为 LLM 判断建立执行日志，并落盘到 `raw/notion_dumps/`
-4. 扩展 raw page body 的递归读取
-5. 增加批量编译队列
+3. 把 compile 运行日志和 LLM 判断日志完整落盘到 `raw/notion_dumps/`
+4. 把 `Canonical ID` 查询从全表扫改成 Notion 端属性过滤
+5. 扩展 raw page body 的递归读取
+6. 增加批量编译队列
 
 ## 版本控制
 
