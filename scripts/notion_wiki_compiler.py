@@ -131,6 +131,12 @@ def database_parent_id(page: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def normalize_notion_id(value: Optional[str]) -> str:
+    if not value:
+        return ""
+    return value.replace("-", "").lower()
+
+
 def rich_text_value(text: str) -> List[Dict[str, Any]]:
     return [{"type": "text", "text": {"content": text}}]
 
@@ -195,7 +201,8 @@ def read_page_body_text(client: NotionClient, page_id: str) -> str:
 
 def search_in_database(client: NotionClient, database_id: str, query: str, title_property: str) -> List[Dict[str, Any]]:
     results = client.search(query, page_size=20).get("results", [])
-    pages = [page for page in results if database_parent_id(page) == database_id]
+    target_database_id = normalize_notion_id(database_id)
+    pages = [page for page in results if normalize_notion_id(database_parent_id(page)) == target_database_id]
     pages.sort(key=lambda page: 0 if normalize(extract_title(page, title_property)) == normalize(query) else 1)
     return pages
 
@@ -366,7 +373,7 @@ def command_compile_from_raw(
     args: argparse.Namespace,
 ) -> int:
     raw_page = client.retrieve_page(args.page_id)
-    if database_parent_id(raw_page) != raw_database_id:
+    if normalize_notion_id(database_parent_id(raw_page)) != normalize_notion_id(raw_database_id):
         raise NotionError("Raw page does not belong to NOTION_RAW_INBOX_DB_ID")
 
     raw_database = client.retrieve_database(raw_database_id)
