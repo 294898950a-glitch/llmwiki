@@ -170,3 +170,57 @@ LLM 层负责高不确定性、需要语义判断的动作：
   - 不在 `scripts/notion_wiki_compiler.py` 中直接接入模型 API
 
 这份决定是后续“候选排序 / 冲突处理 / 幂等策略”的前置条件。
+
+## 会话层留痕约定
+
+既然 LLM 判断放在 Claude Code 会话层，每次判断（选候选、合并 vs 新建、风险等级）必须**可追溯**。否则后续无法回归、无法在模式 A 跑够轮数时决定是否切到模式 B。
+
+### 落盘方式
+
+脚本提供了 `log-session-event` 子命令。会话层每做一次对 raw 的语义判断，应立即调用它：
+
+```bash
+python scripts/notion_wiki_compiler.py log-session-event \
+  --model claude-opus-4-7 \
+  --raw-page-id <raw-uuid> \
+  --wiki-page-id <wiki-uuid or 空> \
+  --tier canonical_id|title|alias|fuzzy|none \
+  --decision update|create|ask_user|skip \
+  --risk low|medium|high \
+  --notes "为什么这么判断，关键证据"
+```
+
+命令会把事件 append 到 `raw/notion_dumps/YYYY-MM-DD-session-log.jsonl`。该文件不入 git（在 `.gitignore` 中），只作为本地审计，需要时上传到团队共享位置。
+
+### 字段定义
+
+| 字段 | 含义 |
+|---|---|
+| `timestamp` | UTC iso8601，脚本自动填 |
+| `model` | 做判断的模型 id，如 `claude-opus-4-7` / `gpt-5-codex` |
+| `raw_page_id` | 被判断的 Raw Inbox page（可空，若判断与特定 raw 无关） |
+| `wiki_page_id` | 判断涉及的 Wiki page（创建前可为空） |
+| `tier` | 对应 `MERGE_STRATEGY.md` 的候选排序层级，或 `none` 表示未命中 |
+| `decision` | `update`（追加到已有页）/ `create`（新建）/ `ask_user`（停下来询问用户）/ `skip`（跳过） |
+| `risk` | 低 / 中 / 高，对应 MERGE_STRATEGY 的冲突分级 |
+| `notes` | 自由文本解释，必填。越详细越利于回归 |
+| `input` | 可选结构化输入：候选列表、原文片段、命中正则 |
+
+### 什么时候必须记
+
+以下场景**必须**留痕，否则跑完无法回溯：
+
+1. `compile-from-raw` 返回 `match_strategy: alias`（触发 tier 3 review）——即便脚本已经写入，会话层要登记为什么认为这次 alias 命中是可接受的。
+2. `compile-from-raw` 返回 `action: skipped_duplicate_body`——登记发现了跨 raw 重复，决定保持现状。
+3. 会话层主动跳过某条 raw（`decision: skip`）。
+4. 对 MERGE_STRATEGY tier 4 的场景（主题相近无明确标识），会话层判断"不应自动合并"时。
+
+### 与 `compile-log.jsonl` / `audit-log.jsonl` 的区别
+
+| 文件 | 谁写 | 内容 |
+|---|---|---|
+| `audit-log.jsonl` | 脚本 | 所有命令的执行事件（含成功/失败） |
+| `compile-log.jsonl` | 脚本 | compile-from-raw 的结构化结果 |
+| `session-log.jsonl` | 会话层通过 `log-session-event` | 语义判断的 why + 依据 |
+
+三者互补：审计问"发生了什么"、编译问"这条 raw 变成了什么"、session 问"为什么这样判断"。
