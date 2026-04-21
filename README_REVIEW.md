@@ -1112,3 +1112,87 @@ v12 未做此清单。补：
 - 未评估 `chunk_text` 对整段无换行的超长 URL / base64 / 代码块的切分行为。
 - 未对 `wiki/index.md`（自 `cd4d3ee` 起未动）做是否作废判断。
 - 未核对 `LLM_EXTRACTION_DESIGN.md` 本身是否该因本版代码行为而改版——文档立场与当前脚本行为不符，至少其中一方应让步。
+
+---
+
+## v14 · 2026-04-22
+
+- **评审对象**：
+  - `README.MD`（工作树，未提交）
+  - `scripts/notion_wiki_compiler.py`（工作树，未提交）
+- **对照对象**：
+  - 真实 `QueryLoop` 页面已完成的 live 优化
+  - `README_REVIEW.md` v1-v13
+- **锚定 git 状态**：`a469e8d`（HEAD）之后的工作树修改，当前至少包含 `README.MD` / `README_REVIEW.md` / `scripts/notion_wiki_compiler.py`
+- **评审者**：GPT-5 Codex
+- **本版定位**：不是再审架构，而是专门检查 README 当前叙述是否和代码现状一致，尤其是 `--auto-refine` 的边界描述。
+
+### 1. 新发现的 README 漂移
+
+1. **README 把 `--auto-refine` 写得比代码更保守**
+
+   `README.MD` 现在写的是：
+   - “首次创建时自动补结构化整理模板（heading 骨架 + 原文摘录）”
+   - “模板段落的具体判断由 Claude Code 会话层补写，脚本不做领域性结论”
+   - “所有‘判断句’都回退为中性表述；领域性结论不由脚本写入”
+
+   但代码并不只是写 heading 骨架。当前 `--auto-refine` 打开时，脚本仍会自动写入：
+   - `Topic`
+   - `关键机制`
+   - `关联概念`
+   - `核心判断`
+   - `实现信号`
+   - `与相邻概念的区别`
+
+   直接证据：
+   - `infer_topics()`：`scripts/notion_wiki_compiler.py:645-668`
+   - `infer_key_points()`：`:689-703`
+   - `infer_related_concepts()`：`:706-721`
+   - `infer_core_judgment()`：`:736-737`
+   - `infer_neighbor_distinction()`：`:756-757`
+   - `build_deepening_blocks()`：`:828-899`
+
+   **判定**：README 当前对 `auto-refine` 的描述过于理想化，已与代码脱钩。
+
+2. **README 对 `QueryLoop` 页的来源划分不够准确**
+
+   README 现在写：
+   - “heading 是脚本模板产物，具体段落内容仍需 Claude Code 会话层介入后才是真正的永久笔记。”
+
+   这句话容易让读者误解成：脚本只写 heading，不写正文。但真实代码路径下，只要显式传 `--auto-refine`，脚本会直接 append 结构化和 deepening 的正文块；会话层只是后续又做了 live editorial 收敛。
+
+   直接证据：
+   - `compile_raw_page()` 在 `args.auto_refine` 为真时直接调用 `apply_low_risk_refinement()`：`scripts/notion_wiki_compiler.py:1225-1235`
+   - `apply_low_risk_refinement()` 会真正 append block：`:1097-1112`
+
+   **判定**：README 应改成“脚本会先写一版启发式正文，会话层再做二次整理”，而不是“正文全靠会话层”。
+
+### 2. 本轮 README 与代码一致的部分
+
+- `--auto-refine` 默认关闭，需显式传入才启用：
+  - README：`README.MD:91`
+  - 代码：`scripts/notion_wiki_compiler.py:1521`
+- `skipped_unchanged` 分支会把 raw `Status` 推进到完成态，避免 queue 反复拉取：
+  - README：`README.MD:144-147`
+  - 代码：`scripts/notion_wiki_compiler.py:1147-1161`
+- `raw/notion_dumps/*.jsonl` 已在 `.gitignore` 中忽略：
+  - README：`README.MD:249`
+  - `.gitignore`：`/home/jay/projects/llmwiki/.gitignore:7`
+
+### 3. 本版结论
+
+- README 的大方向是对的：它已经不再把 `QueryLoop` 写成“系统已稳定完成高质量整理”。
+- 但新引入了另一类漂移：
+  - 对 `--auto-refine` 的描述比真实代码更“收敛”
+  - 对 `QueryLoop` 页的来源归因把脚本正文写入弱化了
+- 下一步最直接的修复不是再改代码，而是先把 README 两处表述修准。
+
+### 4. 建议下一步
+
+1. 修 README 对 `--auto-refine` 的描述：
+   - 明确它仍会写入启发式判断内容，而不只是 heading 骨架
+2. 修 README 对 `QueryLoop` 案例的描述：
+   - 改成“脚本先产出启发式正文，会话层再做 live editorial”
+3. 然后再决定是：
+   - 让代码继续保留这套启发式正文生成
+   - 还是进一步收缩回真正的“骨架 + 摘录”模式
