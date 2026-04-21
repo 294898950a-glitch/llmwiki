@@ -7,7 +7,7 @@
 ## v1 · 2026-04-21
 
 - **评审对象**：`CLAUDE.md` (Version 2026-04-21.r1) + `scripts/notion_wiki_compiler.py` + `schema/notion_wiki_mapping.example.json` + `.env.example`
-- **锚定 commit**：首次 git 提交（见 `git log -- CLAUDE.md` 第一条）
+- **锚定 commit**：`cd4d3ee`（首次提交）
 - **评审者**：Claude Opus 4.7 (1M context)，模型 ID `claude-opus-4-7`
 - **评审方式**：读 CLAUDE.md → 读实际脚本与 schema → 对照设计与实现差距
 
