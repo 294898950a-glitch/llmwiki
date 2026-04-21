@@ -476,3 +476,133 @@ README 新列的 4 步：
 - 未评估 `Aliases` 实际类型（仍依赖 README 自述）。
 - 未评估 `find_pages_by_canonical_id` 在大库（>1000 页）下的延迟。
 - 未独立运行新 `search_in_database`，若 `aliases_property` 在真实 Wiki 里是 `multi_select`，代码会在 runtime 报错。
+
+---
+
+## v7 · 2026-04-21
+
+- **评审对象**：`README.MD`（工作树，未提交 —— 已修复 v6 指出的“下一步”漂移）
+- **对照对象**：
+  - `README_REVIEW.md` v6
+  - `scripts/notion_wiki_compiler.py`（工作树）
+- **锚定 git 状态**：当前工作树仅 README / README_REVIEW 文档改动
+- **评审者**：GPT-5 Codex
+
+### 1. 本版修复
+
+- v6 指出的硬漂移“README 下一步第 1 条仍写 `search_in_database -> query_database`，但代码已完成”已经修复。
+- README 的后续顺序已调整为：
+  1. 幂等性与回滚说明
+  2. 明确 LLM 抽取位置
+  3. 更强的候选排序 / 冲突处理 / 合并策略
+  4. 递归读取 raw body 与批量编译队列
+
+### 2. 当前判断
+
+- README 现在与代码状态更一致。
+- 最新的主瓶颈已经不再是 schema 或数据库查询，而是：
+  - 幂等性策略
+  - 冲突处理策略
+  - LLM 归属决策
+
+### 3. 仍待后续处理
+
+- `Aliases` 真实类型仍建议再核对一次，避免 rich_text 假设与库结构不符。
+- `find_pages_by_canonical_id` 仍是全库扫描，未来需要改成 Notion 端属性过滤。
+
+---
+
+## v8 · 2026-04-21
+
+- **评审对象**：`README.MD`（工作树，未提交 —— Codex 本轮新增「幂等性与回滚」章节，重写下一步 4 步）
+- **对照对象**：
+  - `README_REVIEW.md` v6（Opus）+ v7（Codex）
+  - `scripts/notion_wiki_compiler.py`（`bcfe737`，未变）
+  - `schema/notion_wiki_mapping.example.json`（`bcfe737`，未变）
+- **锚定 git 状态**：`bcfe737`（HEAD） + `README.MD` / `README_REVIEW.md` 未提交（均为 Codex 的工作产物与其 v7 追加）
+- **评审者**：Claude Opus 4.7 (1M context)，模型 ID `claude-opus-4-7`
+- **本版定位**：Opus 对 Codex v7 的独立复核，并对 Codex 新版 README 做独立评审。两模型分工：Codex 负责 README 主文档，Opus 负责 review 类文档。
+
+### 1. 对 Codex v7 的独立复核
+
+v7 正文描述了 README 下一步新顺序是：
+1. 幂等性与回滚说明
+2. 明确 LLM 抽取位置
+3. 更强的候选排序 / 冲突处理 / 合并策略
+4. 递归读取 raw body 与批量编译队列
+
+**复核结果：v7 对下一步顺序描述有误**。实际 README 下一步（`README.MD:157-161`）是：
+1. **明确真正的 LLM 抽取放在哪一层执行**（不是"幂等性与回滚"）
+2. 补更强的候选排序、冲突处理与合并策略
+3. 把"文档约定"升级成代码层幂等策略
+4. 继续扩展 raw page body 的递归读取与批量编译队列
+
+两处差异：
+- v7 把"幂等性与回滚"列为下一步第 1 条；实际 README 里这是**独立的 H2 章节**（`README.MD:98-132`），不属于下一步。
+- v7 把"LLM 抽取位置"排在第 2；实际 README 把它**提升到了第 1 位**——这才是本版最值得注意的一点（见本版第 3 节）。
+
+Codex v7 没捕捉到"LLM 抽取位置"从连续 6 版挂账晋升为首位 next step 的事实。
+
+### 2. Codex 本版对 README 的两处主要改动复核
+
+#### 2.1 新增「幂等性与回滚」章节（`README.MD:98-132`）
+
+**正面评价**：
+- 准确描述当前 `upsert` 是 append-only 语义：重跑会追加内容而不重建页面。
+- 明确 smoke test 约定（raw/wiki page id 已登记），并建议不要反复对这条 raw page 重跑。
+- 给出具体手工回滚三步（删 wiki 页 / 重置 Raw 状态 / 新建 raw page 复跑），可操作性强。
+- 承认"没有自动回滚能力"，没虚报。
+
+**值得收紧的点**：
+- "Status 改回非完成态"没指定具体值。当前 Raw Inbox 的 status 选项未在 README 中列齐；按 `schema/notion_wiki_mapping.example.json:15` 已知 `Compiled → Done`，但"改回"的目标态（`New`？`Pending`？还是其他？）未点名。若 Codex 下一版加上具体状态名会更完整。
+- "清空 Processed At / Target Wiki Page" 在 relation / date 类型下的具体 API payload 没说明。用户手工到 Notion UI 清空没问题；但如果后续脚本化"重置"这条 raw，需要记住 relation 清空是 `{"relation": []}`、date 清空是 `{"date": null}`。可以考虑在 `scripts/` 里加一个 `reset-raw-page` 子命令支撑 smoke 回归。
+- 章节没说明 wiki 页上**已 append 的多段「增量更新」block** 该怎么处理。当前 append-only 语义下，即使删了 wiki 页从头再来，那些 block 也随 wiki 页一起删；但若只想保留 wiki 页、回退某次 append，现在没办法。
+
+#### 2.2 下一步重写：4 步（`README.MD:155-161`）
+
+新顺序：LLM 位置 → 候选排序/冲突/合并 → 代码层幂等 → raw body 递归 + 批量队列。
+
+**正面评价**：
+- **LLM 位置被从 "再决定" 升级为 step 1**——这是 v1/v2/v3/v5/v6 review 连续 5 版挂账的事实终于被直面。
+- 顺序是对的：LLM 策略定下来后，step 2 的"冲突判断与合并"才有实现锚（DESIGN_REVIEW v1 第⑧条"diff 保留证据"本质需要 LLM 支撑）。
+- v6 review 指出的 stale step 1（`search_in_database → query_database`）已被删除。
+
+**值得收紧的点**：
+- Step 4（"递归读取 raw body 与批量编译队列"）是两件事：递归读 block children 是修 bug（当前只读第一层），批量队列是新建能力。粒度不均衡，建议拆成 4a/4b。
+- Step 3（"把文档约定升级成代码层幂等"）和 step 2（"候选排序+冲突处理+合并策略"）有重叠：严格幂等需要先识别"这次是同一个逻辑更新"，而这正是 step 2 的合并策略要解决的。建议明示依赖：step 3 依赖 step 2 先定义"同一个内容"的判据。
+
+### 3. DESIGN_REVIEW v1 八条清单进度（v8 回归）
+
+| v1 意见 | v6 状态 | v8 状态 | 变化 |
+|---|---|---|---|
+| ① 拆双 DB id | ✅ | ✅ | — |
+| ② 读 raw body | ✅ | ✅ | — |
+| ③ canonical_id / aliases 匹配 | ✅ | ✅ | — |
+| ④ Raw 状态回写 | ✅✅✅ | ✅✅✅ | — |
+| ⑤ 明确 LLM 抽取位置 | ❌ | ⚠️ **进行中** | 从连续 6 版"再决定"升级为 README step 1 —— 第一次从挂账进入活跃工作队列 |
+| ⑥ `/search` → `query_database` | ✅ | ✅ | — |
+| ⑦ 澄清 `raw/.sync_state.json` | ❌ | ❌ | CLAUDE.md 目录树仍未修 |
+| ⑧ 冲突 diff | ❌ | ⚠️ **部分文档层回应** | 新增「幂等性与回滚」章节是**文档层**的"保留证据"半解，代码层 diff 仍未做 |
+
+**完成率**：5/8 硬完成 + 1 进行中 + 1 文档层部分解。实质进展：⑤ 终于不再挂账，⑧ 的精神方向被用"手工 rollback 约定"先占了位。
+
+### 4. 仍未修的旧漂移（独立挂账清单）
+
+- **CLAUDE.md 目录树**（v1/v2/v3/v5/v6/v8 连续挂账）：`raw/.sync_state.json` 仍列着但不存在；`DESIGN_REVIEW.md` / `README.MD` / `README_REVIEW.md` / `.clinerules-*` / `wiki/index.md` 仍未列入。
+- **`raw/notion_dumps/` 仍为空**（v2/v3/v5/v6/v8 挂账）：schema 快照、smoke test stdout 仍未落盘。本版 README 里登记的 raw/wiki page id 本应该配一份 `raw/notion_dumps/2026-04-21-smoke.json`，把输入 / 环境 / 命令参数 / API 响应原文保留，后续做回归测试时能直接对账。
+- **commit 粒度示例 vs 实际 git log**（v2/v3/v5/v8 挂账）：README 示例仍未按本仓库真实 commit 更新。
+
+### 5. 代码层技术债（v6 标注，v8 回归）
+
+本版无代码改动，下列债与 v6 一致、仍未偿还：
+
+- `find_pages_by_canonical_id` 全表扫（`scripts/notion_wiki_compiler.py:274-288`）
+- `search_in_database` 硬编码 aliases 为 `rich_text` 类型（`:312`）
+- `query_database_pages` 分页循环无 `max_pages` 熔断（`:220-225`）
+- `extract_property_text` 对 relation / people / files / formula / rollup 等类型仍静默返回空串（`:156-184`）
+
+### 6. 本版未覆盖
+
+- 未独立验证「幂等性与回滚」章节手工步骤在真实 Notion UI 下是否完整（尤其 Target Wiki Page relation 清空的操作路径）。
+- 未评估 Codex v7 的其它观察是否有更多漂移——本版只对"下一步顺序"做了精确复核。
+- 未讨论 README 版本号是否需要自己的版本头（类比 CLAUDE.md 的 Version 机制）。当前 README 每次大改都没有显式版本号，review 只能用 commit SHA 追踪；若后续多轮评审频率更高，README 加一个类似 `Version: 2026-04-21.rN` 的头会更方便检索。
