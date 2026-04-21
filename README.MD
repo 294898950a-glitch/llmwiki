@@ -64,8 +64,10 @@
 
 - 读取 `.env` 中的 Notion 配置
 - 检查 Raw Inbox 或 Wiki 数据库 schema
-- 在 Wiki 数据库中搜索候选页面
-- 按标题执行最小 upsert：
+- 在 Wiki 数据库中进行数据库内候选检索
+- 执行基础 upsert：
+  - 优先按 `Canonical ID` 匹配（如果传入）
+  - 其次按标题与 `Aliases` 检索候选
   - 命中已有页面则更新
   - 未命中则新建页面
 - 从 Raw Inbox 指定 page 读取正文
@@ -103,16 +105,16 @@
   - 主题提取
   - 冲突差异总结
 - 匹配逻辑仍然偏弱：
-  - 目前主要按标题匹配
-  - 还没有完整实现 `Canonical ID + Aliases` 优先匹配
+  - 已有 `Canonical ID + Aliases` 基础匹配
+  - 但还没有更完整的候选排序、冲突判断和合并策略
 - Raw page body 读取还比较浅：
   - 当前只读取第一层 block 文本
   - 还没有递归处理深层嵌套 block
 - 还没有批量编译队列：
   - 目前是 `compile-from-raw <page_id>` 单条运行
 - 虽然 smoke test 已通过，但还存在实现层限制：
-  - `search_in_database` 仍使用全局 `/search`，不是 `query_database`
-  - 仍未实现 `Canonical ID + Aliases` 优先匹配
+  - `query_database` 已替代全局 `/search`
+  - 但匹配仍缺少更强的判定与冲突处理
   - 还没有幂等性与冲突处理策略
 
 ## 下一步
@@ -120,8 +122,8 @@
 建议按这个顺序继续：
 
 1. 将 `search_in_database` 改成 `query_database` 属性过滤
-2. 补 `Canonical ID` 和 `Aliases` 匹配
-3. 增加 smoke test 的幂等性检查与回滚说明
+2. 增加 smoke test 的幂等性检查与回滚说明
+3. 补更强的候选排序、冲突处理与合并策略
 4. 再决定是否接入真正的 LLM 抽取与冲突处理
 
 ## 版本控制
