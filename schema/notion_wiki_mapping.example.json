@@ -1,0 +1,15 @@
+{
+  "title_property": "Name",
+  "canonical_id_property": "Canonical ID",
+  "verification_property": "Verification",
+  "source_property": "Source",
+  "compounded_level_property": "Compounded Level",
+  "last_compounded_at_property": "Last Compounded At",
+  "aliases_property": "Aliases",
+  "topic_property": "Topic",
+  "append_heading": "增量更新",
+  "expired_status_values": [
+    "Expired",
+    "Needs Review"
+  ]
+}
