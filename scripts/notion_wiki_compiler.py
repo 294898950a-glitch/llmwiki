@@ -285,6 +285,15 @@ def split_aliases(raw_value: str) -> List[str]:
     return aliases
 
 
+def extract_unique_id_number(raw_value: str) -> Optional[int]:
+    if not raw_value:
+        return None
+    match = re.search(r"(\d+)$", raw_value.strip())
+    if not match:
+        return None
+    return int(match.group(1))
+
+
 def page_matches_query(
     page: Dict[str, Any],
     query: str,
@@ -306,8 +315,19 @@ def find_pages_by_canonical_id(
     database_id: str,
     canonical_id: str,
     canonical_property: str,
+    canonical_property_type: str,
 ) -> List[Dict[str, Any]]:
-    pages = query_database_pages(client, database_id, {})
+    filter_body: Optional[Dict[str, Any]] = None
+    if canonical_property_type == "rich_text":
+        filter_body = {"property": canonical_property, "rich_text": {"equals": canonical_id}}
+    elif canonical_property_type == "title":
+        filter_body = {"property": canonical_property, "title": {"equals": canonical_id}}
+    elif canonical_property_type == "unique_id":
+        unique_id_number = extract_unique_id_number(canonical_id)
+        if unique_id_number is not None:
+            filter_body = {"property": canonical_property, "unique_id": {"equals": unique_id_number}}
+
+    pages = query_database_pages(client, database_id, filter_body)
     normalized_canonical_id = normalize(canonical_id)
     matches = [
         page
@@ -458,13 +478,27 @@ def upsert_note_to_wiki(
     else:
         aliases_prop_type = database.get("properties", {}).get(aliases_prop, {}).get("type")
     canonical_prop = args.canonical_id_property or mapping.get("canonical_id_property")
+    canonical_prop_type = None
     if canonical_prop not in database.get("properties", {}):
         canonical_prop = None
+    else:
+        canonical_prop_type = database.get("properties", {}).get(canonical_prop, {}).get("type")
 
     candidates: List[Dict[str, Any]] = []
     if args.canonical_id and canonical_prop:
-        candidates = find_pages_by_canonical_id(client, database_id, args.canonical_id, canonical_prop)
+        candidates = find_pages_by_canonical_id(
+            client,
+            database_id,
+            args.canonical_id,
+            canonical_prop,
+            canonical_prop_type or "",
+        )
     if not candidates:
+        if args.canonical_id and canonical_prop:
+            print(
+                f"WARN: canonical_id={args.canonical_id!r} not matched in wiki; falling back to title/aliases search",
+                file=sys.stderr,
+            )
         candidates = search_in_database(
             client,
             database_id,

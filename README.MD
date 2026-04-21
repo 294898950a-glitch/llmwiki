@@ -99,6 +99,7 @@
 - 查询层当前能力：
   - `query_database` 已替代全局 `/search`
   - `Aliases` 查询会根据真实字段类型构造过滤（`rich_text` / `multi_select`）
+  - `Canonical ID` 查询优先使用 Notion 端属性过滤，必要时再回退到本地过滤
   - 分页查询已带基础熔断上限
 
 ## 幂等性与回滚
@@ -155,7 +156,6 @@
   - 目前是 `compile-from-raw <page_id>` 单条运行
 - 虽然 smoke test 已通过，但还存在实现层限制：
   - `query_database` 已替代全局 `/search`
-  - `find_pages_by_canonical_id` 仍是全表扫，尚未下推到 Notion 端属性过滤
   - 匹配仍缺少更强的判定与冲突处理
   - 目前只有文档层的幂等性与回滚约定，还没有代码层的严格幂等策略
   - LLM 归属与合并策略已在文档层明确：
@@ -179,9 +179,8 @@
    - 冲突保留证据
 2. 把“文档约定”升级成代码层幂等策略
 3. 把 compile 运行日志和 LLM 判断日志完整落盘到 `raw/notion_dumps/`
-4. 把 `Canonical ID` 查询从全表扫改成 Notion 端属性过滤
-5. 扩展 raw page body 的递归读取
-6. 增加批量编译队列
+4. 扩展 raw page body 的递归读取
+5. 增加批量编译队列
 
 ## 版本控制
 
