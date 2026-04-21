@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-22.r4
+> **Version**: 2026-04-22.r5
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -28,7 +28,8 @@ llmwiki/
 ├── .gitignore                       # 忽略 .env、raw/notion_dumps/*.jsonl 等
 ├── CLAUDE.md                        # 本文件
 ├── DESIGN_REVIEW.md                 # 设计与实现差距评审（含 v1 八条清单）
-├── LLM_EXTRACTION_DESIGN.md         # LLM 抽取归属与执行策略决策书
+├── EDITORIAL_POLICY.md              # 永久笔记结构 checklist 与脚本/会话分工
+├── LLM_EXTRACTION_DESIGN.md         # LLM 抽取归属、执行策略、会话层留痕约定
 ├── MERGE_STRATEGY.md                # 候选排序、冲突分级与合并策略
 ├── README.MD                        # 项目状态说明
 ├── README_REVIEW.md                 # README 与实际状态一致性评审
@@ -201,8 +202,8 @@ llmwiki/
 - `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
 - `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
 - `upsert-note`：显式传入 title/note/canonical 等直接写入 Wiki；支持 `--strict-alias`
-- `compile-from-raw <raw_page_id>`：从指定 raw page 编译到 Wiki，含 `body_hash` 幂等（含跨 raw 同 hash 的 `skipped_duplicate_body`）、raw 状态回写、可选 `--auto-refine` / `--strict-alias` / `--force`
-- `compile-queue --status <S> --limit N`：按 Raw Inbox Status 批量编译，失败不中断；支持 `--retry-failed` 从最近一次 queue audit 记录里取失败条目重跑
+- `compile-from-raw <raw_page_id>`：从指定 raw page 编译到 Wiki，含 `body_hash` 幂等（含跨 raw 同 hash 的 `skipped_duplicate_body`）、raw 状态回写、可选 `--auto-refine` / `--strict-alias` / `--strict-fuzzy` / `--emit-diff` / `--force`
+- `compile-queue --status <S> --limit N`：按 Raw Inbox Status 批量编译，失败不中断；支持 `--retry-failed` / `--filter PROP=VALUE`（可重复，和 Status 共同组成 AND 过滤）/ 同样的 strict/emit-diff flags
 - `log-session-event --model --tier --decision --risk --notes ...`：会话层留痕入口，写 `session-log.jsonl`，用于记录语义判断的 why
 - `cleanup-wiki-page <page_id>`：去重页面内的重复 `增量更新` section，支持 `--dry-run`
 - `lint`：按 `Verification` 列出 Expired / Needs Review 的 Wiki 页

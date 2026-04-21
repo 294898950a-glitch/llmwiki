@@ -33,8 +33,8 @@
 - `inspect-schema --database raw|wiki`
 - `search <query>`
 - `upsert-note`
-- `compile-from-raw <page_id>` ——支持 `--force` / `--auto-refine` / `--strict-alias`
-- `compile-queue --status <S> --limit N` ——支持 `--retry-failed`
+- `compile-from-raw <page_id>` ——支持 `--force` / `--auto-refine` / `--strict-alias` / `--strict-fuzzy` / `--emit-diff`
+- `compile-queue --status <S> --limit N` ——支持 `--retry-failed` / `--filter PROP=VALUE`（可重复）/ 同样的 strict/emit-diff flags
 - `log-session-event` ——会话层留痕入口（写 `session-log.jsonl`）
 - `cleanup-wiki-page <page_id>` ——去重页面内重复的 `增量更新` section，支持 `--dry-run`
 - `lint`
@@ -102,6 +102,13 @@
   - 写入 `raw/notion_dumps/YYYY-MM-DD-session-log.jsonl`，配合 `LLM_EXTRACTION_DESIGN.md` 的"会话层留痕约定"
 - 对已有 wiki 页面做重复 `增量更新` 清理：
   - `cleanup-wiki-page <page_id>`，支持 `--dry-run`
+- tier 4 审查：无 canonical/title/alias 命中但存在 fuzzy 同主题候选时：
+  - 默认输出 stderr warning，继续建新页
+  - `--strict-fuzzy` 直接 raise，由人或会话层决定
+- 冲突 diff 证据：`compile-from-raw --emit-diff`：
+  - compile-log 里现在始终存 raw body 截取（≤ 8000 字符）
+  - update 路径下若上一次 compile 留有 body_text，则计算段落级 unified diff 并 append 为 `差异分析 YYYY-MM-DD` 代码块
+- Raw Inbox 多维过滤：`compile-queue --filter PROP=VALUE`（可重复）与 `--status` 合成 AND 过滤，覆盖 status/select/rich_text/title/checkbox/number/multi_select 常见类型
 - 可选的低风险整理（默认关闭，`--auto-refine` 开启）：
   - 章节标题收束为主题标题
   - 自动补 `Aliases / Topic / Last Compounded At`
@@ -224,25 +231,33 @@
   - 脚本层已部分实现 MERGE_STRATEGY 的 tier 3 / 冲突证据：
     - alias 命中会触发 `review_required: true` 或 `--strict-alias` 硬停
     - 会话层可通过 `log-session-event` 登记判断
-  - 脚本层尚未实现：
-    - tier 4 主题相近无明确标识的"停下来问用户"分支
-    - 结构化 diff 证据（仅 append `增量更新` block，无与旧内容的差异标注）
+  - 脚本层当前具备：
+    - tier 4 fuzzy 候选感知（`--strict-fuzzy` 可硬停）
+    - 段落级 unified diff 证据（`--emit-diff`，需上次 compile 留有 body_text）
+  - 仍待推进：
+    - 真正的永久笔记结构化验证（见 `EDITORIAL_POLICY.md`；当前 checklist 仅文档层）
+    - 基于 diff 的"核心判断是否需要重写"决策（归会话层）
 
 ## 下一步
 
-上一轮挂账已经清：
-- `cleanup-wiki-page` 子命令替代了手工去重 `增量更新` block（对应"live 优化经验沉淀"）
-- tier 3 alias 命中现在触发 stderr warning + `review_required: true`，或 `--strict-alias` 硬停
-- `body_hash` 幂等升级成"跨 raw 同 hash 也跳过"（`skipped_duplicate_body`），附带 warning 与关联的 originating raw/wiki
-- `log-session-event` 子命令 + `LLM_EXTRACTION_DESIGN.md` 的"会话层留痕约定"段落
-- `compile-queue --retry-failed` 从最近一次 audit 记录读失败条目重跑
+上几轮挂账已经清：
+- `cleanup-wiki-page`：替代手工去重 `增量更新` block（原"live 优化经验沉淀"）
+- alias 命中：`review_required: true` + `--strict-alias`（tier 3）
+- fuzzy 命中：stderr warning + `--strict-fuzzy` 硬停（tier 4）
+- `body_hash` 幂等：跨 raw 同 hash `skipped_duplicate_body`；compile-log 现在留 body_text 截取
+- `log-session-event` + `LLM_EXTRACTION_DESIGN.md` 会话层留痕约定（DESIGN_REVIEW v1 第⑤条销账）
+- `compile-queue --retry-failed`：从最近一次 audit 里拉失败条目重跑
+- `compile-queue --filter PROP=VALUE`：多维过滤，支持 status/select/rich_text/title/checkbox/number/multi_select
+- `compile-from-raw --emit-diff`：段落级 unified diff 作为 `差异分析 YYYY-MM-DD` 代码块追加
+- `EDITORIAL_POLICY.md`：永久笔记结构 checklist（文档层，未强制执行）
 
-仍待推进：
+尚未做（需要专项设计、非一两轮能定稿）：
 
-1. **深度整理升级成"真正永久笔记结构"**：当前 `--auto-refine` 仍是硬编码 `infer_*` 启发式；要达到永久笔记水准必须由会话层介入。脚本侧可能需要一个 `refine-wiki-page` 子命令接受会话层产出的内容块，但"什么是永久笔记的正确结构"本身是 editorial policy，建议先起一个专门的设计文档再动代码。
-2. **tier 4 代码层停顿**（主题相近无明确标识）：当前未实现；需要在 `upsert_note_to_wiki` 里先查"近似候选"（fuzzy 标题匹配），若有但无 tier 1-3 命中则返回 `decision: ask_user` 不写入。待设计。
-3. **冲突 diff 证据结构化**：目前只靠 append `增量更新` block，没有与旧结论对比。要做需要先定义 diff 语义（段落级？句级？属性级？）。
-4. **`compile-queue` 筛选升级**：目前按 Status 一维；未来可加 `--priority` / `--type` / `--since DATE`，等 Raw Inbox 真的建了对应字段再做。
+1. **永久笔记结构的代码层强制**：`EDITORIAL_POLICY.md` 已定义 checklist，但脚本不会阻止"不合格"页面。未来可在 `lint` 里新增一条 `--check-editorial` 选项，对缺段的 wiki 页列表化。
+2. **对象级"同 wiki 同状态跳过"**：当前跨 raw 同 hash 已能跳过；但"同一 wiki 对象已达到目标内容，即便 raw 变了也应跳过"尚无实现（需先定义"目标内容"）。
+3. **基于 diff 的核心判断重写**：`--emit-diff` 只记录差异，没有触发摘要重写；重写是会话层 editorial 决策，脚本不代做。
+
+这三项都属于"把语义判断做得更深"而非"把工具链补齐"，按 `LLM_EXTRACTION_DESIGN.md` 的分工，应留给会话层逐步积累案例后再回收到脚本。
 
 ## 版本控制
 
@@ -277,9 +292,10 @@
 
 - [`CLAUDE.md`](./CLAUDE.md)：系统设计蓝图
 - [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md)：设计与实现差距评审
-- [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)：LLM 抽取归属与执行策略
+- [`EDITORIAL_POLICY.md`](./EDITORIAL_POLICY.md)：永久笔记结构与分工 checklist
+- [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)：LLM 抽取归属、执行策略、会话层留痕约定
 - [`MERGE_STRATEGY.md`](./MERGE_STRATEGY.md)：候选排序、冲突处理与合并策略
 - [`README.MD`](./README.MD)：项目状态说明
 - [`README_REVIEW.md`](./README_REVIEW.md)：README 与实际状态一致性评审
 - [`schema/notion_wiki_mapping.example.json`](./schema/notion_wiki_mapping.example.json)：字段映射模板
-- [`scripts/notion_wiki_compiler.py`](./scripts/notion_wiki_compiler.py)：最小编译器脚本
+- [`scripts/notion_wiki_compiler.py`](./scripts/notion_wiki_compiler.py)：Notion API 执行层
