@@ -227,12 +227,41 @@ def extract_property_text(page: Dict[str, Any], property_name: str) -> str:
         return rich_text_plain_text(prop.get("rich_text", []))
     if prop_type == "url":
         return prop.get("url") or ""
+    if prop_type == "email":
+        return prop.get("email") or ""
+    if prop_type == "phone_number":
+        return prop.get("phone_number") or ""
     if prop_type == "select":
         value = prop.get("select")
         return value.get("name", "") if value else ""
     if prop_type == "status":
         value = prop.get("status")
         return value.get("name", "") if value else ""
+    if prop_type == "multi_select":
+        values = prop.get("multi_select", []) or []
+        return ", ".join(v.get("name", "") for v in values if v.get("name"))
+    if prop_type == "number":
+        value = prop.get("number")
+        return "" if value is None else str(value)
+    if prop_type == "checkbox":
+        return "true" if prop.get("checkbox") else "false"
+    if prop_type == "date":
+        value = prop.get("date")
+        if not value:
+            return ""
+        start = value.get("start") or ""
+        end = value.get("end")
+        return f"{start} – {end}" if end else start
+    if prop_type == "people":
+        values = prop.get("people", []) or []
+        return ", ".join(p.get("name") or p.get("id", "") for p in values)
+    if prop_type == "relation":
+        values = prop.get("relation", []) or []
+        return ", ".join(v.get("id", "") for v in values)
+    if prop_type == "files":
+        values = prop.get("files", []) or []
+        names = [v.get("name", "") for v in values if v.get("name")]
+        return ", ".join(names)
     if prop_type == "unique_id":
         value = prop.get("unique_id")
         if not value:
@@ -240,6 +269,47 @@ def extract_property_text(page: Dict[str, Any], property_name: str) -> str:
         prefix = value.get("prefix") or ""
         number = value.get("number")
         return f"{prefix}{number}" if number is not None else ""
+    if prop_type == "formula":
+        value = prop.get("formula") or {}
+        formula_type = value.get("type")
+        if formula_type == "string":
+            return value.get("string") or ""
+        if formula_type == "number":
+            num = value.get("number")
+            return "" if num is None else str(num)
+        if formula_type == "boolean":
+            return "true" if value.get("boolean") else "false"
+        if formula_type == "date":
+            inner = value.get("date") or {}
+            return inner.get("start") or ""
+        return ""
+    if prop_type == "rollup":
+        value = prop.get("rollup") or {}
+        rollup_type = value.get("type")
+        if rollup_type == "number":
+            num = value.get("number")
+            return "" if num is None else str(num)
+        if rollup_type == "date":
+            inner = value.get("date") or {}
+            return inner.get("start") or ""
+        if rollup_type == "array":
+            parts: List[str] = []
+            for item in value.get("array", []) or []:
+                item_type = item.get("type")
+                if item_type == "title":
+                    parts.append(rich_text_plain_text(item.get("title", [])))
+                elif item_type == "rich_text":
+                    parts.append(rich_text_plain_text(item.get("rich_text", [])))
+                elif item_type == "number":
+                    num = item.get("number")
+                    if num is not None:
+                        parts.append(str(num))
+            return ", ".join(p for p in parts if p)
+        return ""
+    if prop_type == "created_time":
+        return prop.get("created_time") or ""
+    if prop_type == "last_edited_time":
+        return prop.get("last_edited_time") or ""
     return ""
 
 
