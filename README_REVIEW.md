@@ -170,3 +170,94 @@ README 列的 5 步：
 - 未调用 Notion API 验证 README 中声明的字段拓扑（title=`Source`、`Source ` 尾部带空格等）。
 - 未评估 `Compounded Level` 为 `rich_text` 时 `--increment-compounded-level` 的实际失败模式。
 - 未评估 relation 回写时 `property_payload_for_value` 对 id 合法性的防御（当前代码没做 id 格式校验）。
+
+---
+
+## v3 · 2026-04-21
+
+- **评审对象**：`README.MD`（工作树，未提交 —— 较 v2 有重大 Wiki schema 清理）
+- **对照对象**：
+  - `CLAUDE.md` (Version 2026-04-21.r2，`cb0b27c`)
+  - `scripts/notion_wiki_compiler.py`（`86e75bc`，未变）
+  - `schema/notion_wiki_mapping.example.json`（`86e75bc`，未变）
+- **锚定 git 状态**：`cb0b27c`（HEAD） + README.MD 单文件未提交
+- **评审者**：Claude Opus 4.7 (1M context)，模型 ID `claude-opus-4-7`
+- **与 v2 差异**：Wiki 数据库 schema 已整理完毕：title 回到 `Name`、`Source` 成为唯一 relation 字段（尾部空格消失）、新增 `Verification` / `Last Compounded At`、`Compounded Level` 升级为 `number`。下一步从 8 步压回 5 步。
+
+### 1. 重大状态变化
+
+- v2 最大的风险点「Wiki schema 与 mapping 脱钩」**已整体消除**。原因：用户把 Wiki 库的字段改得和原 mapping 对齐，而不是改 mapping 去迁就 Wiki —— 这是更彻底的收敛方向。
+- 原来的 `Source` (title) vs `Source ` (relation, 尾部带空格) 命名冲突**已消除**：title 回到 `Name`，只剩一个 `Source` 字段且是 relation。
+- v2 列出的 Wiki 5 个类型/字段缺陷（`Verification` 缺 / `Last Compounded At` 缺 / `Compounded Level` 类型错 / `Source` 歧义 / title 错位）**全部落地**。
+
+### 2. README 声明 vs 实际核对
+
+| README 声明 | 实际状态 | 判定 |
+|---|---|---|
+| Wiki 标题 = `Name`（title） | 依赖 README 自述，未经 API 验证 | ⚠️ 未独立验证 |
+| Wiki 已有 `Source`(relation) / `Canonical ID` / `Aliases` / `Compounded Level` / `Last Compounded At` / `Topic` / `Verification` | 依赖 README 自述 | ⚠️ 未独立验证 |
+| `Compounded Level` 现在是 `number` | 若属实，脚本 `--increment-compounded-level` 路径（`{"number": current + 1}`）可正常工作 | ✅ 技术前提成立 |
+| `Verification` 现在是 `status` | 脚本 `property_payload_for_value` 支持 status 类型写入，`lint` 过滤也不会再因字段不存在而崩 | ✅ 技术前提成立 |
+
+### 3. `schema/notion_wiki_mapping.example.json` 实际对齐度（无需修改）
+
+v2 时认定为重大债的 mapping 文件，现在因 Wiki schema 调整**实际已对齐**：
+
+| mapping key | mapping 值 | 新 Wiki 中是否存在 | 判定 |
+|---|---|---|---|
+| `title_property` | `Name` | 是（title） | ✅ |
+| `source_property` | `Source` | 是（relation） | ✅ |
+| `canonical_id_property` | `Canonical ID` | 是 | ✅ |
+| `verification_property` | `Verification` | 是（status） | ✅ |
+| `compounded_level_property` | `Compounded Level` | 是（number） | ✅ |
+| `last_compounded_at_property` | `Last Compounded At` | 是（date） | ✅ |
+| `aliases_property` | `Aliases` | 是 | ✅ |
+| `topic_property` | `Topic` | 是 | ✅ |
+
+**结论**：README 步骤 1「根据真实字段名更新 mapping」其实**已经隐式完成**，下一次 commit 只需要把这句话改成「已核对 mapping 和真实 schema 对齐」即可。除非 `Aliases` / `Canonical ID` / `Topic` 的 Notion 类型和 `property_payload_for_value` 期望不同（例如 `Aliases` 是 multi_select 还是 rich_text 未定），这才需要在 mapping 层加 hint。
+
+### 4. DESIGN_REVIEW v1 八条清单进度（v3 回归）
+
+| v1 意见 | v2 状态 | v3 状态 | 变化 |
+|---|---|---|---|
+| ① 拆双 DB id | ✅ | ✅ | — |
+| ② 读 raw body | ✅ | ✅ | — |
+| ③ canonical_id / aliases 匹配 | ❌ | ❌ | 前置条件更完备（两个字段都已在 Wiki 落地） |
+| ④ Raw 状态回写 | ✅✅ | ✅✅ | — |
+| ⑤ 明确 LLM 抽取位置 | ❌ | ❌ | README 步骤 5 仍"再决定" |
+| ⑥ `/search` → `query_database` | ❌ | ❌ | README 步骤 3 |
+| ⑦ 澄清 `raw/.sync_state.json` | ❌ | ❌ | CLAUDE.md 目录树仍未修 |
+| ⑧ 冲突 diff | ❌ | ❌ | — |
+
+**完成率**：仍 3/8，但下一步的路径更清晰 —— 现在挡在 ③ 前面的 schema 债已扫除。
+
+### 5. 「下一步」5 步方案合理性
+
+README 现列的 5 步：
+
+1. 根据真实字段名更新 `schema/notion_wiki_mapping.example.json`
+2. 选一条 raw page 做第一次真实 `compile-from-raw`
+3. 将 `search_in_database` 改成 `query_database` 属性过滤
+4. 补 `Canonical ID` 和 `Aliases` 匹配
+5. 再决定是否接入真正的 LLM 抽取与冲突处理
+
+**合理的部分**：
+- 顺序依然对。schema → smoke → 改查询方式 → 强化匹配 → 引入 LLM。
+- 步骤 3 前置于步骤 4 继承了 v1 / v2 review 的意见，保持住了。
+
+**需要收紧的部分**：
+- **步骤 1 可能已是 no-op**：见本版第 3 节 —— mapping 文件与真实 Wiki 字段已经对齐。建议把步骤 1 重写为「dry-run：跑一次 `inspect-schema --database wiki` 并对照 mapping，确认类型（特别是 `Aliases` / `Canonical ID` / `Topic` 的 Notion 类型）能被 `property_payload_for_value` 覆盖」—— 这是真正需要动手的事，而不是"改字段名"。
+- **步骤 2 smoke test 之前最好先准备 rollback 机制**：`compile-from-raw` 一旦成功，会往 Wiki 里建新页、往 Raw 写 `Compiled` + relation。如果 smoke 页测脏了，没办法一键回滚。建议第一条 smoke 跑完后保留一个"已知 Compiled"的 raw page id 和对应 Wiki page id，用于后续幂等验证。
+- **步骤 5「再决定」已连续三版未定**：v1 / v2 / v3 都提了。到步骤 4 完成时必须定，否则再下一版 review 会继续重复这条。
+
+### 6. 仍未修的旧漂移（独立于下一步）
+
+- **CLAUDE.md 目录树**：`raw/.sync_state.json` 仍列着但不存在；`DESIGN_REVIEW.md` / `README.MD` / `README_REVIEW.md` / `.clinerules-*` / `wiki/index.md` 仍未列入。v1、v2 都点过，v3 继续挂账。
+- **`raw/notion_dumps/` 仍为空**：两次 Wiki schema 调整（切库 → 清理）的 `inspect-schema` 输出都没被保存为只读快照。这是 CLAUDE.md 三级编译里 raw 层本应承担的审计职责，但实际被跳过。建议下次跑 `inspect-schema` 时把 JSON 落盘到 `raw/notion_dumps/` 或 `schema/` 下，带时间戳文件名。
+- **README.MD 「推荐 commit 粒度」示例与实际 git log 不吻合**：v2 指出过；最新的 2 笔（`d6fe4dd` / `cb0b27c`）倒是按粒度拆了，但示例里列的 4 条命令仍与实际 history 对不上。可以把示例改成本仓库最近的真实 commit 作为参照。
+
+### 7. 本版未覆盖
+
+- 未调用 Notion API 验证新 Wiki 8 个字段的真实类型是否与 README 声明一致（尤其是 `Aliases` / `Topic` 的类型未在 README 里点明 —— 可能是 multi_select、rich_text、relation 之一）。
+- 未实际跑 `compile-from-raw` smoke test。
+- 未评估 `Compounded Level` 升级为 `number` 后，若已有历史 `rich_text` 数据会如何迁移。
