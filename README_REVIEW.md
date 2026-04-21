@@ -389,3 +389,90 @@ README 新列的 4 步：
 - 未独立验证 smoke test 成功的 page id 是否真存在于 Notion（信任 v4 的实测结论）。
 - 未评估 `normalize_notion_id` 是否覆盖其他 ID 比较路径（如 `wiki_result["page_id"]` 作为 relation 传回时是否需要归一化—— Notion API 接收 relation id 时两种格式都接受，所以应该不需要，但值得 smoke 多条后再确认）。
 - 未评估重跑同一 raw page 时 `Target Wiki Page` relation 回写是否会生成重复项（Notion relation 默认是 set 语义，应当自动去重，但未实测）。
+
+---
+
+## v6 · 2026-04-21
+
+- **评审对象**：`README.MD`（工作树，未提交） + `scripts/notion_wiki_compiler.py`（工作树，大幅重写）
+- **对照对象**：
+  - `CLAUDE.md` (Version 2026-04-21.r2)
+  - `schema/notion_wiki_mapping.example.json`（HEAD = `415c759`）
+- **锚定 git 状态**：`415c759`（HEAD） + 2 个未提交修改（README.MD / scripts/...）
+- **评审者**：Claude Opus 4.7 (1M context)，模型 ID `claude-opus-4-7`
+- **与 v5 差异**：脚本完成了 DESIGN_REVIEW v1 第⑥条（`/search` → `query_database`）和第③条（canonical_id + aliases 匹配）的真实落地；同时 proactively 加了分页、`unique_id` 属性类型支持。这是自 v1 以来**单次跨度最大的代码跃进**。
+
+### 1. 本版最重要的事实：DESIGN_REVIEW v1 两条核心瓶颈已落地
+
+- **⑥ `/search` → `query_database`**：
+  - `search_in_database` 完全重写（`:290-314`），改用 `query_database_pages` + `title.contains` + `aliases.rich_text.contains` 的 `or` 过滤。
+  - 新增 `query_database_pages`（`:210-227`）内置 `has_more` / `next_cursor` 分页循环 —— v1/v5"未覆盖"清单里列的运行时隐患被顺手解决。
+- **③ canonical_id + aliases 匹配**：
+  - 新增 `find_pages_by_canonical_id`（`:274-288`），`upsert_note_to_wiki`（`:393-416`）现在按"canonical_id 命中 → title+aliases 候选"的顺序查找，与 CLAUDE.md Agent 指令基线完全一致。
+  - 新增 `split_aliases`（`:246-254`）用 `[,;\n|/、，；]+` 分隔，覆盖中英常用写法。
+  - 新增 `page_matches_query`（`:257-271`）把 title-equal 和 alias-in-set 两种命中逻辑统一。
+  - `extract_property_text` 新增 `unique_id` 类型分支（`:178-184`）—— 如果 Notion 里 `Canonical ID` 建成 unique_id 类型，能直接取到 `prefix + number` 字符串。
+
+**DESIGN_REVIEW v1 完成率**：从 3/8 跃升到 **5/8**。
+
+### 2. DESIGN_REVIEW v1 八条清单进度（v6 回归）
+
+| v1 意见 | v5 状态 | v6 状态 | 变化 |
+|---|---|---|---|
+| ① 拆双 DB id | ✅ | ✅ | — |
+| ② 读 raw body | ✅ | ✅ | — |
+| ③ canonical_id / aliases 匹配 | ❌ | ✅ | **本版落地** |
+| ④ Raw 状态回写 | ✅✅✅ | ✅✅✅ | — |
+| ⑤ 明确 LLM 抽取位置 | ❌ | ❌ | **连续 5 版挂账** |
+| ⑥ `/search` → `query_database` | ❌ | ✅ | **本版落地** |
+| ⑦ 澄清 `raw/.sync_state.json` | ❌ | ❌ | CLAUDE.md 目录树仍未修 |
+| ⑧ 冲突 diff | ❌ | ❌ | smoke 重跑仍会 append，不做 diff |
+
+### 3. README 内部不一致（需立刻修）
+
+这是本版唯一硬漂移：
+
+- **「下一步」步骤 1 "将 `search_in_database` 改成 `query_database` 属性过滤" 已过期**：代码本次已完成。但限制段里又写了「`query_database` 已替代全局 `/search`」，两处矛盾。
+  - 建议删除步骤 1，把后面三步向上提：① 幂等性 + 回滚、② 更强的候选排序/冲突/合并策略、③ LLM 决策。
+  - 或者把步骤 1 改写为「给 `find_pages_by_canonical_id` 换成 query_database 的属性 filter，减少全表扫」—— 当前实现是"拉全库后 python 过滤"，大库下会有性能债（见本版第 4 节）。
+
+### 4. 代码质量观察（非硬错但值得标注）
+
+- **`find_pages_by_canonical_id` 是全表扫**（`:274-288`）：`query_database_pages(client, database_id, {})` 无 filter 会拉全部 page。如果 `Canonical ID` 是 `rich_text` 或 `unique_id`，更干净的做法是用 `{"property": canonical_property, "rich_text": {"equals": canonical_id}}` 或 `{"unique_id": {"equals": ...}}` 让 Notion 端过滤。当前实现正确但不高效，建议列为下一步技术债。
+- **`search_in_database` 过滤器对 aliases 假设类型是 `rich_text`**（`:312`）：如果真实 Notion 里 `Aliases` 被建成 `multi_select`，这个过滤会直接报 `validation_error`。README 未说明 `Aliases` 的类型，需要 schema 探测回填。建议从 mapping 里读 `aliases_property_type` 作为 hint，或 runtime 根据 schema 判断。
+- **canonical 分支里"候选为空即 fallback"的语义**（`upsert_note_to_wiki:402-405`）：如果 `canonical_id` 传入但库里真没匹配，会**静默 fallback 到标题搜索**。这在"新建"场景下是对的（找不到就建新页），但在"用户显式传 canonical_id 期望精确命中"场景下会误合并到同名不同实体的页。建议加一个 `--strict-canonical` flag 或至少在 fallback 时 print 一行 warning。
+- **分页循环无上限**（`:220-225`）：big-DB + 故意构造的 pathological page 可能让这里跑很久，目前没有 `max_pages` 保护。v1 里列过这点，现在分页做了但没加熔断，下一步补。
+
+### 5. README 其余部分 vs 代码核对
+
+| README 声明 | 实际状态 | 判定 |
+|---|---|---|
+| "在 Wiki 数据库中进行数据库内候选检索" | `query_database_pages` 只查 `database_id` 指定库 | ✅ |
+| "优先按 `Canonical ID` 匹配（如果传入）" | `upsert_note_to_wiki:402-403` 先跑 `find_pages_by_canonical_id` | ✅ |
+| "其次按标题与 `Aliases` 检索候选" | `search_in_database` 的 `or` 过滤含 title + aliases | ✅ |
+| "已有 `Canonical ID + Aliases` 基础匹配" | 与代码一致 | ✅ |
+| "还没有更完整的候选排序、冲突判断和合并策略" | `upsert` 仍是"命中就 append"，无 diff / 无冲突标注 | ✅ 诚实自述 |
+
+### 6. 仍未修的旧漂移（独立挂账清单）
+
+- **CLAUDE.md 目录树**（v1/v2/v3/v5/v6 连续挂账）：`raw/.sync_state.json` 仍列但不存在；`DESIGN_REVIEW.md` / `README.MD` / `README_REVIEW.md` / `.clinerules-*` / `wiki/index.md` 仍未列入。
+- **`raw/notion_dumps/` 仍为空**（v2/v3/v5/v6 挂账）：schema 快照、smoke test 原始输出仍未落盘。现在脚本复杂度上去了，反而**更需要**这份 raw audit——否则下次回归时不知道当初到底打了哪个 `Aliases` 类型的 Notion 库。
+- **commit 粒度示例 vs 实际 git log**（v2/v3/v5 挂账）：README 示例未更新。
+- **DESIGN_REVIEW v1 第⑤条（LLM 抽取位置）连续 5 版挂账**：现在已经完成 ③⑥，下一步要做"更强的候选排序、冲突判断和合并策略"本质上就是 LLM 能力的触发点。第⑤条不再是"将来要做"而是"马上卡脖子"。强烈建议开 `LLM_EXTRACTION_DESIGN.md` 先定策略。
+
+### 7. 「下一步」合理性（修正 README drift 后）
+
+假设删除 stale 的步骤 1，实际下一步应该是：
+
+1. 幂等性 + 回滚说明（README 原步骤 2）
+2. 更强的候选排序 / 冲突判断 / 合并策略（README 原步骤 3）—— **必须先定 LLM 归属**
+3. 决定 LLM 抽取位置（README 原步骤 4）
+
+三步之间有强依赖：步骤 2 的"冲突判断"没有 LLM 支撑时做不出 DESIGN_REVIEW v1 第⑧条想要的 "diff 保留证据" 效果。**建议把步骤 3 前置到步骤 2 之前**——LLM 位置定了，才知道冲突 diff 是在脚本层做（call Claude API）还是在 Claude Code 会话里做（human-in-the-loop）。
+
+### 8. 本版未覆盖
+
+- 未实测 `query_database` 的 title/rich_text `contains` 过滤在 Unicode / 空格 / 特殊字符场景下的行为。
+- 未评估 `Aliases` 实际类型（仍依赖 README 自述）。
+- 未评估 `find_pages_by_canonical_id` 在大库（>1000 页）下的延迟。
+- 未独立运行新 `search_in_database`，若 `aliases_property` 在真实 Wiki 里是 `multi_select`，代码会在 runtime 报错。
