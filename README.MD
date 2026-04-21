@@ -34,6 +34,7 @@
 - `search <query>`
 - `upsert-note`
 - `compile-from-raw <page_id>`
+- `compile-queue`
 - `lint`
 
 当前已确认的数据库结构：
@@ -72,12 +73,21 @@
   - 命中已有页面则更新
   - 未命中则新建页面
 - 从 Raw Inbox 指定 page 读取正文
+- 递归读取 raw page body 的嵌套 block
 - 将 raw page body 内容编译到 Wiki
+- 对相同 raw page 执行最小代码层幂等检查：
+  - 基于 `body_hash`
+  - 命中本地成功编译历史时默认 `skipped_unchanged`
+  - 可用 `--force` 强制重跑
 - 编译后回写 Raw 记录的：
   - `Status`
   - `Processed At`
   - `Target Wiki Page`
 - 将 `inspect-schema` 的结果落盘到 `raw/notion_dumps/`
+- 将命令执行事件统一落盘到 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`
+- 将 compile 结果落盘到 `raw/notion_dumps/YYYY-MM-DD-compile-log.jsonl`
+- 按 `Raw Inbox` 的状态批量编译：
+  - `compile-queue --status "Not started" --limit N`
 
 说明：
 
@@ -101,12 +111,22 @@
   - `Aliases` 查询会根据真实字段类型构造过滤（`rich_text` / `multi_select`）
   - `Canonical ID` 查询优先使用 Notion 端属性过滤，必要时再回退到本地过滤
   - 分页查询已带基础熔断上限
+- 匹配层当前能力：
+  - `Canonical ID / title / alias` 已区分匹配策略
+  - 同一策略出现多个候选时直接报错，避免静默误并
 
 ## 幂等性与回滚
 
 当前 `compile-from-raw` 的运行语义如下：
 
-- 同一条 raw page 再次运行时，不会自动按 `source_id` 去重。
+- 同一条 raw page 再次运行时，会先计算当前 raw body 的 `body_hash`。
+- 脚本会读取本地成功编译历史：
+  - `raw/notion_dumps/*-audit-log.jsonl`
+- 如果同一 raw page 的最新成功编译记录与当前 `body_hash` 一致，则默认：
+  - 返回 `skipped_unchanged`
+  - 不再重复写入 wiki
+- 如确需重跑，可显式加：
+  - `--force`
 - 当前 upsert 主要依赖：
   - `Canonical ID`（如果显式传入）
   - 标题与 `Aliases`
@@ -114,8 +134,8 @@
   - 更新页面属性
   - 再追加一段新的 `增量更新` block
 - 这意味着当前的“重跑”语义是：
-  - **不一定重建页面**
-  - **但大概率会重复追加内容**
+  - **同内容重跑默认跳过**
+  - **内容变化后重跑仍会继续追加，而不是覆盖**
 
 对 smoke test 的当前约定：
 
@@ -149,15 +169,10 @@
 - 匹配逻辑仍然偏弱：
   - 已有 `Canonical ID + Aliases` 基础匹配
   - 但还没有更完整的候选排序、冲突判断和合并策略
-- Raw page body 读取还比较浅：
-  - 当前只读取第一层 block 文本
-  - 还没有递归处理深层嵌套 block
-- 还没有批量编译队列：
-  - 目前是 `compile-from-raw <page_id>` 单条运行
 - 虽然 smoke test 已通过，但还存在实现层限制：
   - `query_database` 已替代全局 `/search`
   - 匹配仍缺少更强的判定与冲突处理
-  - 目前只有文档层的幂等性与回滚约定，还没有代码层的严格幂等策略
+  - 当前幂等仍是“按 raw page 最新 `body_hash` 跳过重复追加”的最小实现，不是基于 source 级别的严格对象幂等
   - LLM 归属与合并策略已在文档层明确：
     - [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)
     - [`MERGE_STRATEGY.md`](./MERGE_STRATEGY.md)
@@ -165,9 +180,9 @@
     - tier 3 的二次判断
     - tier 4 的停下来问用户
     - 自动 diff / 冲突保留证据
-  - `raw/notion_dumps/` 目前只落了 schema 快照，还没有完整沉淀：
-    - 每次 compile 的可回放运行日志
+  - `raw/notion_dumps/` 目前已经落了 schema 快照、audit 事件和 compile 结果，但还没有：
     - LLM 判断日志
+    - 面向冲突分析的结构化 diff 证据
 
 ## 下一步
 
@@ -177,10 +192,9 @@
    - tier 3 二次判断
    - tier 4 停下来问用户
    - 冲突保留证据
-2. 把“文档约定”升级成代码层幂等策略
-3. 把 compile 运行日志和 LLM 判断日志完整落盘到 `raw/notion_dumps/`
-4. 扩展 raw page body 的递归读取
-5. 增加批量编译队列
+2. 把当前最小 `body_hash` 幂等升级成更严格的对象级幂等策略
+3. 补 LLM 判断日志和冲突 diff 证据落盘
+4. 给 `compile-queue` 增加更细的筛选与失败重试策略
 
 ## 版本控制
 
