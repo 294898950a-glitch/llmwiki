@@ -182,6 +182,24 @@ def rich_text_value(text: str) -> List[Dict[str, Any]]:
     return [{"type": "text", "text": {"content": text}}]
 
 
+def chunk_text(text: str, max_len: int = 1800) -> List[str]:
+    if len(text) <= max_len:
+        return [text]
+    chunks: List[str] = []
+    start = 0
+    while start < len(text):
+        end = min(start + max_len, len(text))
+        if end < len(text):
+            newline = text.rfind("\n", start, end)
+            if newline > start:
+                end = newline
+        chunk = text[start:end].strip()
+        if chunk:
+            chunks.append(chunk)
+        start = end
+    return chunks or [text[:max_len]]
+
+
 def title_property_payload(text: str) -> Dict[str, Any]:
     return {"title": rich_text_value(text)}
 
@@ -532,6 +550,12 @@ def property_payload_for_value(prop_meta: Dict[str, Any], value: Any) -> Dict[st
     raise NotionError(f"Unsupported property type for automatic write: {prop_type}")
 
 
+def relation_targets_database(prop_meta: Dict[str, Any], expected_database_id: str) -> bool:
+    relation = prop_meta.get("relation", {})
+    actual_database_id = relation.get("database_id")
+    return normalize_notion_id(actual_database_id) == normalize_notion_id(expected_database_id)
+
+
 def build_properties(database: Dict[str, Any], mapping: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
     props_meta = database.get("properties", {})
     title_name = args.title_property or mapping.get("title_property") or detect_title_property(database)
@@ -562,13 +586,16 @@ def build_append_blocks(note: str, heading: str, source_url: Optional[str]) -> L
             "object": "block",
             "type": "heading_2",
             "heading_2": {"rich_text": rich_text_value(f"{heading} {timestamp[:10]}")},
-        },
-        {
-            "object": "block",
-            "type": "paragraph",
-            "paragraph": {"rich_text": rich_text_value(note)},
-        },
+        }
     ]
+    for chunk in chunk_text(note):
+        blocks.append(
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": rich_text_value(chunk)},
+            }
+        )
     if source_url:
         blocks.append(
             {
@@ -577,6 +604,312 @@ def build_append_blocks(note: str, heading: str, source_url: Optional[str]) -> L
                 "bookmark": {"url": source_url},
             }
         )
+    return blocks
+
+
+def infer_semantic_title(raw_title: str) -> str:
+    title = raw_title.strip()
+    chapter_match = re.match(r"^第\s*\d+\s*章\s*(.+)$", title)
+    if chapter_match:
+        title = chapter_match.group(1).strip()
+    for delimiter in ("：", ":"):
+        if delimiter in title:
+            left, _right = title.split(delimiter, 1)
+            left = left.strip()
+            if 1 < len(left) <= 80:
+                return left
+    return title
+
+
+def merge_alias_values(*groups: str) -> str:
+    seen = set()
+    ordered: List[str] = []
+    for group in groups:
+        if not group:
+            continue
+        parts = [part.strip() for part in re.split(r"[,;\n|/、，；]+", group) if part.strip()]
+        if not parts:
+            parts = [group.strip()]
+        if len(parts) == 1 and parts[0] != group.strip():
+            parts.append(group.strip())
+        elif len(parts) == 1:
+            parts = [group.strip()]
+        for alias in parts:
+            key = normalize(alias)
+            if key and key not in seen:
+                seen.add(key)
+                ordered.append(alias)
+    return ", ".join(ordered)
+
+
+def infer_topics(title: str, note: str) -> str:
+    haystack = normalize(f"{title}\n{note}")
+    topic_map = [
+        ("query loop", "Query Loop"),
+        ("queryengine", "Query Engine"),
+        ("agent", "Agent Runtime"),
+        ("runtime", "Agent Runtime"),
+        ("state", "State Management"),
+        ("session", "State Management"),
+        ("tool_use", "Tool Orchestration"),
+        ("tool", "Tool Orchestration"),
+        ("prompt-too-long", "Recovery Logic"),
+        ("max-output", "Recovery Logic"),
+        ("恢复", "Recovery Logic"),
+        ("context", "Context Governance"),
+        ("compact", "Context Governance"),
+        ("history snip", "Context Governance"),
+        ("中断", "Interrupt Handling"),
+    ]
+    topics: List[str] = []
+    for needle, label in topic_map:
+        if needle in haystack and label not in topics:
+            topics.append(label)
+    return " / ".join(topics[:4])
+
+
+def first_nonempty_paragraphs(note: str, limit: int = 3) -> List[str]:
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", note) if part.strip()]
+    return paragraphs[:limit]
+
+
+def sentence_excerpt(text: str, limit: int = 180) -> str:
+    cleaned = " ".join(text.split())
+    if len(cleaned) <= limit:
+        return cleaned
+    clipped = cleaned[:limit].rstrip()
+    for delimiter in ("。", "；", ".", ";", "，", ",", " "):
+        idx = clipped.rfind(delimiter)
+        if idx > 40:
+            clipped = clipped[:idx]
+            break
+    return clipped + "…"
+
+
+def infer_key_points(title: str, note: str) -> List[str]:
+    haystack = normalize(f"{title}\n{note}")
+    candidates = [
+        ("跨轮状态", ["状态", "turn", "session", "state"]),
+        ("输入治理先于推理", ["治理", "compact", "history snip", "context collapse"]),
+        ("模型输出被当作事件流处理", ["事件流", "stream", "for await", "tool_use"]),
+        ("中断后需要补齐执行账本", ["中断", "abort", "synthetic tool_result"]),
+        ("恢复是运行时主路径的一部分", ["恢复", "prompt-too-long", "max-output"]),
+        ("停止条件需要区分完成、失败、恢复和继续", ["停止条件", "stop hook", "retry", "继续"]),
+    ]
+    points: List[str] = []
+    for label, needles in candidates:
+        if any(normalize(needle) in haystack for needle in needles):
+            points.append(label)
+    return points[:4]
+
+
+def infer_related_concepts(title: str, note: str) -> List[str]:
+    haystack = normalize(f"{title}\n{note}")
+    concept_map = [
+        ("QueryEngine", ["queryengine"]),
+        ("Agent Runtime", ["agent", "runtime"]),
+        ("State Management", ["状态", "state", "session", "turn"]),
+        ("Context Governance", ["context", "compact", "history snip", "micro compact", "context collapse"]),
+        ("Recovery Logic", ["恢复", "prompt-too-long", "max-output"]),
+        ("Interrupt Handling", ["中断", "abort", "synthetic tool_result"]),
+        ("Tool Orchestration", ["tool_use", "tool", "streamingtoolexecutor"]),
+    ]
+    concepts: List[str] = []
+    for label, needles in concept_map:
+        if any(normalize(needle) in haystack for needle in needles):
+            concepts.append(label)
+    return concepts[:6]
+
+
+def infer_evidence_quotes(note: str, limit: int = 4) -> List[str]:
+    paragraphs = first_nonempty_paragraphs(note, limit=10)
+    evidence: List[str] = []
+    for paragraph in paragraphs:
+        excerpt = sentence_excerpt(paragraph, limit=110)
+        if excerpt and excerpt not in evidence:
+            evidence.append(excerpt)
+        if len(evidence) >= limit:
+            break
+    return evidence
+
+
+def infer_core_judgment(title: str, note: str) -> str:
+    return f"{title} 更适合作为一个长期维护的知识对象，而不是一次性章节摘要。"
+
+
+def infer_implementation_signals(title: str, note: str) -> List[str]:
+    haystack = normalize(f"{title}\n{note}")
+    signal_map = [
+        ("显式跨轮状态对象", ["state", "messages", "toolusecontext", "turncount"]),
+        ("模型调用前的输入治理链路", ["compact", "history snip", "context collapse", "micro compact"]),
+        ("流式事件消费而非一次性响应", ["for await", "stream", "tool_use"]),
+        ("中断后补齐 tool_result", ["synthetic tool_result", "abort", "missing tool result"]),
+        ("失败进入恢复分支而不是礼貌终止", ["prompt-too-long", "max-output", "恢复"]),
+    ]
+    signals: List[str] = []
+    for label, needles in signal_map:
+        if any(normalize(needle) in haystack for needle in needles):
+            signals.append(label)
+    return signals[:5]
+
+
+def infer_neighbor_distinction(title: str, note: str) -> str:
+    return f"{title} 应被视作一个独立知识对象，与相邻条目的边界由后续人工或会话层判断细化。"
+
+
+def build_structured_refinement_blocks(title: str, note: str, raw_title: str) -> List[Dict[str, Any]]:
+    paragraphs = first_nonempty_paragraphs(note, limit=3)
+    definition_source = paragraphs[0] if paragraphs else note
+    importance_source = paragraphs[1] if len(paragraphs) > 1 else definition_source
+    key_points = infer_key_points(title, note)
+    blocks: List[Dict[str, Any]] = [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": rich_text_value(f"结构化整理 {today_iso_date()}")},
+        },
+        {
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": rich_text_value("定义")},
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": rich_text_value(
+                    f"原文摘要：{sentence_excerpt(definition_source)}"
+                )
+            },
+        },
+        {
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": rich_text_value("为什么重要")},
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": rich_text_value(
+                    f"原文要点：{sentence_excerpt(importance_source)}"
+                )
+            },
+        },
+    ]
+    if key_points:
+        blocks.append(
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": rich_text_value("关键机制")},
+            }
+        )
+        for point in key_points:
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": rich_text_value(point)},
+                }
+            )
+    blocks.append(
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {
+                "rich_text": rich_text_value(f"原始来源标题保留为：{raw_title}")
+            },
+        }
+    )
+    return blocks
+
+
+def build_deepening_blocks(title: str, note: str) -> List[Dict[str, Any]]:
+    related_concepts = infer_related_concepts(title, note)
+    evidence_quotes = infer_evidence_quotes(note)
+    implementation_signals = infer_implementation_signals(title, note)
+    core_judgment = infer_core_judgment(title, note)
+    neighbor_distinction = infer_neighbor_distinction(title, note)
+    blocks: List[Dict[str, Any]] = [
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": rich_text_value(f"补充整理 {today_iso_date()}")},
+        },
+        {
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": rich_text_value("核心判断")},
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value(core_judgment)},
+        }
+    ]
+    if implementation_signals:
+        blocks.append(
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": rich_text_value("实现信号")},
+            }
+        )
+        for signal in implementation_signals:
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": rich_text_value(signal)},
+                }
+            )
+    if related_concepts:
+        blocks.append(
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": rich_text_value("关联概念")},
+            }
+        )
+        for concept in related_concepts:
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "bulleted_list_item",
+                    "bulleted_list_item": {"rich_text": rich_text_value(concept)},
+                }
+            )
+    blocks.append(
+        {
+            "object": "block",
+            "type": "heading_3",
+            "heading_3": {"rich_text": rich_text_value("与相邻概念的区别")},
+        }
+    )
+    blocks.append(
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value(neighbor_distinction)},
+        }
+    )
+    if evidence_quotes:
+        blocks.append(
+            {
+                "object": "block",
+                "type": "heading_3",
+                "heading_3": {"rich_text": rich_text_value("原文证据")},
+            }
+        )
+        for quote in evidence_quotes:
+            blocks.append(
+                {
+                    "object": "block",
+                    "type": "quote",
+                    "quote": {"rich_text": rich_text_value(quote)},
+                }
+            )
     return blocks
 
 
@@ -714,6 +1047,77 @@ def finalize_compile_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return audit_success("compile-from-raw", payload)
 
 
+def apply_low_risk_refinement(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+    raw_title: str,
+    note: str,
+    wiki_action: str,
+) -> Dict[str, Any]:
+    database = client.retrieve_database(wiki_database_id)
+    page = client.retrieve_page(wiki_page_id)
+    props_meta = database.get("properties", {})
+    title_prop = mapping.get("title_property") or detect_title_property(database)
+    if not title_prop or title_prop not in props_meta:
+        raise NotionError("Unable to determine wiki title property for refinement")
+
+    current_title = extract_title(page, title_prop)
+    semantic_title = infer_semantic_title(raw_title)
+    aliases_prop = mapping.get("aliases_property")
+    topic_prop = mapping.get("topic_property")
+    compounded_level_prop = mapping.get("compounded_level_property")
+    last_compounded_at_prop = mapping.get("last_compounded_at_property")
+    existing_aliases = extract_property_text(page, aliases_prop) if aliases_prop else ""
+    existing_body_text = read_page_body_text(client, wiki_page_id)
+
+    property_updates: Dict[str, Any] = {}
+    if semantic_title and semantic_title != current_title:
+        property_updates[title_prop] = title_property_payload(semantic_title)
+    if aliases_prop and aliases_prop in props_meta:
+        merged_aliases = merge_alias_values(existing_aliases, raw_title, semantic_title, current_title)
+        if merged_aliases:
+            property_updates[aliases_prop] = property_payload_for_value(props_meta[aliases_prop], merged_aliases)
+    if topic_prop and topic_prop in props_meta:
+        inferred_topics = infer_topics(semantic_title or current_title, note)
+        if inferred_topics:
+            property_updates[topic_prop] = property_payload_for_value(props_meta[topic_prop], inferred_topics)
+    if compounded_level_prop and compounded_level_prop in props_meta:
+        current_level = page.get("properties", {}).get(compounded_level_prop, {}).get("number")
+        if current_level is None:
+            property_updates[compounded_level_prop] = {"number": 1}
+    if last_compounded_at_prop and last_compounded_at_prop in props_meta:
+        property_updates[last_compounded_at_prop] = property_payload_for_value(props_meta[last_compounded_at_prop], today_iso_date())
+
+    if property_updates:
+        client.update_page(wiki_page_id, {"properties": property_updates})
+
+    appended_structured_summary = False
+    if "结构化整理" not in existing_body_text:
+        client.append_block_children(
+            wiki_page_id,
+            build_structured_refinement_blocks(semantic_title or current_title, note, raw_title),
+        )
+        appended_structured_summary = True
+
+    appended_deepening = False
+    deepening_markers = ["核心判断", "实现信号", "关联概念", "与相邻概念的区别", "原文证据"]
+    if any(marker not in existing_body_text for marker in deepening_markers):
+        client.append_block_children(
+            wiki_page_id,
+            build_deepening_blocks(semantic_title or current_title, note),
+        )
+        appended_deepening = True
+
+    return {
+        "renamed_to": semantic_title if semantic_title != current_title else current_title,
+        "property_updates": sorted(property_updates.keys()),
+        "appended_structured_summary": appended_structured_summary,
+        "appended_deepening": appended_deepening,
+    }
+
+
 def compile_raw_page(
     client: NotionClient,
     raw_database_id: str,
@@ -743,6 +1147,18 @@ def compile_raw_page(
     last_compile = find_last_successful_compile(raw_page_id)
     if last_compile and not getattr(args, "force", False):
         if last_compile.get("body_hash") == body_hash:
+            raw_props_meta = raw_database.get("properties", {})
+            status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
+            compiled_status = args.raw_compiled_status or mapping.get("raw_compiled_status", "Compiled")
+            skipped_raw_updates: Dict[str, Any] = {}
+            if status_prop_name and status_prop_name in raw_props_meta:
+                current_status = extract_property_text(raw_page, status_prop_name)
+                if current_status != compiled_status:
+                    skipped_raw_updates[status_prop_name] = property_payload_for_value(
+                        raw_props_meta[status_prop_name], compiled_status
+                    )
+            if skipped_raw_updates:
+                client.update_page(raw_page_id, {"properties": skipped_raw_updates})
             return {
                 "timestamp": iso_now(),
                 "action": "skipped_unchanged",
@@ -751,7 +1167,7 @@ def compile_raw_page(
                 "body_hash": body_hash,
                 "source_url": last_compile.get("source_url"),
                 "wiki": last_compile.get("wiki"),
-                "raw_updates": [],
+                "raw_updates": list(skipped_raw_updates.keys()),
                 "reason": "body_hash_unchanged",
             }
 
@@ -778,6 +1194,7 @@ def compile_raw_page(
 
     raw_props_meta = raw_database.get("properties", {})
     raw_updates: Dict[str, Any] = {}
+    warnings: List[str] = []
     status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
     processed_at_prop_name = args.raw_processed_at_property or mapping.get("raw_processed_at_property")
     target_prop_name = args.raw_target_wiki_page_property or mapping.get("raw_target_wiki_page_property")
@@ -788,9 +1205,34 @@ def compile_raw_page(
     if processed_at_prop_name and processed_at_prop_name in raw_props_meta:
         raw_updates[processed_at_prop_name] = property_payload_for_value(raw_props_meta[processed_at_prop_name], today_iso_date())
     if target_prop_name and target_prop_name in raw_props_meta:
-        raw_updates[target_prop_name] = property_payload_for_value(raw_props_meta[target_prop_name], [wiki_result["page_id"]])
+        target_meta = raw_props_meta[target_prop_name]
+        if target_meta.get("type") == "relation" and not relation_targets_database(target_meta, wiki_database_id):
+            warnings.append(
+                f"{target_prop_name} relation points to database "
+                f"{target_meta.get('relation', {}).get('database_id')} instead of wiki database {wiki_database_id}"
+            )
+        else:
+            raw_updates[target_prop_name] = property_payload_for_value(target_meta, [wiki_result["page_id"]])
     if raw_updates:
         client.update_page(raw_page_id, {"properties": raw_updates})
+
+    refinement = {
+        "renamed_to": wiki_result["title"],
+        "property_updates": [],
+        "appended_structured_summary": False,
+        "skipped": True,
+    }
+    if getattr(args, "auto_refine", False):
+        refinement = apply_low_risk_refinement(
+            client,
+            wiki_database_id,
+            mapping,
+            wiki_result["page_id"],
+            title,
+            note,
+            wiki_result["action"],
+        )
+        refinement["skipped"] = False
 
     return {
         "timestamp": iso_now(),
@@ -801,6 +1243,8 @@ def compile_raw_page(
         "wiki": wiki_result,
         "raw_updates": list(raw_updates.keys()),
         "source_url": source_url,
+        "low_risk_refinement": refinement,
+        "warnings": warnings,
     }
 
 
@@ -964,12 +1408,10 @@ def command_lint(client: NotionClient, database_id: str, mapping: Dict[str, Any]
     hits: List[Dict[str, Any]] = []
     for value in expired_values:
         filter_body = {
-            "filter": {
-                "property": verification_prop,
-                props_meta[verification_prop]["type"]: {"equals": value},
-            }
+            "property": verification_prop,
+            props_meta[verification_prop]["type"]: {"equals": value},
         }
-        results = client.query_database(database_id, filter_body).get("results", [])
+        results = query_database_pages(client, database_id, filter_body)
         for page in results:
             hits.append(
                 {
@@ -1032,6 +1474,7 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--raw-target-wiki-page-property")
     compile_parser.add_argument("--raw-compiled-status")
     compile_parser.add_argument("--force", action="store_true")
+    compile_parser.add_argument("--auto-refine", action="store_true")
 
     queue_parser = subparsers.add_parser("compile-queue")
     queue_parser.add_argument("--status", default="Not started")
@@ -1054,6 +1497,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_parser.add_argument("--raw-target-wiki-page-property")
     queue_parser.add_argument("--raw-compiled-status")
     queue_parser.add_argument("--force", action="store_true")
+    queue_parser.add_argument("--auto-refine", action="store_true")
 
     upsert_parser = subparsers.add_parser("upsert-note")
     upsert_parser.add_argument("--title", required=True)
