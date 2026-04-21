@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -174,6 +175,13 @@ def extract_property_text(page: Dict[str, Any], property_name: str) -> str:
     if prop_type == "status":
         value = prop.get("status")
         return value.get("name", "") if value else ""
+    if prop_type == "unique_id":
+        value = prop.get("unique_id")
+        if not value:
+            return ""
+        prefix = value.get("prefix") or ""
+        number = value.get("number")
+        return f"{prefix}{number}" if number is not None else ""
     return ""
 
 
@@ -199,11 +207,101 @@ def read_page_body_text(client: NotionClient, page_id: str) -> str:
     return "\n\n".join(lines).strip()
 
 
-def search_in_database(client: NotionClient, database_id: str, query: str, title_property: str) -> List[Dict[str, Any]]:
-    results = client.search(query, page_size=20).get("results", [])
-    target_database_id = normalize_notion_id(database_id)
-    pages = [page for page in results if normalize_notion_id(database_parent_id(page)) == target_database_id]
-    pages.sort(key=lambda page: 0 if normalize(extract_title(page, title_property)) == normalize(query) else 1)
+def query_database_pages(
+    client: NotionClient,
+    database_id: str,
+    filter_body: Optional[Dict[str, Any]],
+    page_size: int = 20,
+) -> List[Dict[str, Any]]:
+    payload: Dict[str, Any] = {"page_size": page_size}
+    if filter_body:
+        payload["filter"] = filter_body
+    results: List[Dict[str, Any]] = []
+    while True:
+        response = client.query_database(database_id, payload)
+        results.extend(response.get("results", []))
+        if not response.get("has_more"):
+            break
+        payload["start_cursor"] = response.get("next_cursor")
+    return results
+
+
+def dedupe_pages(pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique: Dict[str, Dict[str, Any]] = {}
+    for page in pages:
+        page_id = page.get("id")
+        if page_id and page_id not in unique:
+            unique[page_id] = page
+    return list(unique.values())
+
+
+def split_aliases(raw_value: str) -> List[str]:
+    if not raw_value:
+        return []
+    parts = re.split(r"[,;\n|/、，；]+", raw_value)
+    aliases = [normalize(part) for part in parts if normalize(part)]
+    whole = normalize(raw_value)
+    if whole and whole not in aliases:
+        aliases.append(whole)
+    return aliases
+
+
+def page_matches_query(
+    page: Dict[str, Any],
+    query: str,
+    title_property: str,
+    aliases_property: Optional[str] = None,
+) -> bool:
+    normalized_query = normalize(query)
+    if normalize(extract_title(page, title_property)) == normalized_query:
+        return True
+    if aliases_property:
+        aliases_text = extract_property_text(page, aliases_property)
+        if normalized_query in split_aliases(aliases_text):
+            return True
+    return False
+
+
+def find_pages_by_canonical_id(
+    client: NotionClient,
+    database_id: str,
+    canonical_id: str,
+    canonical_property: str,
+) -> List[Dict[str, Any]]:
+    pages = query_database_pages(client, database_id, {})
+    normalized_canonical_id = normalize(canonical_id)
+    matches = [
+        page
+        for page in pages
+        if normalize(extract_property_text(page, canonical_property)) == normalized_canonical_id
+    ]
+    return dedupe_pages(matches)
+
+
+def search_in_database(
+    client: NotionClient,
+    database_id: str,
+    query: str,
+    title_property: str,
+    aliases_property: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    filters: List[Dict[str, Any]] = [
+        {"property": title_property, "title": {"contains": query}},
+    ]
+    if aliases_property:
+        filters.append({"property": aliases_property, "rich_text": {"contains": query}})
+
+    pages = dedupe_pages(
+        query_database_pages(client, database_id, {"or": filters})
+        if len(filters) > 1
+        else query_database_pages(client, database_id, filters[0])
+    )
+    pages.sort(
+        key=lambda page: (
+            0 if normalize(extract_title(page, title_property)) == normalize(query) else 1,
+            extract_title(page, title_property).lower(),
+        )
+    )
     return pages
 
 
@@ -295,10 +393,26 @@ def upsert_note_to_wiki(
 ) -> Dict[str, Any]:
     database = client.retrieve_database(database_id)
     title_prop = resolve_title_property_name(database, mapping, args.title_property)
-    candidates = search_in_database(client, database_id, args.title, title_prop)
+    aliases_prop = mapping.get("aliases_property")
+    if aliases_prop not in database.get("properties", {}):
+        aliases_prop = None
+    canonical_prop = args.canonical_id_property or mapping.get("canonical_id_property")
+    if canonical_prop not in database.get("properties", {}):
+        canonical_prop = None
+
+    candidates: List[Dict[str, Any]] = []
+    if args.canonical_id and canonical_prop:
+        candidates = find_pages_by_canonical_id(client, database_id, args.canonical_id, canonical_prop)
+    if not candidates:
+        candidates = search_in_database(client, database_id, args.title, title_prop, aliases_prop)
+
     exact_match = None
     for page in candidates:
-        if normalize(extract_title(page, title_prop)) == normalize(args.title):
+        if args.canonical_id and canonical_prop:
+            if normalize(extract_property_text(page, canonical_prop)) == normalize(args.canonical_id):
+                exact_match = page
+                break
+        if page_matches_query(page, args.title, title_prop, aliases_prop):
             exact_match = page
             break
 
@@ -345,7 +459,10 @@ def inspect_schema(client: NotionClient, database_id: str, database_role: str) -
 def command_search(client: NotionClient, database_id: str, mapping: Dict[str, Any], args: argparse.Namespace) -> int:
     database = client.retrieve_database(database_id)
     title_prop = resolve_title_property_name(database, mapping, args.title_property)
-    results = search_in_database(client, database_id, args.query, title_prop)
+    aliases_prop = mapping.get("aliases_property")
+    if aliases_prop not in database.get("properties", {}):
+        aliases_prop = None
+    results = search_in_database(client, database_id, args.query, title_prop, aliases_prop)
     summary = [
         {
             "page_id": page.get("id"),
