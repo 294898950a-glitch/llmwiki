@@ -95,6 +95,41 @@
   - Wiki page：`3496e2cd-6e4f-816e-919b-fd80753dcc9b`
   - 闭环已验证：`raw -> wiki -> raw 回写`
 
+## 幂等性与回滚
+
+当前 `compile-from-raw` 的运行语义如下：
+
+- 同一条 raw page 再次运行时，不会自动按 `source_id` 去重。
+- 当前 upsert 主要依赖：
+  - `Canonical ID`（如果显式传入）
+  - 标题与 `Aliases`
+- 如果命中已有 wiki 页面，脚本会：
+  - 更新页面属性
+  - 再追加一段新的 `增量更新` block
+- 这意味着当前的“重跑”语义是：
+  - **不一定重建页面**
+  - **但大概率会重复追加内容**
+
+对 smoke test 的当前约定：
+
+- 已知测试 raw page：
+  - `3496e2cd-6e4f-81a2-988a-c9fd757c1b42`
+- 已知测试 wiki page：
+  - `3496e2cd-6e4f-816e-919b-fd80753dcc9b`
+- 在没有更强幂等策略前，不建议反复对这条 raw page 运行 `compile-from-raw`，否则会继续向该 wiki 页面追加测试内容。
+
+当前可接受的手工回滚方式：
+
+1. 到 Notion 中删除 smoke test 生成的 wiki 页面：
+   - `3496e2cd-6e4f-816e-919b-fd80753dcc9b`
+2. 在 Raw Inbox 中把对应 raw 记录重置为未完成状态：
+   - `Status` 改回 `Not started`
+   - 清空 `Processed At`
+   - 清空 `Target Wiki Page`
+3. 若要重新做 smoke test，建议新建一条新的 raw page，而不是复用旧的测试条目。
+
+当前还没有自动回滚能力，也还没有“按 source_id 幂等更新”的严格策略，这属于下一阶段要补的实现。
+
 ## 当前限制
 
 这还是第一版骨架，下面这些能力还没有完成：
@@ -115,16 +150,17 @@
 - 虽然 smoke test 已通过，但还存在实现层限制：
   - `query_database` 已替代全局 `/search`
   - 但匹配仍缺少更强的判定与冲突处理
-  - 还没有幂等性与冲突处理策略
+  - 目前只有文档层的幂等性与回滚约定，还没有代码层的严格幂等策略
 
 ## 下一步
 
 建议按这个顺序继续：
 
-1. 将 `search_in_database` 改成 `query_database` 属性过滤
-2. 增加 smoke test 的幂等性检查与回滚说明
-3. 补更强的候选排序、冲突处理与合并策略
-4. 再决定是否接入真正的 LLM 抽取与冲突处理
+1. 明确真正的 LLM 抽取放在哪一层执行
+2. 在 LLM 策略明确后，补更强的候选排序、冲突处理与合并策略
+3. 在合并策略明确后，把“文档约定”升级成代码层幂等策略
+4. 扩展 raw page body 的递归读取
+5. 增加批量编译队列
 
 ## 版本控制
 
