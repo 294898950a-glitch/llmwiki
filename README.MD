@@ -33,8 +33,10 @@
 - `inspect-schema --database raw|wiki`
 - `search <query>`
 - `upsert-note`
-- `compile-from-raw <page_id>`
-- `compile-queue`
+- `compile-from-raw <page_id>` ——支持 `--force` / `--auto-refine` / `--strict-alias`
+- `compile-queue --status <S> --limit N` ——支持 `--retry-failed`
+- `log-session-event` ——会话层留痕入口（写 `session-log.jsonl`）
+- `cleanup-wiki-page <page_id>` ——去重页面内重复的 `增量更新` section，支持 `--dry-run`
 - `lint`
 
 当前已确认的数据库结构：
@@ -88,6 +90,18 @@
 - 将 compile 结果落盘到 `raw/notion_dumps/YYYY-MM-DD-compile-log.jsonl`
 - 按 `Raw Inbox` 的状态批量编译：
   - `compile-queue --status "Not started" --limit N`
+  - `compile-queue --retry-failed` 从最近一次 queue audit 记录中拉失败条目重跑
+- 跨 raw 的 `body_hash` 级幂等：
+  - 若同一 body_hash 已从别的 raw 页面编译过，当前 raw 会被 `skipped_duplicate_body` 跳过，并记录 `originating_raw_page_id` / 关联 wiki
+  - 显式加 `--force` 可绕过
+- 匹配策略层的审查门控：
+  - 命中 `alias` 时输出 stderr warning，payload 附带 `review_required: true`
+  - 传入 `--strict-alias` 时 alias 命中直接 raise，不写入
+- 会话层留痕入口：
+  - `log-session-event --model --raw-page-id --wiki-page-id --tier --decision --risk --notes`
+  - 写入 `raw/notion_dumps/YYYY-MM-DD-session-log.jsonl`，配合 `LLM_EXTRACTION_DESIGN.md` 的"会话层留痕约定"
+- 对已有 wiki 页面做重复 `增量更新` 清理：
+  - `cleanup-wiki-page <page_id>`，支持 `--dry-run`
 - 可选的低风险整理（默认关闭，`--auto-refine` 开启）：
   - 章节标题收束为主题标题
   - 自动补 `Aliases / Topic / Last Compounded At`
@@ -186,7 +200,7 @@
    - 清空 `Target Wiki Page`
 3. 若要重新做 smoke test，建议新建一条新的 raw page，而不是复用旧的测试条目。
 
-当前还没有自动回滚能力，也还没有“按 source_id 幂等更新”的严格策略，这属于下一阶段要补的实现。
+当前仍没有"对象级"严格幂等（同一 wiki 对象 + 同一内容状态 = 跳过），也没有自动回滚。但跨 raw 的 body_hash 重复已能识别并跳过，见 `skipped_duplicate_body`。
 
 ## 当前限制
 
@@ -202,33 +216,33 @@
   - 但还没有更完整的候选排序、冲突判断和合并策略
 - 虽然 smoke test 已通过，但还存在实现层限制：
   - `query_database` 已替代全局 `/search`
-  - 匹配仍缺少更强的判定与冲突处理
-  - 当前幂等仍是“按 raw page 最新 `body_hash` 跳过重复追加”的最小实现，不是基于 source 级别的严格对象幂等
+  - 匹配仍缺少主题级语义判断（仅规则命中，不是真 LLM）
+  - 幂等当前覆盖 raw 自身重跑 + 跨 raw 同 body_hash 两种情况；尚未做"同 wiki 对象同内容"严格对象级幂等
   - LLM 归属与合并策略已在文档层明确：
-    - [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)
+    - [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)（含"会话层留痕约定"）
     - [`MERGE_STRATEGY.md`](./MERGE_STRATEGY.md)
-  - 但脚本层还没有实现：
-    - tier 3 的二次判断
-    - tier 4 的停下来问用户
-    - 自动 diff / 冲突保留证据
-    - 基于候选风险的自动/半自动切换
-  - `raw/notion_dumps/` 目前已经落了 schema 快照、audit 事件和 compile 结果，但还没有：
-    - LLM 判断日志
-    - 面向冲突分析的结构化 diff 证据
+  - 脚本层已部分实现 MERGE_STRATEGY 的 tier 3 / 冲突证据：
+    - alias 命中会触发 `review_required: true` 或 `--strict-alias` 硬停
+    - 会话层可通过 `log-session-event` 登记判断
+  - 脚本层尚未实现：
+    - tier 4 主题相近无明确标识的"停下来问用户"分支
+    - 结构化 diff 证据（仅 append `增量更新` block，无与旧内容的差异标注）
 
 ## 下一步
 
-建议按这个顺序继续：
+上一轮挂账已经清：
+- `cleanup-wiki-page` 子命令替代了手工去重 `增量更新` block（对应"live 优化经验沉淀"）
+- tier 3 alias 命中现在触发 stderr warning + `review_required: true`，或 `--strict-alias` 硬停
+- `body_hash` 幂等升级成"跨 raw 同 hash 也跳过"（`skipped_duplicate_body`），附带 warning 与关联的 originating raw/wiki
+- `log-session-event` 子命令 + `LLM_EXTRACTION_DESIGN.md` 的"会话层留痕约定"段落
+- `compile-queue --retry-failed` 从最近一次 audit 记录读失败条目重跑
 
-1. 把当前 `QueryLoop` 这类 live 优化经验沉淀回脚本，减少后续手工清理
-2. 把“深度整理”从低风险模板升级成更稳定的永久笔记结构
-3. 把候选风险分级真正下沉到脚本：
-   - tier 3 二次判断
-   - tier 4 停下来问用户
-   - 冲突保留证据
-4. 把当前最小 `body_hash` 幂等升级成更严格的对象级幂等策略
-5. 补 LLM 判断日志和冲突 diff 证据落盘
-6. 给 `compile-queue` 增加更细的筛选与失败重试策略
+仍待推进：
+
+1. **深度整理升级成"真正永久笔记结构"**：当前 `--auto-refine` 仍是硬编码 `infer_*` 启发式；要达到永久笔记水准必须由会话层介入。脚本侧可能需要一个 `refine-wiki-page` 子命令接受会话层产出的内容块，但"什么是永久笔记的正确结构"本身是 editorial policy，建议先起一个专门的设计文档再动代码。
+2. **tier 4 代码层停顿**（主题相近无明确标识）：当前未实现；需要在 `upsert_note_to_wiki` 里先查"近似候选"（fuzzy 标题匹配），若有但无 tier 1-3 命中则返回 `decision: ask_user` 不写入。待设计。
+3. **冲突 diff 证据结构化**：目前只靠 append `增量更新` block，没有与旧结论对比。要做需要先定义 diff 语义（段落级？句级？属性级？）。
+4. **`compile-queue` 筛选升级**：目前按 Status 一维；未来可加 `--priority` / `--type` / `--since DATE`，等 Raw Inbox 真的建了对应字段再做。
 
 ## 版本控制
 
