@@ -697,3 +697,133 @@ v8 指出当前工作树的 README 改动归 Codex 提交；Codex 已在 `ecdfdd
 - 未实测 MERGE_STRATEGY 策略下的某条真实 raw：比如"aliases 命中需二次判断"场景脚本会不会误合并（静读推断会误合并，但未实跑）。
 - 未评估 LLM_EXTRACTION_DESIGN 的 "模式 B 退出条件" 是否可量化（"smoke test 不止一轮"需多少轮？"schema 基本固定"由谁判断？）。
 - 未对 `.clinerules-*` 5 个文件做独立审核 —— 这组文件自 `cd4d3ee` 起一直在仓库里但从未被任何 review 引用过，可能已失效或与本项目脱钩。
+
+---
+
+## v10 · 2026-04-22
+
+- **评审对象**：Codex 本轮代码与 README 双改
+  - `scripts/notion_wiki_compiler.py`（工作树，未提交 —— 大幅扩展）
+  - `README.MD`（工作树，未提交 —— 同步反映新能力与下一步重排）
+  - `raw/notion_dumps/2026-04-21T172604Z-inspect-schema-wiki.json`（新落盘快照）
+- **对照对象**：
+  - `LLM_EXTRACTION_DESIGN.md` / `MERGE_STRATEGY.md`（`4c3299c`）
+  - `README_REVIEW.md` v1-v9
+- **锚定 git 状态**：`4c3299c`（HEAD，本地未推） + README / scripts 未提交 + `raw/notion_dumps/` 首次出现产物
+- **评审者**：Claude Opus 4.7 (1M context)，模型 ID `claude-opus-4-7`
+- **本版定位**：三条 v6 代码债一次性偿还 + v2–v9 连续挂账的空目录被解除 + Wiki schema 真实类型首次落盘。
+
+### 1. 三条 v6 代码债的偿还对账
+
+| 债务（v6/v8/v9 标注） | 本版状态 | 证据 |
+|---|---|---|
+| `query_database_pages` 分页循环无熔断 | ✅ 已修 | 新增 `DEFAULT_MAX_QUERY_PAGES = 25` 与 `max_pages` 参数，超限时 raise `NotionError` |
+| `search_in_database` 对 aliases 硬编码 `rich_text` 过滤 | ✅ 已修 | 新增 `build_contains_filter`，按真实 property type 动态构造 title/rich_text/multi_select filter；`upsert_note_to_wiki` 和 `command_search` 从 schema 读取类型并传入 |
+| `find_pages_by_canonical_id` 全表扫 | ❌ 未修 | README 下一步步骤 4 已显式列入 |
+| `extract_property_text` 对 relation/people/files/formula/rollup 静默返空 | ❌ 未修 | 未在下一步提及 |
+
+**两修两欠**，修的两条是运行时风险最高的（熔断防超时、aliases 类型误假设会直接 400）。剩下两条里全表扫属于性能债，静默返空属于代码健壮性债，可按需排期。
+
+### 2. `raw/notion_dumps/` 空目录挂账正式解除
+
+连续从 v2 挂到 v9（共 6 版）的"空目录"债结清：
+
+- `inspect_schema` 落盘 `YYYY-MM-DDTHHmmSSZ-inspect-schema-<role>.json`（一次性快照）
+- `command_compile_from_raw` 以 jsonl 形式 append 到 `YYYY-MM-DD-compile-log.jsonl`（累计日志）
+- 脚本层打印结果里同时回传 `snapshot_path` / `log_path`，方便 smoke 追踪
+
+这是 v9 建议"LLM 会话判断留痕"的**基础设施一半**——脚本侧的确定性运行日志已齐，**LLM 侧（会话层）留痕仍需规范**（见本版第 5 节）。
+
+### 3. 首份 Wiki schema 快照核对
+
+`raw/notion_dumps/2026-04-21T172604Z-inspect-schema-wiki.json` 揭示了**真实字段类型**（此前 v6/v8/v9 review 反复标注"未经 API 验证"）：
+
+| 字段 | 类型 | 与此前假设对照 |
+|---|---|---|
+| `Name` | `title` | ✅ 符合 README 与 mapping |
+| `Source` | `relation` | ✅ |
+| `Canonical ID` | **`unique_id`** | ⚠️ 此前未知，本版首次确认 |
+| `Aliases` | `rich_text` | ✅ 与 mapping 假设一致；v6/v8/v9 担心的 multi_select 可能性已消除 |
+| `Topic` | `rich_text` | ✅ |
+| `Verification` | `status` | ✅ |
+| `Compounded Level` | `number` | ✅ |
+| `Last Compounded At` | `date` | ✅ |
+
+**新信号**：`Canonical ID` 是 `unique_id` 类型。这对 README 下一步步骤 4（"Canonical ID 改成 Notion 端过滤"）有两点影响：
+
+- Notion 的 unique_id 属性**原生支持** `{"property": "Canonical ID", "unique_id": {"equals": <number>}}` 这类属性过滤，可以直接把 `find_pages_by_canonical_id` 从全表扫改成一次 API 调用。
+- 但 `extract_property_text` 已经对 unique_id 返回 `prefix + number` 字符串（`scripts/notion_wiki_compiler.py:178-184`）。如果用户传入 `--canonical-id` 时也是带 prefix 的字符串（如 `WIKI-123`），在下推 filter 时需要**解析出 number 部分**传给 `unique_id.equals`。建议本次实现时加一个小 helper `parse_unique_id_value`，否则 filter 会传字符串 → Notion 报 `validation_error`。
+
+### 4. DESIGN_REVIEW v1 八条清单进度（v10 回归）
+
+| v1 意见 | v9 状态 | v10 状态 | 变化 |
+|---|---|---|---|
+| ① 拆双 DB id | ✅ | ✅ | — |
+| ② 读 raw body | ✅ | ✅ | — |
+| ③ canonical_id / aliases 匹配 | ✅ | ✅✅ | aliases 按真实类型动态过滤，质量提升 |
+| ④ Raw 状态回写 | ✅✅✅ | ✅✅✅ | — |
+| ⑤ LLM 抽取位置 | ✅（文档） | ✅（文档） | — |
+| ⑥ `/search` → `query_database` | ✅ | ✅✅ | 熔断已加 + 类型感知，质量提升 |
+| ⑦ 澄清 `raw/.sync_state.json` | ❌ | ⚠️ **语义需校准** | 实际实现已改成 `raw/notion_dumps/<date>-compile-log.jsonl` 而非 `.sync_state.json`；CLAUDE.md 目录树与主流程段与实现脱钩（见本版第 6 节） |
+| ⑧ 冲突 diff | ✅（文档） | ✅（文档） | 脚本层 tier 3/4 停顿点仍未加；README 步骤 1 已列入 |
+
+**文档层完成率**：**7/8**（⑦仍欠语义校准）
+**代码层硬完成**：5/8 硬完成 + 2 已升级质量（③⑥）
+
+### 5. LLM 会话层留痕的半份答卷
+
+v9 建议把每次 LLM 判断（候选选择 / 合并 or 新建 / 风险等级）落到 `raw/notion_dumps/*.jsonl`。现状：
+
+- **脚本侧**：`command_compile_from_raw` 已落 `compile-log.jsonl`，字段含 timestamp / raw_page_id / raw_title / wiki / raw_updates / source_url。**不含 LLM 判断信息**，因为脚本本身不做判断（符合 `LLM_EXTRACTION_DESIGN.md` 立场）。
+- **会话侧**：未有留痕机制。意味着目前 smoke test 到底是按哪个 tier 命中、用哪个模型判断的，都丢失。
+
+建议的最小留痕约定（可由 Codex 在 `LLM_EXTRACTION_DESIGN.md` 或新开的 `SESSION_LOG_CONVENTION.md` 中明文化）：
+
+```jsonl
+{"timestamp": "...", "model": "claude-opus-4-7", "raw_page_id": "...", "tier": 1|2|3|4, "decision": "update|create|ask-user", "wiki_candidates": [...], "chosen_wiki_page_id": "...", "risk": "low|medium|high", "notes": "..."}
+```
+
+该文件由会话（Opus / Codex）在每次判断后 append，可用 `scripts/notion_wiki_compiler.py` 已有的 `append_jsonl_log` helper——**基础设施已就位**，只差约定。
+
+### 6. `raw/.sync_state.json` 的语义校准（第⑦条挂账真相）
+
+v1-v9 一直在挂账说 "CLAUDE.md 目录树列了 `raw/.sync_state.json` 但实际不存在"。v10 发现这条不仅是"未创建"问题，而是**设计已被替换**：
+
+- CLAUDE.md 目录树 `:32` 列 `raw/.sync_state.json # 增量处理状态`
+- 实际实现把"增量处理状态"分散在两个地方：
+  - Raw Inbox 数据库的 `Status` / `Processed At` / `Target Wiki Page` 三个字段（在 Notion 里）
+  - `raw/notion_dumps/<date>-compile-log.jsonl`（在本地）
+- 两种实现**都不是** `.sync_state.json`
+
+建议 Codex 下一次 CLAUDE.md 编辑时做两件事：
+1. 删除目录树的 `raw/.sync_state.json` 那一行，改成 `raw/notion_dumps/`。
+2. 在"主流程 → Raw Inbox"段点明"增量状态存在 Notion 的 Status 字段 + 本地 `compile-log.jsonl`"。
+
+此举会把第⑦条挂账**从"未做"正式升级为"已完成（换实现）"**，同时清掉 v1-v9 反复指出的目录树漂移。
+
+### 7. README 下一步 6 步的合理性
+
+| 步骤 | 状态 | 点评 |
+|---|---|---|
+| 1. 执行 MERGE_STRATEGY（tier 3 二次判断 / tier 4 停下来问 / 冲突证据） | ❌ 未动代码 | 依赖 LLM 会话层协作 + 脚本增加 `--dry-run` / `--interactive` 停顿点 |
+| 2. 文档约定升级成代码层幂等 | ❌ 未动代码 | 需先实现 raw body hash 计算 —— `MERGE_STRATEGY.md:216` 已点出这个前置 |
+| 3. compile 日志 + LLM 判断日志完整落盘 | ⚠️ **已一半** | compile log 已落（本版落地）；LLM 判断日志仍待会话层约定（见本版第 5 节）。建议拆 3a（✅）/ 3b（❌） |
+| 4. Canonical ID 全表扫 → Notion 端过滤 | ❌ 未动 | 本版 schema 快照证明可用 `unique_id.equals` 下推，注意 prefix 解析 |
+| 5. raw body 递归读取 | ❌ 未动 | 独立改动，不依赖其他步骤 |
+| 6. 批量编译队列 | ❌ 未动 | 最下游，需等前置稳定 |
+
+**可并行**：步骤 4、5 可以独立做，不阻塞步骤 1/2；建议这两条优先清，把代码层技术债降下来。
+**强依赖链**：步骤 2 依赖 `MERGE_STRATEGY` 里 "同一次更新" 的 body hash 定义稳定；步骤 1 依赖 LLM 会话层实际跑几轮积累经验。
+
+### 8. 仍未修的旧挂账
+
+- **CLAUDE.md 目录树**（v1/v2/v3/v5/v6/v8/v9/v10 连续挂账）：本版第 6 节提供了"把⑦挂账正式销账"的具体动作清单。
+- **commit 粒度示例 vs 实际 git log**（v2/v3/v5/v8/v9/v10 挂账）：README 示例仍是虚构的 4 条。
+- **代码层剩余技术债**：`find_pages_by_canonical_id` 全表扫（README 步骤 4）/ `extract_property_text` 多类型静默返空（未列入下一步）。
+- **`.clinerules-*` 5 个文件的适用性**（v9 标注）：仍未审核，未知是否已失效。
+
+### 9. 本版未覆盖
+
+- 未实测新加的 `max_pages=25` 熔断在 >25 页真实场景下的行为（静读推断能 raise，但未跑）。
+- 未实测 `build_contains_filter` 对 `multi_select` 类型的 `contains` 行为（Notion API 里 multi_select.contains 的语义是"包含某个 option"，不是"字符串包含"，这里可能需要二次确认；但当前 mapping 下 Aliases/Topic 都是 rich_text，暂不会触发 multi_select 路径）。
+- 未评估 `raw/notion_dumps/` 的 gitignore 策略——目前未在 `.gitignore` 中排除，意味着 schema 快照和 compile log 会入库。若未来内容含敏感数据（raw page body 里出现 API key、PII 等），需要补 `.gitignore` 规则。**建议 Codex 下一次动 `.gitignore` 时加 `raw/notion_dumps/*.jsonl`**（schema json 本身一般无敏感信息，可以入库）。
