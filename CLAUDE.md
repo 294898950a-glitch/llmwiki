@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-21.r1
+> **Version**: 2026-04-21.r2
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -27,14 +27,17 @@ llmwiki/
 ├── .env.example                     # 模板
 ├── .gitignore
 ├── CLAUDE.md                        # 本文件
+├── DESIGN_REVIEW.md                 # 设计与实现差距评审
+├── README.MD                        # 项目状态说明
+├── README_REVIEW.md                 # README 与实际状态一致性评审
 ├── raw/
-│   ├── notion_dumps/                # 原始资料或页面快照
-│   └── .sync_state.json             # 增量处理状态
+│   └── notion_dumps/                # 原始资料或页面快照（本地缓存，可选）
 ├── schema/
 │   └── notion_wiki_mapping.example.json
 ├── scripts/
 │   └── notion_wiki_compiler.py      # 最小脚本骨架
-└── wiki/                            # 保留为调试输出目录，不再是主产物
+└── wiki/
+    └── index.md                     # 历史调试遗留目录，当前不是主产物
 ```
 
 ## 主流程
@@ -58,8 +61,8 @@ llmwiki/
 
 ### Inspect Schema · 检查 Wiki 数据库结构
 
-**输入**：`.env` 中的 `NOTION_API_KEY` 与 `NOTION_DATABASE_ID`
-**输出**：Wiki 数据库属性报告
+**输入**：`.env` 中的 `NOTION_API_KEY` 与目标库 ID
+**输出**：Raw Inbox 或 Wiki 数据库属性报告
 
 执行要求：
 - 先读数据库 schema，再决定映射。
@@ -171,7 +174,7 @@ llmwiki/
 
 ## 关键约束
 
-1. 每次运行前检查 `.env` 是否完整；若缺失密钥或数据库 ID，直接停止并提醒用户。
+1. 每次运行前检查 `.env` 是否完整；若缺失密钥或目标库 ID，直接停止并提醒用户。
 2. 不要把密钥写进任何会被提交到 git 或同步分享的文本中。
 3. 不要假设 Notion Wiki 一定已经包含某些字段；脚本应报告缺口，而不是硬编码崩溃。
 4. 对已存在页面的修改应优先追加或局部更新，避免整页替换。
@@ -182,6 +185,7 @@ llmwiki/
 `scripts/notion_wiki_compiler.py` 提供最小能力：
 - `inspect-schema`
 - `search`
+- `compile-from-raw`
 - `upsert-note`
 - `lint`
 
@@ -189,4 +193,4 @@ llmwiki/
 
 ## 设计评审
 
-设计与实现之间的差距、修复优先级记录在 `DESIGN_REVIEW.md`。每一版评审都需标注评审日期、被评审文件状态、以及评审模型版本（如 Claude Opus 4.7 / `claude-opus-4-7`），用于后续追溯。当前最新版本：**v1 · 2026-04-21**。
+设计与实现之间的差距、修复优先级记录在 `DESIGN_REVIEW.md`。每一版评审都需标注评审日期、被评审文件状态、以及评审模型版本（如 Claude Opus 4.7 / `claude-opus-4-7`），用于后续追溯。当前最新版本：**v2 · 2026-04-21**。

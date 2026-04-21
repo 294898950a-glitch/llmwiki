@@ -74,11 +74,17 @@ class NotionClient:
     def query_database(self, database_id: str, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         return self.request("POST", f"databases/{database_id}/query", payload or {})
 
+    def retrieve_page(self, page_id: str) -> Dict[str, Any]:
+        return self.request("GET", f"pages/{page_id}")
+
     def create_page(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self.request("POST", "pages", payload)
 
     def update_page(self, page_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         return self.request("PATCH", f"pages/{page_id}", payload)
+
+    def retrieve_block_children(self, block_id: str, page_size: int = 100) -> Dict[str, Any]:
+        return self.request("GET", f"blocks/{block_id}/children?page_size={page_size}")
 
     def append_block_children(self, block_id: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
         return self.request("PATCH", f"blocks/{block_id}/children", {"children": children})
@@ -89,6 +95,11 @@ def require_env(env: Dict[str, str], key: str) -> str:
     if not value:
         raise NotionError(f"Missing required env var: {key}")
     return value
+
+
+def optional_env(env: Dict[str, str], key: str) -> Optional[str]:
+    value = env.get(key, "").strip()
+    return value or None
 
 
 def iso_now() -> str:
@@ -138,6 +149,50 @@ def normalize(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def rich_text_plain_text(chunks: List[Dict[str, Any]]) -> str:
+    return "".join(chunk.get("plain_text", "") for chunk in chunks).strip()
+
+
+def extract_property_text(page: Dict[str, Any], property_name: str) -> str:
+    prop = page.get("properties", {}).get(property_name, {})
+    prop_type = prop.get("type")
+    if prop_type == "title":
+        return rich_text_plain_text(prop.get("title", []))
+    if prop_type == "rich_text":
+        return rich_text_plain_text(prop.get("rich_text", []))
+    if prop_type == "url":
+        return prop.get("url") or ""
+    if prop_type == "select":
+        value = prop.get("select")
+        return value.get("name", "") if value else ""
+    if prop_type == "status":
+        value = prop.get("status")
+        return value.get("name", "") if value else ""
+    return ""
+
+
+def extract_block_text(block: Dict[str, Any]) -> str:
+    block_type = block.get("type")
+    if not block_type:
+        return ""
+    block_value = block.get(block_type, {})
+    if "rich_text" in block_value:
+        return rich_text_plain_text(block_value.get("rich_text", []))
+    if block_type == "bookmark":
+        return block_value.get("url", "")
+    return ""
+
+
+def read_page_body_text(client: NotionClient, page_id: str) -> str:
+    response = client.retrieve_block_children(page_id)
+    lines: List[str] = []
+    for block in response.get("results", []):
+        text = extract_block_text(block)
+        if text:
+            lines.append(text)
+    return "\n\n".join(lines).strip()
+
+
 def search_in_database(client: NotionClient, database_id: str, query: str, title_property: str) -> List[Dict[str, Any]]:
     results = client.search(query, page_size=20).get("results", [])
     pages = [page for page in results if database_parent_id(page) == database_id]
@@ -164,6 +219,9 @@ def property_payload_for_value(prop_meta: Dict[str, Any], value: Any) -> Dict[st
         return {"date": {"start": str(value)}}
     if prop_type == "url":
         return {"url": str(value)}
+    if prop_type == "relation":
+        values = value if isinstance(value, list) else [value]
+        return {"relation": [{"id": str(item)} for item in values]}
     raise NotionError(f"Unsupported property type for automatic write: {prop_type}")
 
 
@@ -215,48 +273,21 @@ def build_append_blocks(note: str, heading: str, source_url: Optional[str]) -> L
     return blocks
 
 
-def inspect_schema(client: NotionClient, database_id: str) -> int:
-    database = client.retrieve_database(database_id)
-    title_prop = detect_title_property(database)
-    print(
-        json.dumps(
-            {
-                "database_id": database.get("id"),
-                "title_property": title_prop,
-                "properties": {name: meta.get("type") for name, meta in database.get("properties", {}).items()},
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-    )
-    return 0
-
-
-def command_search(client: NotionClient, database_id: str, mapping: Dict[str, Any], args: argparse.Namespace) -> int:
-    database = client.retrieve_database(database_id)
-    title_prop = args.title_property or mapping.get("title_property") or detect_title_property(database)
+def resolve_title_property_name(database: Dict[str, Any], mapping: Dict[str, Any], cli_value: Optional[str]) -> str:
+    title_prop = cli_value or mapping.get("title_property") or detect_title_property(database)
     if not title_prop:
         raise NotionError("Unable to determine title property")
-    results = search_in_database(client, database_id, args.query, title_prop)
-    summary = [
-        {
-            "page_id": page.get("id"),
-            "title": extract_title(page, title_prop),
-            "last_edited_time": page.get("last_edited_time"),
-            "url": page.get("url"),
-        }
-        for page in results
-    ]
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0
+    return title_prop
 
 
-def command_upsert(client: NotionClient, database_id: str, mapping: Dict[str, Any], args: argparse.Namespace) -> int:
+def upsert_note_to_wiki(
+    client: NotionClient,
+    database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
     database = client.retrieve_database(database_id)
-    title_prop = args.title_property or mapping.get("title_property") or detect_title_property(database)
-    if not title_prop:
-        raise NotionError("Unable to determine title property")
-
+    title_prop = resolve_title_property_name(database, mapping, args.title_property)
     candidates = search_in_database(client, database_id, args.title, title_prop)
     exact_match = None
     for page in candidates:
@@ -275,8 +306,7 @@ def command_upsert(client: NotionClient, database_id: str, mapping: Dict[str, An
         client.update_page(exact_match["id"], {"properties": properties})
         blocks = build_append_blocks(args.note, append_heading, args.source_url)
         client.append_block_children(exact_match["id"], blocks)
-        print(json.dumps({"action": "updated", "page_id": exact_match["id"], "title": args.title}, ensure_ascii=False, indent=2))
-        return 0
+        return {"action": "updated", "page_id": exact_match["id"], "title": args.title}
 
     payload: Dict[str, Any] = {
         "parent": {"database_id": database_id},
@@ -284,7 +314,123 @@ def command_upsert(client: NotionClient, database_id: str, mapping: Dict[str, An
         "children": build_append_blocks(args.note, append_heading, args.source_url),
     }
     created = client.create_page(payload)
-    print(json.dumps({"action": "created", "page_id": created.get("id"), "title": args.title}, ensure_ascii=False, indent=2))
+    return {"action": "created", "page_id": created.get("id"), "title": args.title}
+
+
+def inspect_schema(client: NotionClient, database_id: str, database_role: str) -> int:
+    database = client.retrieve_database(database_id)
+    title_prop = detect_title_property(database)
+    print(
+        json.dumps(
+            {
+                "database_role": database_role,
+                "database_id": database.get("id"),
+                "title_property": title_prop,
+                "properties": {name: meta.get("type") for name, meta in database.get("properties", {}).items()},
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0
+
+
+def command_search(client: NotionClient, database_id: str, mapping: Dict[str, Any], args: argparse.Namespace) -> int:
+    database = client.retrieve_database(database_id)
+    title_prop = resolve_title_property_name(database, mapping, args.title_property)
+    results = search_in_database(client, database_id, args.query, title_prop)
+    summary = [
+        {
+            "page_id": page.get("id"),
+            "title": extract_title(page, title_prop),
+            "last_edited_time": page.get("last_edited_time"),
+            "url": page.get("url"),
+        }
+        for page in results
+    ]
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_upsert(client: NotionClient, database_id: str, mapping: Dict[str, Any], args: argparse.Namespace) -> int:
+    result = upsert_note_to_wiki(client, database_id, mapping, args)
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_compile_from_raw(
+    client: NotionClient,
+    raw_database_id: str,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    raw_page = client.retrieve_page(args.page_id)
+    if database_parent_id(raw_page) != raw_database_id:
+        raise NotionError("Raw page does not belong to NOTION_RAW_INBOX_DB_ID")
+
+    raw_database = client.retrieve_database(raw_database_id)
+    raw_title_property = args.raw_title_property or mapping.get("raw_title_property") or detect_title_property(raw_database)
+    if not raw_title_property:
+        raise NotionError("Unable to determine raw title property")
+
+    title = args.title or extract_title(raw_page, raw_title_property)
+    if not title:
+        raise NotionError("Raw page title is empty; pass --title explicitly")
+
+    note = read_page_body_text(client, args.page_id)
+    if not note:
+        raise NotionError("Raw page body is empty; nothing to compile")
+
+    source_prop_name = args.raw_source_url_property or mapping.get("raw_source_url_property")
+    source_url = extract_property_text(raw_page, source_prop_name) if source_prop_name else None
+
+    upsert_args = argparse.Namespace(
+        title=title,
+        note=note,
+        source_url=source_url,
+        canonical_id=args.canonical_id,
+        verification=args.verification,
+        compounded_level=args.compounded_level,
+        last_compounded_at=args.last_compounded_at,
+        append_heading=args.append_heading,
+        increment_compounded_level=args.increment_compounded_level,
+        title_property=args.title_property,
+        canonical_id_property=args.canonical_id_property,
+        verification_property=args.verification_property,
+        compounded_level_property=args.compounded_level_property,
+        last_compounded_at_property=args.last_compounded_at_property,
+    )
+    wiki_result = upsert_note_to_wiki(client, wiki_database_id, mapping, upsert_args)
+
+    raw_props_meta = raw_database.get("properties", {})
+    raw_updates: Dict[str, Any] = {}
+    status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
+    processed_at_prop_name = args.raw_processed_at_property or mapping.get("raw_processed_at_property")
+    target_prop_name = args.raw_target_wiki_page_property or mapping.get("raw_target_wiki_page_property")
+    compiled_status = args.raw_compiled_status or mapping.get("raw_compiled_status", "Compiled")
+
+    if status_prop_name and status_prop_name in raw_props_meta:
+        raw_updates[status_prop_name] = property_payload_for_value(raw_props_meta[status_prop_name], compiled_status)
+    if processed_at_prop_name and processed_at_prop_name in raw_props_meta:
+        raw_updates[processed_at_prop_name] = property_payload_for_value(raw_props_meta[processed_at_prop_name], iso_now())
+    if target_prop_name and target_prop_name in raw_props_meta:
+        raw_updates[target_prop_name] = property_payload_for_value(raw_props_meta[target_prop_name], [wiki_result["page_id"]])
+    if raw_updates:
+        client.update_page(args.page_id, {"properties": raw_updates})
+
+    print(
+        json.dumps(
+            {
+                "action": "compiled",
+                "raw_page_id": args.page_id,
+                "wiki": wiki_result,
+                "raw_updates": list(raw_updates.keys()),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -328,11 +474,33 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mapping", default="schema/notion_wiki_mapping.example.json", help="Mapping JSON path relative to llmwiki root")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser("inspect-schema")
+    inspect_parser = subparsers.add_parser("inspect-schema")
+    inspect_parser.add_argument("--database", choices=["raw", "wiki"], default="wiki")
 
     search_parser = subparsers.add_parser("search")
     search_parser.add_argument("query")
     search_parser.add_argument("--title-property")
+
+    compile_parser = subparsers.add_parser("compile-from-raw")
+    compile_parser.add_argument("page_id")
+    compile_parser.add_argument("--title")
+    compile_parser.add_argument("--canonical-id")
+    compile_parser.add_argument("--verification")
+    compile_parser.add_argument("--compounded-level", type=float)
+    compile_parser.add_argument("--last-compounded-at")
+    compile_parser.add_argument("--append-heading")
+    compile_parser.add_argument("--increment-compounded-level", action="store_true")
+    compile_parser.add_argument("--title-property")
+    compile_parser.add_argument("--canonical-id-property")
+    compile_parser.add_argument("--verification-property")
+    compile_parser.add_argument("--compounded-level-property")
+    compile_parser.add_argument("--last-compounded-at-property")
+    compile_parser.add_argument("--raw-title-property")
+    compile_parser.add_argument("--raw-source-url-property")
+    compile_parser.add_argument("--raw-status-property")
+    compile_parser.add_argument("--raw-processed-at-property")
+    compile_parser.add_argument("--raw-target-wiki-page-property")
+    compile_parser.add_argument("--raw-compiled-status")
 
     upsert_parser = subparsers.add_parser("upsert-note")
     upsert_parser.add_argument("--title", required=True)
@@ -363,18 +531,29 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parser.parse_args(argv)
     env = load_env(Path(args.env_file))
     token = require_env(env, "NOTION_API_KEY")
-    database_id = require_env(env, "NOTION_DATABASE_ID")
+    raw_database_id = optional_env(env, "NOTION_RAW_INBOX_DB_ID")
+    wiki_database_id = optional_env(env, "NOTION_WIKI_DB_ID")
     mapping = load_mapping(args.mapping)
     client = NotionClient(token)
 
     if args.command == "inspect-schema":
-        return inspect_schema(client, database_id)
+        if args.database == "raw":
+            return inspect_schema(client, require_env(env, "NOTION_RAW_INBOX_DB_ID"), "raw")
+        return inspect_schema(client, require_env(env, "NOTION_WIKI_DB_ID"), "wiki")
     if args.command == "search":
-        return command_search(client, database_id, mapping, args)
+        return command_search(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "compile-from-raw":
+        return command_compile_from_raw(
+            client,
+            require_env(env, "NOTION_RAW_INBOX_DB_ID"),
+            require_env(env, "NOTION_WIKI_DB_ID"),
+            mapping,
+            args,
+        )
     if args.command == "upsert-note":
-        return command_upsert(client, database_id, mapping, args)
+        return command_upsert(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "lint":
-        return command_lint(client, database_id, mapping, args)
+        return command_lint(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 

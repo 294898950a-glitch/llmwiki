@@ -50,3 +50,46 @@
 - 未评估安全面（Notion integration 权限范围是否最小化等）。
 
 下一版评审可在修复前 4 项后回归，重点从「设计—实现一致性」切到「运行时可靠性」。
+
+---
+
+## v2 · 2026-04-21
+
+- **评审对象**：`CLAUDE.md` (Version 2026-04-21.r2) + `README.MD` + `scripts/notion_wiki_compiler.py` + `schema/notion_wiki_mapping.example.json` + `.env.example`
+- **锚定 commit**：`工作树，待提交`
+- **评审者**：GPT-5 Codex
+- **评审方式**：核对 v1 缺口是否已修、检查文档与工作树是否同步
+
+### 1. 已完成项
+
+- **双库配置已落地**：`.env.example` 已拆成 `NOTION_RAW_INBOX_DB_ID` 与 `NOTION_WIKI_DB_ID`，主流程按命令选择 raw 或 wiki。
+- **`compile-from-raw` 已落地**：脚本已支持读取 raw page、读取第一层 block 文本、写入 wiki、回写 raw 状态。
+- **raw 回写已落地**：支持回写 `Status`、`Processed At`、`Target Wiki Page`。
+- **README 状态说明已建立**：`README.MD` 与 `README_REVIEW.md` 已补齐项目现状与评审记录。
+
+### 2. 仍未解决的核心问题
+
+按后续实现优先级排序：
+
+1. **匹配逻辑仍然过弱**：wiki upsert 仍以标题严格相等为主，没有 `Canonical ID` / `Aliases` 优先匹配。
+2. **搜索实现仍基于全局 `/search`**：应改成 `databases/{id}/query` + 属性过滤，才能支撑 canonical id 和 alias 查询。
+3. **LLM 抽取位置仍未定稿**：当前系统能跑通闭环，但还不是严格意义上的 LLM 编译器。
+4. **raw 本地目录的角色仍需收束**：`raw/notion_dumps/` 目前是“可选本地缓存”，但缓存生成策略还没定义。
+5. **冲突处理仍未实现**：现在只是增量追加，没有 diff 标记或冲突提示。
+
+### 3. 当前阶段结论
+
+系统已经从“设计骨架”进入“可运行的最小闭环”阶段。下一阶段不该继续扩散功能面，而应先加强：
+
+1. schema 对齐
+2. 数据库内查询能力
+3. 匹配质量
+4. 第一轮真实 raw -> wiki 运行验证
+
+### 4. 建议的下一步
+
+1. 运行 `inspect-schema --database raw`
+2. 运行 `inspect-schema --database wiki`
+3. 按真实字段名更新 mapping
+4. 将 `search_in_database` 改为 `query_database` 属性过滤
+5. 增加 `Canonical ID` / `Aliases` 匹配

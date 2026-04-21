@@ -7,6 +7,12 @@
   "last_compounded_at_property": "Last Compounded At",
   "aliases_property": "Aliases",
   "topic_property": "Topic",
+  "raw_title_property": "Name",
+  "raw_source_url_property": "Source URL",
+  "raw_status_property": "Status",
+  "raw_processed_at_property": "Processed At",
+  "raw_target_wiki_page_property": "Target Wiki Page",
+  "raw_compiled_status": "Compiled",
   "append_heading": "增量更新",
   "expired_status_values": [
     "Expired",
