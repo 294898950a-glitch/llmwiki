@@ -46,14 +46,16 @@
     - `Source URL`
 - `Wiki Database`
   - 当前已切换到新的 Wiki 数据库
-  - 标题字段：`Source`
+  - 标题字段：`Name`
   - 当前字段：
-    - `Source`
-    - `Source `（relation，字段名尾部带空格）
+    - `Name`
+    - `Source`（relation）
     - `Canonical ID`
     - `Aliases`
     - `Compounded Level`
+    - `Last Compounded At`
     - `Topic`
+    - `Verification`
 
 ## 已实现能力
 
@@ -79,6 +81,12 @@
   - `Status`: `status`
   - `Processed At`: `date`
   - `Target Wiki Page`: `relation`
+- Wiki 数据库的关键字段也已基本到位：
+  - `Name`: `title`
+  - `Source`: `relation`
+  - `Compounded Level`: `number`
+  - `Last Compounded At`: `date`
+  - `Verification`: `status`
 
 ## 当前限制
 
@@ -97,31 +105,19 @@
   - 还没有递归处理深层嵌套 block
 - 还没有批量编译队列：
   - 目前是 `compile-from-raw <page_id>` 单条运行
-- 虽然已经跑过 `inspect-schema`，但数据库字段还没长齐：
-  - 新 Wiki 的标题字段是 `Source`，不是原先假设的 `Name` 或 `Page`
-  - Wiki 里存在两个非常接近的字段：
-    - `Source`：title
-    - `Source `：relation，字段名尾部带空格
-  - 这会给 mapping 和脚本调用带来歧义，建议改名
-  - Wiki 当前仍缺：
-    - `Verification`
-    - `Last Compounded At`
-  - `Compounded Level` 当前是 `rich_text`，后续更适合改成 `number`
+- 虽然已经完成 schema 对齐，但第一次真实写入还没跑：
+  - 还没有做过真实 `compile-from-raw` 的烟雾测试
+  - 还没有验证 raw -> wiki -> raw 回写的端到端行为
 
 ## 下一步
 
 建议按这个顺序继续：
 
 1. 根据真实字段名更新 `schema/notion_wiki_mapping.example.json`。
-2. 在 Wiki 数据库中把 `Source ` 这个 relation 字段改成一个不带尾部空格、语义明确的名字。
-3. 在 Wiki 数据库中补：
-   - `Verification`
-   - `Last Compounded At`
-4. 如果要更稳，把 `Compounded Level` 从 `rich_text` 改成 `number`
-5. 选一条 raw page 做第一次真实 `compile-from-raw`
-6. 将 `search_in_database` 改成 `query_database` 属性过滤
-7. 补 `Canonical ID` 和 `Aliases` 匹配
-8. 再决定是否接入真正的 LLM 抽取与冲突处理
+2. 选一条 raw page 做第一次真实 `compile-from-raw`
+3. 将 `search_in_database` 改成 `query_database` 属性过滤
+4. 补 `Canonical ID` 和 `Aliases` 匹配
+5. 再决定是否接入真正的 LLM 抽取与冲突处理
 
 ## 版本控制
 
