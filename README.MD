@@ -88,6 +88,11 @@
 - 将 compile 结果落盘到 `raw/notion_dumps/YYYY-MM-DD-compile-log.jsonl`
 - 按 `Raw Inbox` 的状态批量编译：
   - `compile-queue --status "Not started" --limit N`
+- 可选的低风险整理（默认关闭，`--auto-refine` 开启）：
+  - 章节标题收束为主题标题
+  - 自动补 `Aliases / Topic / Last Compounded At`
+  - 首次创建时自动补结构化整理模板（heading 骨架 + 原文摘录）
+  - 模板段落的具体判断由 Claude Code 会话层补写，脚本不做领域性结论
 
 说明：
 
@@ -106,14 +111,28 @@
   - Raw page：`3496e2cd-6e4f-81a2-988a-c9fd757c1b42`
   - Wiki page：`3496e2cd-6e4f-816e-919b-fd80753dcc9b`
   - 闭环已验证：`raw -> wiki -> raw 回写`
+- 已完成一条真实文本案例：
+  - Raw page：`3496e2cd-6e4f-8151-a289-dd2233536e30`
+  - Wiki page：`3496e2cd-6e4f-81b2-b037-d76d653b9c1f`
+  - 主题标题已自动收束为：`QueryLoop`
+  - 模板生成的 heading 骨架包括：
+    - `定义 / 为什么重要 / 关键机制 / 核心判断 / 实现信号 / 关联概念 / 与相邻概念的区别 / 原文证据`
+  - 注意：heading 是脚本模板产物，具体段落内容仍需 Claude Code 会话层介入后才是真正的永久笔记。
+  - 该页面后续经过一轮人工 + 会话层整理，才从"原文入库页"推进为"主题对象页雏形"。
 - 查询层当前能力：
   - `query_database` 已替代全局 `/search`
   - `Aliases` 查询会根据真实字段类型构造过滤（`rich_text` / `multi_select`）
   - `Canonical ID` 查询优先使用 Notion 端属性过滤，必要时再回退到本地过滤
   - 分页查询已带基础熔断上限
+  - `lint` 也已切到分页查询，不再只返回单页结果
 - 匹配层当前能力：
   - `Canonical ID / title / alias` 已区分匹配策略
   - 同一策略出现多个候选时直接报错，避免静默误并
+- 整理层当前能力（默认关闭，需 `--auto-refine`）：
+  - 能自动将章节式标题收束成主题式标题
+  - 能自动生成 heading 骨架与原文摘录
+  - 所有"判断句"都回退为中性表述；领域性结论不由脚本写入
+  - 真正的定义 / 核心判断 / 相邻概念区别，仍须 Claude Code 会话层介入
 
 ## 幂等性与回滚
 
@@ -125,6 +144,7 @@
 - 如果同一 raw page 的最新成功编译记录与当前 `body_hash` 一致，则默认：
   - 返回 `skipped_unchanged`
   - 不再重复写入 wiki
+  - 但若 Raw 当前 Status 仍非编译完成态，仍会把 Status 推进到 `Done`，避免 `compile-queue` 反复拉取
 - 如确需重跑，可显式加：
   - `--force`
 - 当前 upsert 主要依赖：
@@ -133,6 +153,7 @@
 - 如果命中已有 wiki 页面，脚本会：
   - 更新页面属性
   - 再追加一段新的 `增量更新` block
+  - 若显式传入 `--auto-refine`，才补 heading 骨架和原文摘录（默认关闭）
 - 这意味着当前的“重跑”语义是：
   - **同内容重跑默认跳过**
   - **内容变化后重跑仍会继续追加，而不是覆盖**
@@ -143,7 +164,9 @@
   - `3496e2cd-6e4f-81a2-988a-c9fd757c1b42`
 - 已知测试 wiki page：
   - `3496e2cd-6e4f-816e-919b-fd80753dcc9b`
-- 在没有更强幂等策略前，不建议反复对这条 raw page 运行 `compile-from-raw`，否则会继续向该 wiki 页面追加测试内容。
+- 在没有更强对象级幂等策略前，不建议反复拿这条 raw page 做测试：
+  - 若 raw body 未变化，当前实现会返回 `skipped_unchanged`
+  - 若 raw body 变化，或显式加 `--force`，仍会继续向该 wiki 页面追加测试内容
 
 当前可接受的手工回滚方式：
 
@@ -180,6 +203,7 @@
     - tier 3 的二次判断
     - tier 4 的停下来问用户
     - 自动 diff / 冲突保留证据
+    - 基于候选风险的自动/半自动切换
   - `raw/notion_dumps/` 目前已经落了 schema 快照、audit 事件和 compile 结果，但还没有：
     - LLM 判断日志
     - 面向冲突分析的结构化 diff 证据
@@ -188,13 +212,15 @@
 
 建议按这个顺序继续：
 
-1. 把“文档层策略”升级成脚本层行为：
+1. 把当前 `QueryLoop` 这类 live 优化经验沉淀回脚本，减少后续手工清理
+2. 把“深度整理”从低风险模板升级成更稳定的永久笔记结构
+3. 把候选风险分级真正下沉到脚本：
    - tier 3 二次判断
    - tier 4 停下来问用户
    - 冲突保留证据
-2. 把当前最小 `body_hash` 幂等升级成更严格的对象级幂等策略
-3. 补 LLM 判断日志和冲突 diff 证据落盘
-4. 给 `compile-queue` 增加更细的筛选与失败重试策略
+4. 把当前最小 `body_hash` 幂等升级成更严格的对象级幂等策略
+5. 补 LLM 判断日志和冲突 diff 证据落盘
+6. 给 `compile-queue` 增加更细的筛选与失败重试策略
 
 ## 版本控制
 
@@ -223,6 +249,7 @@
 - `.env` 不入 git
 - 不要把真实 `NOTION_API_KEY` 提交到仓库
 - 数据库 ID 是否入库可以讨论，但 API key 不允许入库
+- `raw/notion_dumps/*.jsonl`（运行日志，可能含 raw 标题与 source_url）已在 `.gitignore` 中忽略；schema 快照 JSON 仍入库，便于追溯字段变更
 
 ## 当前关键文件
 
