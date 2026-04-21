@@ -151,14 +151,24 @@
   - `query_database` 已替代全局 `/search`
   - 但匹配仍缺少更强的判定与冲突处理
   - 目前只有文档层的幂等性与回滚约定，还没有代码层的严格幂等策略
+  - LLM 归属与合并策略已在文档层明确：
+    - [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)
+    - [`MERGE_STRATEGY.md`](./MERGE_STRATEGY.md)
+  - 但脚本层还没有实现：
+    - tier 3 的二次判断
+    - tier 4 的停下来问用户
+    - 自动 diff / 冲突保留证据
 
 ## 下一步
 
 建议按这个顺序继续：
 
-1. 明确真正的 LLM 抽取放在哪一层执行
-2. 在 LLM 策略明确后，补更强的候选排序、冲突处理与合并策略
-3. 在合并策略明确后，把“文档约定”升级成代码层幂等策略
+1. 把“文档层策略”升级成脚本层行为：
+   - tier 3 二次判断
+   - tier 4 停下来问用户
+   - 冲突保留证据
+2. 把“文档约定”升级成代码层幂等策略
+3. 为 LLM 判断建立执行日志，并落盘到 `raw/notion_dumps/`
 4. 扩展 raw page body 的递归读取
 5. 增加批量编译队列
 
@@ -194,6 +204,8 @@
 
 - [`CLAUDE.md`](./CLAUDE.md)：系统设计蓝图
 - [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md)：设计与实现差距评审
+- [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)：LLM 抽取归属与执行策略
+- [`MERGE_STRATEGY.md`](./MERGE_STRATEGY.md)：候选排序、冲突处理与合并策略
 - [`README.MD`](./README.MD)：项目状态说明
 - [`README_REVIEW.md`](./README_REVIEW.md)：README 与实际状态一致性评审
 - [`schema/notion_wiki_mapping.example.json`](./schema/notion_wiki_mapping.example.json)：字段映射模板
