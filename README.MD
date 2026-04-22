@@ -37,6 +37,7 @@
 - `compile-queue --status <S> --limit N` ——支持 `--retry-failed` / `--filter PROP=VALUE`（可重复）/ 同样的 strict/emit-diff flags
 - `log-session-event` ——会话层留痕入口（写 `session-log.jsonl`）
 - `cleanup-wiki-page <page_id>` ——去重页面内重复的 `增量更新` section，支持 `--dry-run`
+- `check-editorial [<page_id>] [--all --limit N]` ——按 `EDITORIAL_POLICY.md` 的 checklist 机器化评估 wiki 页的永久笔记达标度，返回 green/yellow/red 分级
 - `lint`
 
 当前已确认的数据库结构：
@@ -109,6 +110,13 @@
   - compile-log 里现在始终存 raw body 截取（≤ 8000 字符）
   - update 路径下若上一次 compile 留有 body_text，则计算段落级 unified diff 并 append 为 `差异分析 YYYY-MM-DD` 代码块
 - Raw Inbox 多维过滤：`compile-queue --filter PROP=VALUE`（可重复）与 `--status` 合成 AND 过滤，覆盖 status/select/rich_text/title/checkbox/number/multi_select 常见类型
+- `check-editorial` 按 `EDITORIAL_POLICY.md` 的 checklist 对 wiki 页做机器化评估：
+  - 检查必填属性（Canonical ID / Verification / Compounded Level / Last Compounded At）
+  - 检查 title 是否已收束（无"第N章"前缀、无冒号切分残留）
+  - 检查正文是否至少含 `定义 / 核心判断 / 关联概念 / 原文证据` 四个 heading_2
+  - 检查 `原文证据` 下的条数 ≤ 4
+  - 检查 `增量更新` section 是否存在重复
+  - 输出 green（全绿）/ yellow（≤2 问题）/ red（>2 问题）；exit code 0/1 反映 green 与否
 - 可选的低风险整理（默认关闭，`--auto-refine` 开启）：
   - 章节标题收束为主题标题
   - 自动补 `Aliases / Topic / Last Compounded At`
@@ -234,9 +242,10 @@
   - 脚本层当前具备：
     - tier 4 fuzzy 候选感知（`--strict-fuzzy` 可硬停）
     - 段落级 unified diff 证据（`--emit-diff`，需上次 compile 留有 body_text）
+    - `check-editorial` 按 `EDITORIAL_POLICY.md` checklist 对 wiki 页做机器化评估
   - 仍待推进：
-    - 真正的永久笔记结构化验证（见 `EDITORIAL_POLICY.md`；当前 checklist 仅文档层）
     - 基于 diff 的"核心判断是否需要重写"决策（归会话层）
+    - `check-editorial` 结果驱动的自动补段（会话层协作）
 
 ## 下一步
 
@@ -249,11 +258,12 @@
 - `compile-queue --retry-failed`：从最近一次 audit 里拉失败条目重跑
 - `compile-queue --filter PROP=VALUE`：多维过滤，支持 status/select/rich_text/title/checkbox/number/multi_select
 - `compile-from-raw --emit-diff`：段落级 unified diff 作为 `差异分析 YYYY-MM-DD` 代码块追加
-- `EDITORIAL_POLICY.md`：永久笔记结构 checklist（文档层，未强制执行）
+- `EDITORIAL_POLICY.md`：永久笔记结构 checklist（文档层）
+- `check-editorial`：把 EDITORIAL_POLICY checklist 落到代码层自动评估（green/yellow/red 分级）
 
 尚未做（需要专项设计、非一两轮能定稿）：
 
-1. **永久笔记结构的代码层强制**：`EDITORIAL_POLICY.md` 已定义 checklist，但脚本不会阻止"不合格"页面。未来可在 `lint` 里新增一条 `--check-editorial` 选项，对缺段的 wiki 页列表化。
+1. **`check-editorial` 驱动的自动补段**：当前只评估不行动，缺段页面报 yellow/red；真正补内容需要会话层介入，脚本可后续增加"按 check-editorial 缺口批量生成骨架"能力。
 2. **对象级"同 wiki 同状态跳过"**：当前跨 raw 同 hash 已能跳过；但"同一 wiki 对象已达到目标内容，即便 raw 变了也应跳过"尚无实现（需先定义"目标内容"）。
 3. **基于 diff 的核心判断重写**：`--emit-diff` 只记录差异，没有触发摘要重写；重写是会话层 editorial 决策，脚本不代做。
 

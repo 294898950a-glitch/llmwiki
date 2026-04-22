@@ -82,8 +82,21 @@
 
 全部满足 → 该条可标为 `Verification: Fresh`。任何一条不满足 → 标为 `Needs Review`，并在 session-log 登记缺口。
 
+## 机器化检查
+
+本策略**写入 compile 路径不强制**，但已经有机器化评估入口：
+
+```
+python scripts/notion_wiki_compiler.py check-editorial <wiki_page_id>
+python scripts/notion_wiki_compiler.py check-editorial --all --limit 50
+```
+
+脚本检查：必填属性 4 项是否为空、title 是否仍带"第N章"前缀或未切分的冒号、正文是否包含 `定义 / 核心判断 / 关联概念 / 原文证据` 四个 heading_2、`原文证据` 条目是否 ≤ 4、`增量更新` section 是否有重复。
+
+输出 `green`（零问题）/ `yellow`（≤2 问题）/ `red`（>2 问题），exit code 0（green）或 1（其他）。会话层应把 `yellow` / `red` 页面作为下一轮 live editorial 的候选队列。
+
 ## 后续演进
 
-本策略**当前不强制执行**，脚本不会因为页面缺段而拒绝写入。未来若加入 `refine-wiki-page` 子命令，可选择把 checklist 做成 lint 的扩展，对不合格页面列表化并提示会话层补段。
-
-此外：`--auto-refine` 的 heading 模板应与本策略保持同步；如果 heading 名字或顺序在这里调整，脚本里的 `build_structured_refinement_blocks` / `build_deepening_blocks` 需要同步改。
+- **暂不强制**：当前 compile / upsert 不会因为 check-editorial 为非 green 而阻塞写入；后续可考虑加 `--enforce-editorial` flag 做硬门禁。
+- **自动补段**：未来可基于 `check-editorial` 结果，结合 Claude Code 会话层做"按缺段 append 骨架 + 留占位"的动作。
+- **与 `--auto-refine` 的耦合**：`--auto-refine` 的 heading 模板应与本策略保持同步；如果 heading 名字或顺序在这里调整，脚本里的 `build_structured_refinement_blocks` / `build_deepening_blocks` / `REQUIRED_EDITORIAL_HEADINGS` 三处需要同步改。

@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-22.r5
+> **Version**: 2026-04-22.r6
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -197,7 +197,7 @@ llmwiki/
 
 ## 当前可用脚本
 
-`scripts/notion_wiki_compiler.py` 提供 8 个子命令：
+`scripts/notion_wiki_compiler.py` 提供 9 个子命令：
 
 - `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
 - `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
@@ -206,6 +206,7 @@ llmwiki/
 - `compile-queue --status <S> --limit N`：按 Raw Inbox Status 批量编译，失败不中断；支持 `--retry-failed` / `--filter PROP=VALUE`（可重复，和 Status 共同组成 AND 过滤）/ 同样的 strict/emit-diff flags
 - `log-session-event --model --tier --decision --risk --notes ...`：会话层留痕入口，写 `session-log.jsonl`，用于记录语义判断的 why
 - `cleanup-wiki-page <page_id>`：去重页面内的重复 `增量更新` section，支持 `--dry-run`
+- `check-editorial [<page_id>] [--all --limit N]`：按 `EDITORIAL_POLICY.md` checklist 机器化评估 wiki 页永久笔记达标度，返回 green/yellow/red
 - `lint`：按 `Verification` 列出 Expired / Needs Review 的 Wiki 页
 
 所有子命令均写 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`（含 error 记录）。
