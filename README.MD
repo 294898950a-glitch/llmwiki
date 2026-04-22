@@ -7,7 +7,9 @@
 
 本项目当前目标不是生成本地 Markdown Wiki，而是实现 `raw -> compile -> wiki -> raw 回写` 的最小闭环。
 
-> **当前定位**：本项目处于 **alpha** 阶段。`raw → wiki` 写入链路已打通，但"知识复利（compounding）"尚未稳定——单页质量依赖会话层 editorial、概念网络未成图、对象级幂等未做实。路线图与具体执行清单见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。不要把当前状态当成成熟 wiki。
+> **当前定位**：本项目处于 **alpha** 阶段。`raw → wiki` 写入链路已打通，概念网络已开始生长（QueryLoop / QueryEngine 精修中，5 个相邻概念作占位页），并已进入 LLM_EXTRACTION_DESIGN 的模式 B——`llm-refine` 子命令接入 DeepSeek-reasoner 做段落级"解读"重写。路线图与具体执行清单见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。
+>
+> **LLM API 配置**：`llm-refine` 需要 DeepSeek key。在 `.env` 里设 `DEEPSEEK_API_KEY=sk-...` 或 `DEEPSEEK_API_KEY_FILE=<路径>`。其他命令不依赖 LLM，只用 Notion API。
 
 ## 当前状态
 
@@ -51,8 +53,10 @@
 - `consolidate-evidence <page_id> [--heading <text>] [--keep N] [--dry-run]` ——把指定 heading（默认"原文证据"）下的证据条数截到 `--keep` 以内
 - `reference-check <reference_page_id> [<target_page_id>] [--all --limit N]` ——以样板页（如 QueryLoop）为基准，比对其他 wiki 页的结构（heading / 属性 / 证据数），输出 conformance 分级
 - `seed-related-pages <source_page_id> [--dry-run]` ——从 source 页的 `infer_related_concepts` 输出中，对未在 Wiki 存在的概念创建占位页（`<placeholder>` marker + `Verification = Needs Review` + `Related Pages` 回指 source）
-- `rewrite-section <page_id> --heading <text> --body <text> [--mention-map LABEL=ID,...] [--promote]` ——会话层精修入口；替换指定 heading 下的 body；`--mention-map` 把 literal label 转成 Notion page mention（可点击跳转）
+- `rewrite-section <page_id> --heading <text> --body <text> [--mention-map LABEL=ID,...] [--link-style mention|link|both] [--promote]` ——会话层精修入口；替换指定 heading 下的 body；`--mention-map` 把 literal label 转成 Notion page mention 或 text-link
 - `link-pages <page_id> --add ID --remove ID [--ensure-property]` ——维护 wiki-to-wiki 的 `Related Pages` relation；`--ensure-property` 可程序化创建该属性
+- `link-concepts-in-page <page_id> --mention-map LABEL=ID,...` ——扫全页 block 给含 label 且尚无 link 的段落批量补链接
+- `llm-refine <page_id> --heading <text> [--style-from-page-id <id>] [--style-note ...] [--source-page-id <id>] [--preview]` ——调 DeepSeek-reasoner 对段落做"有解读"的重写（不是提要）；默认 **Style J**（锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说），按 heading 注入 section role guidance 防止段间重叠；reasoning + 产出完整落盘
 - `lint`
 
 当前已确认的数据库结构：

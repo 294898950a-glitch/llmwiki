@@ -1,0 +1,12 @@
+{
+  "database_role": "raw",
+  "database_id": "3496e2cd-6e4f-8050-9ecf-dc9aadc5c5c2",
+  "title_property": "Name",
+  "properties": {
+    "Target Wiki Page": "relation",
+    "Processed At": "date",
+    "Status": "status",
+    "Source URL": "url",
+    "Name": "title"
+  }
+}

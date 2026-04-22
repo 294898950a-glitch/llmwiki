@@ -159,17 +159,31 @@ LLM 层负责高不确定性、需要语义判断的动作：
 
 ## 当前决定
 
-当前正式决定如下：
+**2026-04-22 更新**：原立场（见下方旧版决定）已部分调整。用户观察到 wiki 页面输出"没有解读、没有精髓"——这是会话层精修成本高、产出慢的结构性问题。经多轮 style prompt 实验后，进入**模式 B 的有限形式**：
 
-- **短期**：
-  - LLM 抽取放在 Claude Code 会话层
-  - Notion API 执行放在本地脚本层
-- **中期**：
-  - 待候选排序与冲突策略稳定后，再考虑脚本内模型调用
-- **当前不做**：
-  - 不在 `scripts/notion_wiki_compiler.py` 中直接接入模型 API
+- **引入脚本内 LLM API 调用**：`scripts/notion_wiki_compiler.py` 的 `llm-refine` 子命令接入 DeepSeek-reasoner（OpenAI-compatible endpoint）做段落级"有解读"重写
+- **默认 prompt 固化为 Style J**：锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说；按 heading 注入 section role guidance 防止段间重叠
+- **reasoning + 生成内容完整落盘**：每次调用的 prompt / reasoning_content / content / usage 都写入 `raw/notion_dumps/YYYY-MM-DD-llm-refine-log.jsonl`，可回归比对
 
-这份决定是后续“候选排序 / 冲突处理 / 幂等策略”的前置条件。
+### 仍归会话层的工作
+
+以下语义判断仍不下沉到脚本：
+
+- 候选选择（canonical_id 命中或 alias 命中时是否为同一对象）
+- 冲突解释（新旧结论冲突时如何保留证据）
+- 高风险 tier 4 的 merge/split 决策
+- 样板页（如 QueryLoop）的 editorial 质量把关
+- 跨页面的结构一致性审查（通过 `reference-check` 后的人工判断）
+
+### 原立场（2026-04-22 前）
+
+保留作为历史记录：
+
+- **短期**：LLM 抽取放在 Claude Code 会话层；Notion API 执行放在本地脚本层
+- **中期**：待候选排序与冲突策略稳定后，再考虑脚本内模型调用
+- **当前不做**：不在 `scripts/notion_wiki_compiler.py` 中直接接入模型 API
+
+这份立场是后续"候选排序 / 冲突处理 / 幂等策略"的前置条件。现已被 `llm-refine` 局部突破，但其他语义工作仍按原立场留在会话层。
 
 ## 会话层留痕约定
 
