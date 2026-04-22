@@ -2599,15 +2599,21 @@ def command_reference_check(
 
 
 def build_placeholder_blocks(concept_label: str, source_title: str, source_page_id: str) -> List[Dict[str, Any]]:
-    marker_para = (
-        f"{PLACEHOLDER_MARKER} 此页面由 seed-related-pages 从源页 "
-        f"{source_title!r}（`{source_page_id}`）自动创建，等会话层精修为真实永久笔记。"
-    )
+    marker_rich_text: List[Dict[str, Any]] = [
+        {"type": "text", "text": {"content": f"{PLACEHOLDER_MARKER} 此页面由 seed-related-pages 从源页 "}},
+        {"type": "mention", "mention": {"type": "page", "page": {"id": source_page_id}}},
+        {"type": "text", "text": {"content": " 自动创建，等会话层精修为真实永久笔记。"}},
+    ]
+    related_rich_text: List[Dict[str, Any]] = [
+        {"type": "text", "text": {"content": "源页："}},
+        {"type": "mention", "mention": {"type": "page", "page": {"id": source_page_id}}},
+        {"type": "text", "text": {"content": "。其他关联由会话层补充。"}},
+    ]
     return [
         {
             "object": "block",
             "type": "paragraph",
-            "paragraph": {"rich_text": rich_text_value(marker_para)},
+            "paragraph": {"rich_text": marker_rich_text},
         },
         {
             "object": "block",
@@ -2637,7 +2643,7 @@ def build_placeholder_blocks(concept_label: str, source_title: str, source_page_
         {
             "object": "block",
             "type": "paragraph",
-            "paragraph": {"rich_text": rich_text_value(f"源页：{source_title}（`{source_page_id}`）。其他关联由会话层补充。")},
+            "paragraph": {"rich_text": related_rich_text},
         },
         {
             "object": "block",
