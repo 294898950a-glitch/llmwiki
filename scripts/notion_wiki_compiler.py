@@ -666,6 +666,7 @@ def detect_command_name(argv: List[str]) -> str:
         "link-concepts-in-page",
         "llm-refine",
         "llm-refine-page",
+        "llm-validate",
     }
     for token in argv:
         if token in known_commands:
@@ -3146,6 +3147,193 @@ def command_llm_refine_page(
     return 0
 
 
+LLM_VALIDATION_SYSTEM_PROMPT = (
+    "你是永久笔记的校对编辑。读者是懂 agent 系统架构的工程师/产品人，已经看过教科书，不需要入门介绍。\n"
+    "\n"
+    "你需要评估一段针对某个 heading 的永久笔记内容。评估标准：\n"
+    "\n"
+    "1. **有解读 vs 提要**：是否存在可被反驳的论断（非中性转述）；是否给出可操作判据（\"测试方式：...\"、\"判据是：...\"）；是否指出常见误解；是否有非显见洞察\n"
+    "2. **段职责遵守**：是否在该 heading 的 role guidance 范围内，不越界写其他段的内容\n"
+    "3. **类比质量**：类比是否精确；是否做了回溯映射（不只是抛一个类比就走）；是否指出类比不贴合的边界\n"
+    "4. **风格合规**：是否避免了空洞形容词（关键/核心/重要）、营销话术（颠覆/革命/breakthrough）、玩具比喻（小明小红）\n"
+    "5. **内在一致性**：段内论断是否前后一致；和源材料有无矛盾\n"
+    "\n"
+    "输出一个纯 JSON 对象（不要 markdown 代码块、不要前言），格式：\n"
+    "{\n"
+    "  \"pass\": true/false,\n"
+    "  \"score\": 0-10 整数,\n"
+    "  \"issues\": [\"具体问题 1\", \"具体问题 2\"],\n"
+    "  \"strengths\": [\"亮点 1\", \"亮点 2\"],\n"
+    "  \"suggestion\": \"一句具体改进建议\"\n"
+    "}\n"
+    "\n"
+    "score 标准：10=标杆样本；8-9=合格有解读；6-7=部分合格，需小改；4-5=偏提要或越界，需重写；0-3=空洞或与源材料矛盾。\n"
+    "pass=true 仅当 score >= 8。\n"
+)
+
+
+def command_llm_validate(
+    notion_client: NotionClient,
+    validator_client: LLMClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    page_id = args.page_id
+    top_blocks = iterate_block_children(notion_client, page_id)
+    database = notion_client.retrieve_database(wiki_database_id)
+    page = notion_client.retrieve_page(page_id)
+    title_prop = mapping.get("title_property") or detect_title_property(database)
+    title = extract_title(page, title_prop) if title_prop else ""
+
+    if args.heading:
+        sections = [args.heading]
+    else:
+        sections = ["定义", "为什么重要", "关键机制", "核心判断", "实现信号", "与相邻概念的区别"]
+
+    results: List[Dict[str, Any]] = []
+    for s in sections:
+        heading_block, body = find_section_body(top_blocks, s)
+        if heading_block is None:
+            continue
+        current = "\n\n".join(
+            extract_block_text(b) for b in body if extract_block_text(b).strip()
+        ).strip()
+        if not current:
+            results.append({"heading": s, "pass": False, "score": 0, "note": "section empty"})
+            continue
+        role = LLM_SECTION_ROLE_GUIDANCE.get(s, "")
+        list_spec = LLM_LIST_SECTION_SPEC.get(s)
+        list_note = ""
+        if list_spec:
+            list_note = f"\n这是一个条目型 section，应为 {list_spec['min_items']}-{list_spec['max_items']} 条 bullet。"
+
+        user_prompt = (
+            f"词条：{title or '(未命名)'}\n"
+            f"Heading：{s}\n"
+            f"该段职责（role guidance）：\n{role}{list_note}\n\n"
+            f"待评估段落内容：\n---\n{current}\n---\n\n"
+            "请按系统提示的 5 项标准评估，输出 JSON。"
+        )
+
+        try:
+            response = validator_client.chat(
+                system=LLM_VALIDATION_SYSTEM_PROMPT,
+                user=user_prompt,
+                max_tokens=getattr(args, "max_tokens", 2000),
+            )
+        except NotionError as exc:
+            results.append({"heading": s, "error": str(exc)})
+            continue
+
+        choices = response.get("choices") or []
+        if not choices:
+            results.append({"heading": s, "error": "no choices"})
+            continue
+        message = choices[0].get("message", {})
+        raw_output = (message.get("content") or "").strip()
+        if not raw_output:
+            results.append({"heading": s, "error": "empty content"})
+            continue
+
+        parsed = None
+        fence_match = re.match(r"```(?:json)?\s*(.*?)\s*```", raw_output, re.DOTALL)
+        candidate = fence_match.group(1).strip() if fence_match else raw_output
+        try:
+            parsed = json.loads(candidate)
+        except (json.JSONDecodeError, ValueError):
+            obj_match = re.search(r"\{.*\}", candidate, re.DOTALL)
+            if obj_match:
+                try:
+                    parsed = json.loads(obj_match.group(0))
+                except (json.JSONDecodeError, ValueError):
+                    pass
+        if not isinstance(parsed, dict):
+            results.append({"heading": s, "error": "parse failure", "raw": raw_output[:300]})
+            continue
+
+        results.append(
+            {
+                "heading": s,
+                "pass": bool(parsed.get("pass")),
+                "score": parsed.get("score"),
+                "issues": parsed.get("issues", []),
+                "strengths": parsed.get("strengths", []),
+                "suggestion": parsed.get("suggestion", ""),
+                "usage": response.get("usage", {}),
+            }
+        )
+
+    pass_count = sum(1 for r in results if r.get("pass"))
+    fail_count = sum(1 for r in results if r.get("pass") is False)
+    error_count = sum(1 for r in results if r.get("error"))
+    scored = [r.get("score") for r in results if isinstance(r.get("score"), int)]
+    avg_score = round(sum(scored) / len(scored), 2) if scored else 0
+
+    annotated_blocks_count = 0
+    if getattr(args, "annotate", False):
+        callout_blocks: List[Dict[str, Any]] = []
+        intro_text = (
+            f"DeepSeek 校验 · {today_iso_date()} · {validator_client.provider}/{validator_client.model}\n"
+            f"平均分 {avg_score}/10 · pass={pass_count}, fail={fail_count}, error={error_count}"
+        )
+        callout_blocks.append(
+            {
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "icon": {"emoji": "🔍"},
+                    "rich_text": rich_text_value(intro_text),
+                },
+            }
+        )
+        for r in results:
+            if r.get("error"):
+                text = f"[{r['heading']}] 校验失败：{r['error']}"
+            else:
+                status = "PASS" if r.get("pass") else "FAIL"
+                score = r.get("score", "?")
+                issues = " / ".join(r.get("issues") or [])
+                suggestion = r.get("suggestion") or ""
+                lines = [
+                    f"[{r['heading']}] · {status} · {score}/10",
+                ]
+                if issues:
+                    lines.append(f"问题：{issues}")
+                if suggestion:
+                    lines.append(f"建议：{suggestion}")
+                text = "\n".join(lines)
+            emoji = "✅" if r.get("pass") else ("❌" if r.get("pass") is False else "⚠️")
+            callout_blocks.append(
+                {
+                    "object": "block",
+                    "type": "callout",
+                    "callout": {
+                        "icon": {"emoji": emoji},
+                        "rich_text": rich_text_value(text),
+                    },
+                }
+            )
+        if not getattr(args, "dry_run", False):
+            notion_client.append_block_children(page_id, callout_blocks)
+        annotated_blocks_count = len(callout_blocks)
+
+    payload = {
+        "wiki_page_id": page_id,
+        "validator_provider": validator_client.provider,
+        "validator_model": validator_client.model,
+        "sections_checked": len(results),
+        "pass_count": pass_count,
+        "fail_count": fail_count,
+        "error_count": error_count,
+        "avg_score": avg_score,
+        "annotated_blocks_count": annotated_blocks_count,
+        "results": results,
+    }
+    print(json.dumps(audit_success("llm-validate", payload), ensure_ascii=False, indent=2))
+    return 0 if fail_count == 0 and error_count == 0 else 1
+
+
 def command_link_concepts_in_page(client: NotionClient, args: argparse.Namespace) -> int:
     mention_map = parse_mention_map(args.mention_map)
     if not mention_map:
@@ -3826,13 +4014,22 @@ def build_parser() -> argparse.ArgumentParser:
     llm_page_parser.add_argument("--source-page-id")
     llm_page_parser.add_argument("--style-from-page-id")
     llm_page_parser.add_argument("--style-note", default="")
-    llm_page_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek")
+    llm_page_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="LLM provider for generation (default: kimi, with deepseek as validator)")
     llm_page_parser.add_argument("--model", default="", help="Model override; default uses provider's default_model")
     llm_page_parser.add_argument("--max-tokens", type=int, default=16000)
     llm_page_parser.add_argument("--temperature", type=float, default=0.4)
     llm_page_parser.add_argument("--mention-map")
     llm_page_parser.add_argument("--link-style", choices=["mention", "link", "both"], default="link")
     llm_page_parser.add_argument("--preview", action="store_true")
+
+    validate_parser = subparsers.add_parser("llm-validate")
+    validate_parser.add_argument("page_id")
+    validate_parser.add_argument("--heading", default="", help="Validate single heading; omit for all registered sections")
+    validate_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek", help="Validator provider (default: deepseek)")
+    validate_parser.add_argument("--model", default="")
+    validate_parser.add_argument("--max-tokens", type=int, default=2000)
+    validate_parser.add_argument("--annotate", action="store_true", help="Append callout blocks to the wiki page with validation results")
+    validate_parser.add_argument("--dry-run", action="store_true", help="With --annotate, compute blocks but do not write to Notion")
 
     llm_parser = subparsers.add_parser("llm-refine")
     llm_parser.add_argument("page_id", help="Wiki page id to refine")
@@ -3841,7 +4038,7 @@ def build_parser() -> argparse.ArgumentParser:
     llm_parser.add_argument("--extra-instruction", default="", help="Optional extra instruction appended to the prompt")
     llm_parser.add_argument("--style-from-page-id", help="Wiki page id whose 定义 / 核心判断 / 关联概念 sections are fed as few-shot style samples")
     llm_parser.add_argument("--style-note", default="", help="Inline style guidance appended to system prompt (禁令 / 倾向 / 读者层次描述)")
-    llm_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek", help="LLM provider (default: deepseek)")
+    llm_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="LLM provider for generation (default: kimi, with deepseek as validator)")
     llm_parser.add_argument("--model", default="", help="Model override; default uses provider's default_model")
     llm_parser.add_argument("--max-tokens", type=int, default=10000)
     llm_parser.add_argument("--temperature", type=float, default=0.4)
@@ -3941,6 +4138,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "llm-refine-page":
         llm = build_llm_client(env, args.provider, args.model or None)
         return command_llm_refine_page(
+            client,
+            llm,
+            require_env(env, "NOTION_WIKI_DB_ID"),
+            mapping,
+            args,
+        )
+    if args.command == "llm-validate":
+        llm = build_llm_client(env, args.provider, args.model or None)
+        return command_llm_validate(
             client,
             llm,
             require_env(env, "NOTION_WIKI_DB_ID"),
