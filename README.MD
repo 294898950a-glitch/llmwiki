@@ -19,9 +19,9 @@
 
 ## Implemented
 
-### 子命令（18 个）
+### 子命令
 
-由 `scripts/notion_wiki_compiler.py` 的 `build_parser()` 注册：
+由 `scripts/notion_wiki_compiler.py` 的 `build_parser()` 注册，权威清单以代码为准：
 
 | 分类 | 子命令 |
 |---|---|
@@ -32,68 +32,34 @@
 | 概念网络 | `seed-related-pages` · `rewrite-section` · `link-pages` · `link-concepts-in-page` |
 | LLM 层 | `llm-refine` · `llm-refine-page` · `llm-validate` |
 
-关键 flag：
-- `compile-from-raw` 支持 `--force` / `--auto-refine` / `--strict-alias` / `--strict-fuzzy` / `--emit-diff` / `--merge-mode {append,propose,replace}`（replace 需配 `--replace-heading <text>`）
-- `compile-queue` 支持 `--retry-failed` / `--filter PROP=VALUE`（可重复，和 `--status` 合成 AND 过滤），及上面所有 strict / emit-diff / merge-mode flag
-- `llm-refine` / `llm-refine-page` 默认 provider 为 `kimi`；`llm-validate` 默认 provider 为 `deepseek`，`--annotate` 把评估结果作 callout block append 到页面底部
-- `llm-validate` 输出 JSON `{pass, score 0-10, issues, strengths, suggestion}`，按 5 项标准（有解读 vs 提要 / 段职责 / 类比质量 / 风格合规 / 内在一致性）评估
-- `link-pages --ensure-property` / `ensure_related_pages_property` 可程序化创建 `Related Pages` self-referencing relation 属性
+### 能力概览
 
-### 编译 / 幂等能力
+- **编译闭环**：raw body 递归读取 + `body_hash` 幂等（同 raw 跳过 / 跨 raw 同 hash 跳过）+ `Status` / `Processed At` / `Target Wiki Page` 回写
+- **匹配分层**：`canonical_id` / `title` / `alias` / `fuzzy` 逐级降级；同策略多候选直接报错；`alias` / `fuzzy` 有 `--strict-*` 硬停
+- **merge 模式**：`--merge-mode {append,propose,replace}` 覆盖追加 / 预览 / 替换三种 compounding 路径
+- **冲突证据**：`--emit-diff` 产出段落级 unified diff 作为 `差异分析 YYYY-MM-DD` block 追加
+- **LLM 层**：`llm-refine` 单段重写 / `llm-refine-page` 整页重写 / `llm-validate --annotate` 事后 callout 批注；默认 primary = Kimi、validator = DeepSeek；prompt / reasoning / content / usage 全量落盘
+- **体检与整理**：`check-editorial` / `reference-check` 给 green / yellow / red 分级；`consolidate-evidence` / `cleanup-wiki-page` 做结构清理；`seed-related-pages` 建占位页
+- **概念网络**：`Related Pages` self-referencing relation（`link-pages`）+ 正文 page mention（`rewrite-section --mention-map`）双实现
 
-- 读取 raw page body（含递归嵌套 block），计算 `body_hash`；相同 hash 再跑默认 `skipped_unchanged`
-- 跨 raw 同 hash 识别（`skipped_duplicate_body`），记录 `originating_raw_page_id`
-- 编译后回写 Raw 记录的 `Status` / `Processed At` / `Target Wiki Page`
-- 匹配策略区分 `canonical_id` / `title` / `alias` / `fuzzy`，同策略多候选直接报错避免静默误并
-- `alias` 命中输出 `review_required: true`；`--strict-alias` / `--strict-fuzzy` 可让 tier 3 / tier 4 硬停
-- `--emit-diff` 产出段落级 unified diff，作为 `差异分析 YYYY-MM-DD` 代码块追加
+能力细节（prompt style / JSON schema / editorial checklist / provider 抽象字段 / 落盘格式等）见下列二级文档：
+- `LLM_EXTRACTION_DESIGN.md`（LLM 层 prompt / provider / 校验协议）
+- `EDITORIAL_POLICY.md`（永久笔记结构 checklist）
+- `MERGE_STRATEGY.md`（候选排序 / 冲突分级）
+- `CLAUDE.md`（子命令完整签名与 flag 列表）
 
-### LLM 精修与校验
+### 配置
 
-- Style J 默认 prompt：锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说
-- 按 heading 注入 section role guidance 防止段间职责越界
-- 条目型 section（关键机制 / 实现信号）走 JSON list mode 强制 bullet 输出
-- 整页模式 `llm-refine-page` 单次 API 调用重写多段，注入 cross-section directive 强制各段用不同锚点 / 不同类比
-- provider 抽象：`LLM_PROVIDERS` dict 注册（`endpoint` / `default_model` / `env_key` / `env_key_file` / `fixed_temperature`）；`fixed_temperature` 用于 kimi-k2.6 这种强制 `temperature=1` 的模型
-- 所有调用的 prompt / reasoning_content / content / usage / provider / model 落盘到 `raw/notion_dumps/YYYY-MM-DD-llm-refine-log.jsonl`
-
-### 体检与结构整理
-
-- `check-editorial`：按 `EDITORIAL_POLICY.md` checklist 评估——必填属性（Canonical ID / Verification / Compounded Level / Last Compounded At）、title 收束、`定义 / 核心判断 / 关联概念 / 原文证据` 四个 heading、`原文证据` ≤ 4、`增量更新` 无重复；输出 green / yellow / red / placeholder
-- `consolidate-evidence`：对指定 heading（默认"原文证据"）下证据条数做截断
-- `reference-check`：以样板页（如 QueryLoop）为基准做 page 级一致性比对，支持 `--all` 扫全库
-- `cleanup-wiki-page`：去重页面内重复的 `增量更新` section
-- `seed-related-pages`：从 source 页 `infer_related_concepts` 输出建占位页（`<placeholder>` marker + `Verification = Needs Review` + 骨架 heading + `Related Pages` 回指）
-
-### 数据库与落盘
-
-- 配置：`NOTION_RAW_INBOX_DB_ID` / `NOTION_WIKI_DB_ID`（`.env`）
-- Raw Inbox 当前字段：`Name` / `Status`(status) / `Processed At`(date) / `Target Wiki Page`(relation) / `Source URL`
-- Wiki 当前字段：`Name`(title) / `Canonical ID` / `Aliases` / `Source`(relation) / `Topic` / `Verification`(status) / `Compounded Level`(number) / `Last Compounded At`(date) / `Related Pages`(relation)
-- 落盘产物（`raw/notion_dumps/`）：
-  - `*-inspect-schema-<role>.json`（schema 快照，入库）
-  - `YYYY-MM-DD-audit-log.jsonl`（命令执行事件，本地）
-  - `YYYY-MM-DD-compile-log.jsonl`（compile 结构化结果，本地）
-  - `YYYY-MM-DD-session-log.jsonl`（会话层语义判断留痕，本地）
-  - `YYYY-MM-DD-llm-refine-log.jsonl`（LLM 调用 prompt / reasoning / content / usage，本地）
-
-### LLM API 配置
-
-- `kimi` provider：`KIMI_API_KEY=...` 或 `KIMI_API_KEY_FILE=<路径>`
-- `deepseek` provider：`DEEPSEEK_API_KEY=...` 或 `DEEPSEEK_API_KEY_FILE=<路径>`
-- 非 LLM 命令（所有 I/O / 结构检查 / 审计）不依赖 provider key
+- Notion：`NOTION_API_KEY` / `NOTION_RAW_INBOX_DB_ID` / `NOTION_WIKI_DB_ID`
+- LLM（按需）：`KIMI_API_KEY` / `DEEPSEEK_API_KEY`（或对应 `*_API_KEY_FILE`）
+- 非 LLM 命令不依赖 provider key
 
 ## Live Examples
 
-live 运行结果不代表系统稳定状态，仅记录已经跑过的真实案例：
+两条已验证、不会漂移的真实引用；进行中的精修状态与占位页进度见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md) §1.1–§1.2。
 
-- **Smoke test 闭环**：raw `3496e2cd-6e4f-81a2-988a-c9fd757c1b42` → wiki `3496e2cd-6e4f-816e-919b-fd80753dcc9b`，`raw → wiki → raw 回写` 已验证
-- **QueryLoop 主题页雏形**：raw `3496e2cd-6e4f-8151-a289-dd2233536e30` → wiki `3496e2cd-6e4f-81b2-b037-d76d653b9c1f`
-  - 启发式先产出 `定义 / 为什么重要 / 关键机制 / 核心判断 / 实现信号 / 关联概念 / 与相邻概念的区别 / 原文证据` 骨架
-  - 会话层随后做了 live editorial 收敛：替换启发式判断为永久笔记级定义、把机械抽取的证据收敛成少量高价值引文、清理噪音
-  - 当前已推进为"主题对象页雏形"，用作 `reference-check` 的样板页
-- **QueryEngine 精修中**：走 Kimi primary + DeepSeek validator 双 provider 闭环，部分段落已通过 validator score ≥ 9
-- **5 个相邻概念占位页**：通过 `seed-related-pages` 从 QueryLoop 派生，等待会话层精修
+- **Smoke test 闭环**：raw `3496e2cd-6e4f-81a2-988a-c9fd757c1b42` → wiki `3496e2cd-6e4f-816e-919b-fd80753dcc9b`，`raw → wiki → raw 回写` 闭环已验证
+- **QueryLoop 样板页**：wiki `3496e2cd-6e4f-81b2-b037-d76d653b9c1f`，用作 `reference-check` 的对标基准
 
 ## Known Limits
 
