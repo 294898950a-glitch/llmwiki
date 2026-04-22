@@ -4027,7 +4027,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument("--heading", default="", help="Validate single heading; omit for all registered sections")
     validate_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek", help="Validator provider (default: deepseek)")
     validate_parser.add_argument("--model", default="")
-    validate_parser.add_argument("--max-tokens", type=int, default=2000)
+    validate_parser.add_argument("--max-tokens", type=int, default=10000)
     validate_parser.add_argument("--annotate", action="store_true", help="Append callout blocks to the wiki page with validation results")
     validate_parser.add_argument("--dry-run", action="store_true", help="With --annotate, compute blocks but do not write to Notion")
 
