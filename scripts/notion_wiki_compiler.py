@@ -462,6 +462,7 @@ def detect_command_name(argv: List[str]) -> str:
         "lint",
         "log-session-event",
         "cleanup-wiki-page",
+        "check-editorial",
     }
     for token in argv:
         if token in known_commands:
@@ -1820,6 +1821,153 @@ def command_log_session_event(args: argparse.Namespace) -> int:
     return 0
 
 
+REQUIRED_EDITORIAL_HEADINGS = ("定义", "核心判断", "关联概念", "原文证据")
+
+
+def count_update_section_duplicates(blocks: List[Dict[str, Any]], heading_prefix: str = "增量更新") -> int:
+    keys: List[str] = []
+    current_key_parts: Optional[List[str]] = None
+    for block in blocks:
+        text = ""
+        if block.get("type") == "heading_2":
+            text = rich_text_plain_text(block.get("heading_2", {}).get("rich_text", []))
+        if text.startswith(heading_prefix):
+            if current_key_parts is not None:
+                key = "\n".join(p for p in current_key_parts if p).strip()
+                if key:
+                    keys.append(key)
+            current_key_parts = []
+        elif current_key_parts is not None:
+            current_key_parts.append(extract_block_text(block))
+    if current_key_parts is not None:
+        key = "\n".join(p for p in current_key_parts if p).strip()
+        if key:
+            keys.append(key)
+    seen: Dict[str, int] = {}
+    dup = 0
+    for key in keys:
+        seen[key] = seen.get(key, 0) + 1
+    for count in seen.values():
+        if count > 1:
+            dup += count - 1
+    return dup
+
+
+def count_evidence_items(blocks: List[Dict[str, Any]]) -> int:
+    in_section = False
+    count = 0
+    for block in blocks:
+        btype = block.get("type")
+        if btype in ("heading_2", "heading_3"):
+            text = rich_text_plain_text(block.get(btype, {}).get("rich_text", []))
+            in_section = text.startswith("原文证据")
+            continue
+        if in_section and btype in ("quote", "bulleted_list_item", "paragraph"):
+            if extract_block_text(block).strip():
+                count += 1
+    return count
+
+
+def check_editorial_compliance(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+) -> Dict[str, Any]:
+    database = client.retrieve_database(wiki_database_id)
+    props_meta = database.get("properties", {})
+    page = client.retrieve_page(wiki_page_id)
+    title_prop = mapping.get("title_property") or detect_title_property(database)
+    title = extract_title(page, title_prop) if title_prop else ""
+
+    issues: List[Dict[str, Any]] = []
+
+    required_prop_keys = [
+        mapping.get("canonical_id_property"),
+        mapping.get("verification_property"),
+        mapping.get("compounded_level_property"),
+        mapping.get("last_compounded_at_property"),
+    ]
+    for prop_name in required_prop_keys:
+        if not prop_name:
+            continue
+        if prop_name not in props_meta:
+            issues.append({"check": "required_property_missing_in_schema", "property": prop_name})
+            continue
+        value = extract_property_text(page, prop_name)
+        if not value:
+            issues.append({"check": "required_property_empty", "property": prop_name})
+
+    if re.match(r"^第\s*\d+\s*章", title):
+        issues.append({"check": "title_not_normalized", "hint": "strip 第N章 prefix"})
+    if "：" in title or ":" in title:
+        issues.append({"check": "title_contains_delimiter", "hint": "consider splitting before ：/:"})
+
+    blocks = iterate_block_children(client, wiki_page_id)
+    heading_texts: List[str] = []
+    for b in blocks:
+        if b.get("type") == "heading_2":
+            heading_texts.append(rich_text_plain_text(b.get("heading_2", {}).get("rich_text", [])))
+    for required in REQUIRED_EDITORIAL_HEADINGS:
+        if not any(required in h for h in heading_texts):
+            issues.append({"check": "missing_heading", "heading": required})
+
+    evidence_count = count_evidence_items(blocks)
+    if evidence_count > 4:
+        issues.append({"check": "too_many_evidence_items", "count": evidence_count, "hint": "cap at 4 per EDITORIAL_POLICY"})
+
+    dup_count = count_update_section_duplicates(blocks)
+    if dup_count > 0:
+        issues.append({"check": "duplicate_update_sections", "count": dup_count, "hint": "run cleanup-wiki-page"})
+
+    if not issues:
+        compliance = "green"
+    elif len(issues) <= 2:
+        compliance = "yellow"
+    else:
+        compliance = "red"
+
+    return {
+        "wiki_page_id": wiki_page_id,
+        "title": title,
+        "compliance": compliance,
+        "issue_count": len(issues),
+        "issues": issues,
+    }
+
+
+def command_check_editorial(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    if getattr(args, "all", False):
+        pages = query_database_pages(client, wiki_database_id, None, page_size=20, max_pages=5)
+        pages = pages[: args.limit] if args.limit else pages
+        results = [
+            check_editorial_compliance(client, wiki_database_id, mapping, page.get("id"))
+            for page in pages
+            if page.get("id")
+        ]
+        summary = {
+            "wiki_database_id": wiki_database_id,
+            "scope": "all",
+            "checked_count": len(results),
+            "green": sum(1 for r in results if r["compliance"] == "green"),
+            "yellow": sum(1 for r in results if r["compliance"] == "yellow"),
+            "red": sum(1 for r in results if r["compliance"] == "red"),
+            "results": results,
+        }
+        print(json.dumps(audit_success("check-editorial", summary), ensure_ascii=False, indent=2))
+        return 0 if all(r["compliance"] == "green" for r in results) else 1
+    if not args.page_id:
+        raise NotionError("check-editorial requires either <page_id> or --all")
+    result = check_editorial_compliance(client, wiki_database_id, mapping, args.page_id)
+    print(json.dumps(audit_success("check-editorial", result), ensure_ascii=False, indent=2))
+    return 0 if result["compliance"] == "green" else 1
+
+
 def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) -> int:
     page_id = args.page_id
     append_heading_prefix = args.heading_prefix or "增量更新"
@@ -1985,6 +2133,11 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("--heading-prefix", default="增量更新", help="Only de-duplicate sections whose heading_2 starts with this prefix")
     cleanup_parser.add_argument("--dry-run", action="store_true", help="Report what would be deleted without calling Notion delete API")
 
+    check_parser = subparsers.add_parser("check-editorial")
+    check_parser.add_argument("page_id", nargs="?", default="", help="Wiki page id to check; omit when using --all")
+    check_parser.add_argument("--all", action="store_true", help="Check every page in the Wiki database (bounded by --limit)")
+    check_parser.add_argument("--limit", type=int, default=50, help="Max pages to inspect when --all is set")
+
     lint_parser = subparsers.add_parser("lint")
     lint_parser.add_argument("--title-property")
     lint_parser.add_argument("--verification-property")
@@ -2031,6 +2184,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_log_session_event(args)
     if args.command == "cleanup-wiki-page":
         return command_cleanup_wiki_page(client, args)
+    if args.command == "check-editorial":
+        return command_check_editorial(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "lint":
         return command_lint(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     parser.error(f"Unknown command: {args.command}")
