@@ -2584,92 +2584,169 @@ LLM_SECTION_ROLE_GUIDANCE: Dict[str, str] = {
 }
 
 
-LLM_REFINE_DEFAULT_STYLE_NOTE = """风格：已知 AI 产品锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说。
+# Heuristic prompt fragments (2026-04-23 refactor)
+# Replaces the previous monolithic LLM_REFINE_SYSTEM_PROMPT_BASE +
+# LLM_REFINE_DEFAULT_STYLE_NOTE, which hardcoded "agent engineer reader" +
+# "LangChain/ReAct anchor" and thus polluted non-agent topics (e.g. 量化入门
+# got written with LangChain / ReAct / AutoGPT analogies).
+#
+# The replacement is composed from 5 reusable fragments:
+#   base_quality — topic-neutral self-check questions (提要 vs 解读)
+#   reader_profile[role] — swappable reader assumption (agent / quant / general)
+#   anchor_hint — topic-agnostic hint: open from something the reader already knows
+#   analogy_hint — topic-agnostic analogy craft hints (no enumerated pool)
+#   taboo_hint — self-check pitfalls, no rigid rules
+#
+# All fragments use heuristic ("问问自己 / 试试 / 举例")不是规定 ("必须 / 严禁") 口吻，
+# giving the LLM room to pick anchors and analogies that fit the topic.
 
-读者背景：
-- 用过 ChatGPT / Claude 这类对话式 AI
-- 大致听说 LangChain / AutoGPT 这些名字
-- 不熟悉工程领域——不要用 SIGSTOP / fork / 数据库事务 / Git / WAL / K8s 这类
-- 熟悉日常参照：Google Docs / Notion / ChatGPT 自身 / 游戏存档 / 手机 APP
+PROMPT_FRAGMENT_PREAMBLE = "你是永久笔记的编辑器。"
 
-费曼侧：
-- 从读者能观察到的现象出发（"想想你用 ChatGPT 时..."）
-- 让读者自己推出结论（"你会发现"、"想想看"）
-- 带亲和感，不学术腔
-
-锚点：
-- 选一个熟悉 AI 框架（LangChain AgentExecutor / ReAct）切入，描述很短
-- 指出它在具体场景下的行为（超时 / 重开 / 网络断）
-
-类比（必用其一）：
-- 游戏存档 / 读档
-- Google Docs 自动保存
-- Notion 多端同步
-- ChatGPT 会话历史
-- 手机 APP 切后台
-- 用"这有点像..."、"类似你用..."（承认不完全）
-
-关键约束：类比必须回溯映射
-类比是脚手架，不是目的。用完类比后必须做"一对一映射回被讲解的概念"：
-- 类比里的 A 在当前概念里具体对应什么
-- 类比里的 B 在当前概念里具体对应什么
-- 类比哪里不完全贴合，明确指出来
-- 表达："回到 X 语境下，Y 其实就是..."、"对应到我们这里..."、"区别是..."
-- 严禁"类比收尾"——段落不能以类比本身结束，必须绕回概念
-- 读者读完必须能独立复述：在当前概念里，A 是什么、B 是什么、和类比的区别是什么
-
-节奏：
-- 观察 → 为什么 → 类比建桥 → 把类比组件映射回概念 → 指出类比边界
-- 每段结尾读者能"哦原来如此"，还能自己复述映射
-- 3 段紧凑
-
-禁忌：
-- 不用工程类比（OS / 数据库 / Git）
-- 不玩具比喻（小明小红）
-- 不空洞形容词（关键、核心、重要）
-- 不营销话术（颠覆、革命）
-- 不贬低产品
-- 不在第一段下定义
-- 不"由此可见"、"综上所述"
-- 不以类比作段落结尾
-"""
-
-
-LLM_REFINE_SYSTEM_PROMPT_BASE = (
-    "你是永久笔记的编辑器。读者是一个懂 agent 系统架构的工程师/产品人；他已经看过"
-    "教科书式描述，需要的是对他自己思维框架的扩展，不是入门介绍。\n"
-    "\n"
-    "\"提要\"和\"解读\"的区别：\n"
-    "- 提要：说 X 是什么、X 做什么，中性描述；读起来像在复述材料\n"
-    "- 解读：说 X 的非显见判据、X 和相邻概念的张力、X 容易被搞错的那条线、X 的一句话核心洞察\n"
-    "\n"
-    "改写约束：\n"
-    "1. 不要空洞形容词和正确的废话（\"重要/核心/关键\"没有具体内容不要用）\n"
-    "2. 每段要有一个可被反驳的论断，不是中性转述\n"
-    "3. 尽量举可操作判据（\"测试方式：...\" / \"判据是：...\"）；避免抽象描述\n"
-    "4. 指出常见误解或相邻概念被搞混的那条线\n"
-    "5. 不要用玩具例子（\"比如小明和小红\"）或过度简化的比喻\n"
-    "6. 保持紧凑，每段一个核心判断；必要时可多段，但不要为凑字数罗列\n"
-    "7. 输出纯文本段落，空行分段。不要返回 heading、不要前言、不要 markdown、不要解释你做了什么\n"
-    "8. 对齐已给出的样本风格（如果有）：模仿样本的论断密度、判据方式、段落组织，不要自创一套\n"
+PROMPT_FRAGMENT_BASE_QUALITY = (
+    "写之前先自查三个问题：\n"
+    "- 这段有没有一句话能被读者反驳？（只有可被反驳的论断才是判断，不是提要）\n"
+    "- 读者想验证结论，给得出可操作判据吗？（\"测试方式：...\"、\"判据是：...\"）\n"
+    "- 有没有指出读者容易搞错或相邻概念容易混淆的那条线？\n"
+    "三个都没有，这段大概率又写成提要了。"
 )
 
+PROMPT_FRAGMENT_ANCHOR_HINT = (
+    "开头可以试着从读者已经熟悉的东西切入：\n"
+    "- 他已经用过的工具\n"
+    "- 他见过的现象\n"
+    "- 他理解的概念\n"
+    "再自然过渡到本主题。切忌从抽象定义起头，或强拉一个读者不熟、且和本主题不贴合的框架。"
+)
 
-def build_llm_refine_system_prompt(style_samples: List[Dict[str, str]], style_note: str) -> str:
-    parts: List[str] = [LLM_REFINE_SYSTEM_PROMPT_BASE]
+PROMPT_FRAGMENT_ANALOGY_HINT = (
+    "写类比时可以问问自己：\n"
+    "- 读者在什么日常场景下会遇到\"同样的问题结构\"？\n"
+    "- 类比里的每个元素能不能一一对应本主题？对不上就说明不贴合，换一个\n"
+    "- 类比讲完能不能自然回到主题？（不能停在\"就像 XX 一样\"这种类比收尾）\n"
+    "\n"
+    "举例思路（示意，不要照抄）：讲 agent loop 一些人用游戏存档；讲量化回测一些人用历史复盘；"
+    "讲数据库事务一些人用银行转账。如果你发现本主题找不到自然的类比，写一句\"本段不强行类比\" "
+    "也比生拉硬扯好。"
+)
+
+PROMPT_FRAGMENT_TABOO_HINT = (
+    "自查常见陷阱（自然避开即可，不必逐条对照）：\n"
+    "- \"关键 / 核心 / 重要\"没配具体内容 → 空洞\n"
+    "- \"颠覆 / 革命 / breakthrough\" → 营销话术\n"
+    "- 段落以类比结尾没回溯 → 类比断线\n"
+    "- 小明小红类玩具比喻 → 读者代入不进去\n"
+    "- 硬拉不相关领域的术语当类比（典型：用 agent 框架解释量化主题、用交易术语解释产品设计） → 污染"
+)
+
+PROMPT_FRAGMENT_OUTPUT_SHAPE = (
+    "输出纯文本段落，空行分段。不要返回 heading、不要前言、不要 markdown、不要解释你做了什么。"
+)
+
+READER_PROFILES: Dict[str, str] = {
+    "agent": "读者：懂 agent 系统架构的工程师 / 产品人（熟悉 LangChain / ReAct 基础）；已看过教科书，需要对自己思维框架的扩展。",
+    "quant": "读者：懂量化与回测的投资者 / 工程师（熟悉均线 / 因子 / 止损 / 回测基础）；已看过入门教材，需要对判据和策略边界的深入。",
+    "general": "读者：有技术背景但不限领域；避免该主题专属术语堆砌，用通用工程思路即可。",
+}
+
+# Hard profile-specific taboos — NOT heuristic. These apply when a non-agent
+# topic is being refined and the model's training distribution would otherwise
+# pull in AI-framework terms. Heuristic hints in taboo_hint weren't sufficient
+# to stop Kimi from reaching for LangChain / AgentExecutor / AutoGPT analogies
+# on 量化入门; this fragment is a hard prohibition inserted after taboo_hint.
+PROFILE_HARD_TABOOS: Dict[str, str] = {
+    "agent": "",  # agent profile wants AI-framework anchors; no cross-domain ban
+    "quant": (
+        "**跨领域污染硬禁（严格遵守）**：本主题是量化 / 金融领域，读者不需要 AI agent 语境。"
+        "禁止以下术语作为锚点或类比：LangChain / ReAct / AgentExecutor / AutoGPT / "
+        "ChatGPT prompt / tool use / agent loop / 工具调用循环。"
+        "也不要用 Git / fork / WAL / 数据库事务 这类纯工程术语做类比。"
+        "如果类比只能从这些领域找，改写为\"本段不强行类比\"或直接回到主题本身的实践（回测 / 止损 / 因子 / K线）。"
+    ),
+    "general": (
+        "**跨领域污染硬禁（严格遵守）**：本主题与 AI agent、金融量化都无关。"
+        "禁止以下术语作为锚点或类比：LangChain / ReAct / AgentExecutor / AutoGPT / 工具调用循环 / "
+        "均线 / 止损 / 回测 / K线 / 金叉死叉。"
+        "如果无法从本主题自身找到自然类比，写\"本段不强行类比\"。"
+    ),
+}
+
+VALID_READERS = set(READER_PROFILES.keys())
+
+
+def infer_reader_profile(text: str) -> str:
+    """Heuristic classifier: pick a reader profile from content keywords.
+
+    Not a semantic classifier — just keyword density. If nothing triggers
+    strongly, fall back to 'general' (safe neutral default)."""
+    if not text:
+        return "general"
+    t = text.lower()
+    agent_tokens = ("agent", "langchain", "react agent", "agentexecutor", "autogpt", "tool use", "工具调用", "代理", "queryloop", "queryengine")
+    quant_tokens = ("量化", "均线", "回测", "因子", "止损", "macd", "rsi", "boll", "k线", "sma", "ema", "金叉", "死叉", "仓位", "技术指标")
+    agent_score = sum(1 for k in agent_tokens if k in t)
+    quant_score = sum(1 for k in quant_tokens if k in t)
+    if quant_score >= 2 and quant_score > agent_score:
+        return "quant"
+    if agent_score >= 2 and agent_score > quant_score:
+        return "agent"
+    return "general"
+
+
+def _resolve_reader_for_llm_refine(
+    notion_client: "NotionClient",
+    args: argparse.Namespace,
+    page_id: Optional[str] = None,
+) -> str:
+    """Pick reader profile: --reader flag wins; else auto-infer from wiki page body."""
+    explicit = getattr(args, "reader", None)
+    if explicit and explicit in VALID_READERS:
+        return explicit
+    if not page_id:
+        return "general"
+    try:
+        body_text = read_page_body_text(notion_client, page_id)
+    except NotionError:
+        return "general"
+    return infer_reader_profile(body_text or "")
+
+
+def build_llm_refine_system_prompt(
+    style_samples: List[Dict[str, str]],
+    style_note: str,
+    reader: str = "general",
+) -> str:
+    """Compose a heuristic system prompt from swappable fragments.
+
+    Only reader_profile varies by topic (swappable via `reader`); the rest
+    (base quality / anchor hint / analogy hint / taboo hint / output shape)
+    are topic-neutral and共用. Optional extra style_note is appended as-is so
+    existing `--style-note` CLI usage continues to work.
+    """
+    reader_key = reader if reader in VALID_READERS else "general"
+    sections: List[str] = [
+        PROMPT_FRAGMENT_PREAMBLE,
+        READER_PROFILES[reader_key],
+        PROMPT_FRAGMENT_BASE_QUALITY,
+        PROMPT_FRAGMENT_ANCHOR_HINT,
+        PROMPT_FRAGMENT_ANALOGY_HINT,
+        PROMPT_FRAGMENT_TABOO_HINT,
+    ]
+    hard_taboo = PROFILE_HARD_TABOOS.get(reader_key, "").strip()
+    if hard_taboo:
+        sections.append(hard_taboo)
+    sections.append(PROMPT_FRAGMENT_OUTPUT_SHAPE)
     if style_samples:
-        parts.append("\n## 读者认可的样本风格\n")
-        parts.append("以下是读者已经认可的\"有解读\"写法。改写时模仿这些样本的论断密度、"
-                     "判据方式、段落节奏，不要偏离它们的风格基调：\n")
+        lines = [
+            "## 读者认可的样本风格",
+            "以下是读者已经认可的\"有解读\"写法。模仿论断密度、判据方式、段落节奏：",
+        ]
         for i, sample in enumerate(style_samples, 1):
-            parts.append(f"\n### 样本 {i}：{sample.get('label', '')}\n")
-            parts.append(sample.get("text", "").strip())
-            parts.append("\n")
-    if style_note.strip():
-        parts.append("\n## 本次额外的风格要求\n")
-        parts.append(style_note.strip())
-        parts.append("\n")
-    return "".join(parts)
+            lines.append(f"### 样本 {i}：{sample.get('label', '')}")
+            lines.append(sample.get("text", "").strip())
+        sections.append("\n".join(lines))
+    if style_note and style_note.strip():
+        sections.append("## 本次额外的风格要求\n" + style_note.strip())
+    return "\n\n".join(sections)
 
 
 def fetch_style_samples(
@@ -2766,9 +2843,8 @@ def command_llm_refine(
     if getattr(args, "style_from_page_id", None):
         style_samples = fetch_style_samples(notion_client, args.style_from_page_id)
     style_note = getattr(args, "style_note", "") or ""
-    if not style_note.strip():
-        style_note = LLM_REFINE_DEFAULT_STYLE_NOTE
-    system_prompt = build_llm_refine_system_prompt(style_samples, style_note)
+    reader = _resolve_reader_for_llm_refine(notion_client, args, page_id=args.page_id)
+    system_prompt = build_llm_refine_system_prompt(style_samples, style_note, reader=reader)
 
     response = deepseek_client.chat(
         system=system_prompt,
@@ -2959,10 +3035,9 @@ def command_llm_refine_page(
     if getattr(args, "style_from_page_id", None):
         style_samples = fetch_style_samples(notion_client, args.style_from_page_id)
     style_note = getattr(args, "style_note", "") or ""
-    if not style_note.strip():
-        style_note = LLM_REFINE_DEFAULT_STYLE_NOTE
+    reader = _resolve_reader_for_llm_refine(notion_client, args, page_id=page_id)
     system_prompt = (
-        build_llm_refine_system_prompt(style_samples, style_note)
+        build_llm_refine_system_prompt(style_samples, style_note, reader=reader)
         + WHOLE_PAGE_CROSS_SECTION_DIRECTIVE
     )
 
@@ -3154,7 +3229,7 @@ def command_llm_refine_page(
 
 
 LLM_VALIDATION_SYSTEM_PROMPT = (
-    "你是永久笔记的校对编辑。读者是懂 agent 系统架构的工程师/产品人，已经看过教科书，不需要入门介绍。\n"
+    "你是永久笔记的校对编辑。评估该段落对它所属词条（由 user prompt 给出的\"词条\"名判定主题）是否合格。\n"
     "\n"
     "你需要评估一段针对某个 heading 的永久笔记内容。评估标准：\n"
     "\n"
@@ -3163,6 +3238,11 @@ LLM_VALIDATION_SYSTEM_PROMPT = (
     "3. **类比质量**：类比是否精确；是否做了回溯映射（不只是抛一个类比就走）；是否指出类比不贴合的边界\n"
     "4. **风格合规**：是否避免了空洞形容词（关键/核心/重要）、营销话术（颠覆/革命/breakthrough）、玩具比喻（小明小红）\n"
     "5. **内在一致性**：段内论断是否前后一致；和源材料有无矛盾\n"
+    "6. **跨领域污染（直接判 FAIL 的硬条件）**：段落是否硬拉不属于该词条主题的术语 / 框架 / 类比？典型场景：\n"
+    "   - 量化 / 金融主题段落中出现 LangChain / ReAct / AgentExecutor / AutoGPT / ChatGPT prompt / tool use / agent loop\n"
+    "   - 产品 / 设计主题段落中出现止损线 / 回测 / K 线 / 均线 / 因子\n"
+    "   - 硬件 / 底层主题段落中出现 DevOps / 云厂商 API\n"
+    "   命中此项 = 直接 pass=false, score ≤ 5，不管其他 5 项如何；issues 里必须把污染术语列出来。\n"
     "\n"
     "输出一个纯 JSON 对象（不要 markdown 代码块、不要前言），格式：\n"
     "{\n"
@@ -4354,7 +4434,11 @@ def _build_compile_args_for_pipeline(
     )
 
 
-def _build_refine_page_args_for_pipeline(wiki_page_id: str, provider: str) -> argparse.Namespace:
+def _build_refine_page_args_for_pipeline(
+    wiki_page_id: str,
+    provider: str,
+    reader: Optional[str] = None,
+) -> argparse.Namespace:
     return argparse.Namespace(
         page_id=wiki_page_id,
         sections="",
@@ -4368,6 +4452,7 @@ def _build_refine_page_args_for_pipeline(wiki_page_id: str, provider: str) -> ar
         preview=False,
         max_tokens=16000,
         temperature=0.4,
+        reader=reader,
     )
 
 
@@ -4432,11 +4517,25 @@ def command_pipeline(
         print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "skipped_by_gate", "stages": stages}), ensure_ascii=False, indent=2))
         return 0
 
+    # Resolve reader profile (explicit --reader overrides; else auto-infer from wiki page body)
+    explicit_reader = getattr(args, "reader", None)
+    if explicit_reader and explicit_reader in VALID_READERS:
+        resolved_reader = explicit_reader
+        reader_source = "explicit"
+    else:
+        try:
+            body_for_infer = read_page_body_text(client, wiki_page_id)
+        except NotionError:
+            body_for_infer = ""
+        resolved_reader = infer_reader_profile(body_for_infer)
+        reader_source = "inferred"
+    stages.append({"stage": "reader_profile", "reader": resolved_reader, "source": reader_source})
+
     if args.skip_refine:
         stages.append({"stage": "refine_skipped_by_flag"})
     else:
         # Stage 2: llm-refine-page round 1
-        refine_args = _build_refine_page_args_for_pipeline(wiki_page_id, args.refine_provider)
+        refine_args = _build_refine_page_args_for_pipeline(wiki_page_id, args.refine_provider, reader=resolved_reader)
         try:
             refine_llm = build_llm_client(env, args.refine_provider, None)
             refine_payload, _ = _capture_command_stdout_json(
@@ -4515,7 +4614,7 @@ def command_pipeline(
         return 0
 
     # Stage 5: Kimi refine round 2
-    refine_args_r2 = _build_refine_page_args_for_pipeline(wiki_page_id, args.refine_provider)
+    refine_args_r2 = _build_refine_page_args_for_pipeline(wiki_page_id, args.refine_provider, reader=resolved_reader)
     # Limit sections to the ones Gemini upheld (save cost)
     refine_args_r2.sections = ",".join(r["heading"] for r in upheld)
     try:
@@ -4775,6 +4874,7 @@ def build_parser() -> argparse.ArgumentParser:
     llm_page_parser.add_argument("--mention-map")
     llm_page_parser.add_argument("--link-style", choices=["mention", "link", "both"], default="link")
     llm_page_parser.add_argument("--preview", action="store_true")
+    llm_page_parser.add_argument("--reader", choices=sorted(VALID_READERS), help="Reader profile (agent / quant / general); if omitted, auto-inferred from page body keywords")
 
     validate_parser = subparsers.add_parser("llm-validate")
     validate_parser.add_argument("page_id")
@@ -4799,6 +4899,7 @@ def build_parser() -> argparse.ArgumentParser:
     llm_parser.add_argument("--mention-map", help="Apply LABEL=page_id mentions to the generated body")
     llm_parser.add_argument("--link-style", choices=["mention", "link", "both"], default="link")
     llm_parser.add_argument("--preview", action="store_true", help="Show what would be written without touching Notion")
+    llm_parser.add_argument("--reader", choices=sorted(VALID_READERS), help="Reader profile (agent / quant / general); if omitted, auto-inferred from page body keywords")
 
     link_concepts_parser = subparsers.add_parser("link-concepts-in-page")
     link_concepts_parser.add_argument("page_id")
@@ -4862,6 +4963,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_parser.add_argument("--force-refine", action="store_true", help="Even if compile returns skipped_unchanged/skipped_duplicate_body, continue into LLM refine (default: stop)")
     pipeline_parser.add_argument("--skip-refine", action="store_true", help="Skip llm-refine-page stage; go straight from compile to validate")
     pipeline_parser.add_argument("--skip-validate", action="store_true", help="Skip llm-validate + Gemini arbiter (only compile + optional refine)")
+    pipeline_parser.add_argument("--reader", choices=sorted(VALID_READERS), help="Reader profile (agent / quant / general); if omitted, auto-inferred from wiki page body keywords")
 
     return parser
 
