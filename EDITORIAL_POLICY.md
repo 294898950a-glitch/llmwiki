@@ -14,7 +14,7 @@
 |---|---|---|
 | `Name` | title | 主题名，已收束（去章节号、去来源标识） |
 | `Canonical ID` | unique_id 或 rich_text | 该对象的唯一稳定 id |
-| `Verification` | status | 当前可信度（如 `Fresh` / `Needs Review` / `Expired`） |
+| `Verification` | status | 当前可信度。按实际 Notion Wiki 库的 options 约定（默认 `Not started` / `In progress` / `Done`）：Done = 已精修到 green 的永久笔记；In progress = 占位页 / 半成品；Not started = 待处理的 legacy 页 |
 | `Compounded Level` | number | 累计合并的 raw 次数 |
 | `Last Compounded At` | date | 最近一次合并时间 |
 

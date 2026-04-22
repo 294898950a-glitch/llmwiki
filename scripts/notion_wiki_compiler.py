@@ -2721,7 +2721,7 @@ def command_seed_related_pages(
                     for opt in vmeta.get("status", {}).get("options", []) or []
                     if opt.get("name")
                 ]
-                for candidate in ("Needs Review", "需要复核", "Unverified", "Pending", "To Review", "Draft"):
+                for candidate in ("Needs Review", "需要复核", "Unverified", "Pending", "To Review", "Draft", "In progress", "In Progress"):
                     if candidate in existing_options:
                         chosen_status = candidate
                         break

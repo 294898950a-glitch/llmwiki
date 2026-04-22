@@ -16,7 +16,7 @@
   "raw_compiled_status": "Done",
   "append_heading": "增量更新",
   "expired_status_values": [
-    "Expired",
-    "Needs Review"
+    "Not started",
+    "In progress"
   ]
 }
