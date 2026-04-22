@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-23.r13
+> **Version**: 2026-04-23.r14
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -44,7 +44,7 @@ llmwiki/
 ├── schema/
 │   └── notion_wiki_mapping.example.json
 ├── scripts/
-│   └── notion_wiki_compiler.py      # Notion API 执行层 + 多 provider LLM 封装（DeepSeek / Kimi），含 20 个子命令
+│   └── notion_wiki_compiler.py      # Notion API 执行层 + 多 provider LLM 封装（DeepSeek / Kimi / Gemini），含 21 个子命令
 └── wiki/
     └── index.md                     # 历史调试遗留目录，当前不是主产物
 ```
@@ -199,7 +199,7 @@ llmwiki/
 
 ## 当前可用脚本
 
-`scripts/notion_wiki_compiler.py` 提供 20 个子命令：
+`scripts/notion_wiki_compiler.py` 提供 21 个子命令：
 
 - `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
 - `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
@@ -221,18 +221,20 @@ llmwiki/
 - `lint`：按 `Verification` 列出 Expired / Needs Review 的 Wiki 页
 - `list-review-queue [--source all|editorial|audit|verification|failures] [--editorial-limit N] [--days N] [--emit-decisions] [--dry-run]`：聚合四路风险信号（`check-editorial` yellow/red + audit-log `review_required` + `Verification = Needs Review` + compile failures）→ 输出 preview 或用 `--emit-decisions` 把新信号作为 decision record 落到 `raw/notion_dumps/decisions.jsonl`（带 sha1 截断 id / 幂等去重 / 不再次 raise 已 resolved|dropped 的 id）
 - `resolve-decision <id> --status in_review|resolved|dropped --rationale "..." [--resolver ...]`：对 decision id 追加一条 resolution record；latest-wins reader 能识别终态
+- `pipeline <raw_page_id> [--refine-provider ...] [--validate-provider ...] [--force-refine] [--skip-refine] [--skip-validate]`：一条 raw 的**全自动化**链路 = `compile-from-raw --auto-refine` → `llm-refine-page`（默认 Kimi）→ `llm-validate --annotate`（默认 DeepSeek）→ **Gemini 2.5 Flash 仲裁**（仅当 DeepSeek FAIL 时介入）→ 若 Gemini 维持 FAIL，则 Kimi 定向重写被 uphold 的段 → 再校验一次。**最多两轮 Kimi 写**，不再循环。默认 compile 返回 `skipped_unchanged` / `skipped_duplicate_body` 时停（A=Z gate），`--force-refine` 显式绕过
 
 所有子命令均写 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`（含 error 记录）。
 
 **Review queue / decision object（2026-04-23 新增，v18 P0 闭环）**：`decisions.jsonl` 是单一 rolling 文件（非 daily），append-only，每条 decision 的状态通过追加新记录推进（`raised → open → in_review → resolved|dropped`）。该文件已在 `.gitignore` 中忽略；dedup id 由 `sha1(source::subject_page_id::trigger_key)[:16]` 得到。
 
-**LLM API 立场（2026-04-23 更新）**：进入模式 B 的双 provider 校验闭环。
-- **Primary generator**（默认 `kimi` / `kimi-k2.6`）：通过 `llm-refine` / `llm-refine-page` 写入内容，不阻塞
-- **Post-hoc validator**（默认 `deepseek` / `deepseek-reasoner`）：事后用 `llm-validate --annotate` 评估并以 callout 形式批注
-- 两者独立运行，由用户决定何时跑 validate
-- 多候选选择、tier 4 停顿、冲突 diff 证据等仍归会话层
+**LLM API 立场（2026-04-23 `r14` 更新）**：进入模式 B 的**三 provider 自动化链路**，由 `pipeline` 子命令编排。
+- **Primary generator**（默认 `kimi` / `kimi-k2.6`）：通过 `llm-refine` / `llm-refine-page` 写入"有解读"内容
+- **Post-hoc validator**（默认 `deepseek` / `deepseek-reasoner`）：`llm-validate --annotate` 按 5 项标准评估，callout 形式批注
+- **Arbiter**（`gemini` / `gemini-2.5-flash`）：pipeline 中仅当 DeepSeek FAIL 时介入；判 DeepSeek 是否判对；若推翻则终结、若维持则触发 Kimi 定向重写被 uphold 的段
+- **两轮上限**：pipeline 最多 Kimi 写 2 次；第二轮 DeepSeek 再校验后不管结果停止，所有 callout 保留
+- `llm-refine` / `llm-refine-page` / `llm-validate` 仍可独立调用（不强制走 pipeline）；多候选选择、tier 4 停顿、冲突 diff 证据仍归会话层
 
-LLM provider 通过 `LLM_PROVIDERS` dict 注册；`fixed_temperature` 字段支持 kimi-k2.6 这种强制 temperature=1 的模型；key 从 `DEEPSEEK_API_KEY` / `KIMI_API_KEY` inline 值或 `*_API_KEY_FILE` 路径读取。
+LLM provider 通过 `LLM_PROVIDERS` dict 注册（`endpoint` / `default_model` / `env_key` / `env_key_file` / `fixed_temperature`）。`fixed_temperature` 字段覆盖用户传值，用于 kimi-k2.6 这种强制 `temperature=1` 的模型。key 从 `DEEPSEEK_API_KEY` / `KIMI_API_KEY` / `GEMINI_API_KEY` inline 值或对应 `*_API_KEY_FILE` 路径读取。Gemini 走 OpenAI-compat endpoint（`.../v1beta/openai/chat/completions`）共用现有 `LLMClient`。
 
 ## 设计评审
 
