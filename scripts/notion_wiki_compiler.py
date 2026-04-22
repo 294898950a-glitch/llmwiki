@@ -986,17 +986,34 @@ def build_append_blocks(note: str, heading: str, source_url: Optional[str]) -> L
 
 
 def infer_semantic_title(raw_title: str) -> str:
+    """Strip raw-bookkeeping prefixes/suffixes to get a clean wiki topic title.
+
+    Handles these patterns (applied in order, each optional):
+    - "第N章 X" → "X" (chapter prefix)
+    - "真人测试 · X" / "真人测试-X" → "X" (annotation prefix)
+    - "X Raw YYYY-MM-DD" → "X" (raw-inbox suffix pattern like "Smoke Test Raw 2026-04-21")
+    - trailing " YYYY-MM-DD" → stripped
+    - "X：Y" or "X:Y" → "X" (colon split, keep left)
+    """
     title = raw_title.strip()
+    original = title
     chapter_match = re.match(r"^第\s*\d+\s*章\s*(.+)$", title)
     if chapter_match:
         title = chapter_match.group(1).strip()
+    annotation_match = re.match(r"^真人测试\s*[·・\-—:： ]+\s*(.+)$", title)
+    if annotation_match:
+        title = annotation_match.group(1).strip()
+    raw_suffix_match = re.match(r"^(.+?)\s+Raw\s+\d{4}-\d{2}-\d{2}$", title, flags=re.IGNORECASE)
+    if raw_suffix_match:
+        title = raw_suffix_match.group(1).strip()
+    title = re.sub(r"\s+\d{4}-\d{2}-\d{2}$", "", title)
     for delimiter in ("：", ":"):
         if delimiter in title:
             left, _right = title.split(delimiter, 1)
             left = left.strip()
             if 1 < len(left) <= 80:
                 return left
-    return title
+    return title.strip() or original
 
 
 def merge_alias_values(*groups: str) -> str:

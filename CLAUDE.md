@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-23.r14
+> **Version**: 2026-04-23.r15
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -227,12 +227,20 @@ llmwiki/
 
 **Review queue / decision object（2026-04-23 新增，v18 P0 闭环）**：`decisions.jsonl` 是单一 rolling 文件（非 daily），append-only，每条 decision 的状态通过追加新记录推进（`raised → open → in_review → resolved|dropped`）。该文件已在 `.gitignore` 中忽略；dedup id 由 `sha1(source::subject_page_id::trigger_key)[:16]` 得到。
 
-**LLM API 立场（2026-04-23 `r14` 更新）**：进入模式 B 的**三 provider 自动化链路**，由 `pipeline` 子命令编排。
+**LLM API 立场（2026-04-23 `r15` 更新）**：进入模式 B 的**三 provider 自动化链路**，由 `pipeline` 子命令编排。
 - **Primary generator**（默认 `kimi` / `kimi-k2.6`）：通过 `llm-refine` / `llm-refine-page` 写入"有解读"内容
-- **Post-hoc validator**（默认 `deepseek` / `deepseek-reasoner`）：`llm-validate --annotate` 按 5 项标准评估，callout 形式批注
+- **Post-hoc validator**（默认 `deepseek` / `deepseek-reasoner`）：`llm-validate --annotate` 按 **6 项标准**评估（第 6 项：跨领域污染硬条件判 FAIL），callout 形式批注
 - **Arbiter**（`gemini` / `gemini-2.5-flash`）：pipeline 中仅当 DeepSeek FAIL 时介入；判 DeepSeek 是否判对；若推翻则终结、若维持则触发 Kimi 定向重写被 uphold 的段
 - **两轮上限**：pipeline 最多 Kimi 写 2 次；第二轮 DeepSeek 再校验后不管结果停止，所有 callout 保留
 - `llm-refine` / `llm-refine-page` / `llm-validate` 仍可独立调用（不强制走 pipeline）；多候选选择、tier 4 停顿、冲突 diff 证据仍归会话层
+
+**Prompt 架构（r15 重构）**：由碎片拼接而非单一模板。原 `LLM_REFINE_SYSTEM_PROMPT_BASE` + `LLM_REFINE_DEFAULT_STYLE_NOTE` 写死"agent engineer 读者 + LangChain 锚点 + SaaS 类比池"，导致非 agent 主题（如量化入门）被 LangChain/ReAct/AutoGPT 类比污染。现在拼成：
+- `PROMPT_FRAGMENT_PREAMBLE` / `BASE_QUALITY` / `ANCHOR_HINT` / `ANALOGY_HINT` / `TABOO_HINT` / `OUTPUT_SHAPE` — 话题无关，启发式提示（"问问自己 / 试试 / 举例"而非"必须 / 严禁"）
+- `READER_PROFILES[agent|quant|general]` — 可替换的读者假设
+- `PROFILE_HARD_TABOOS[quant|general]` — 非 agent profile 硬禁 AI 框架术语（LangChain / ReAct / AgentExecutor / AutoGPT / 工具调用循环）；启发式挡不住时这条硬兜底
+- `--reader` flag 显式选 profile；未传则 `infer_reader_profile(body)` 按关键词密度自动推断
+
+**Raw / Wiki 分工**：脚本层从不写 block 到 raw 页；只回写 raw 属性（Status / Processed At / Target Wiki Page）。`infer_semantic_title` 去除 raw 风格前缀（`第N章` / `真人测试·` / `X Raw YYYY-MM-DD`）避免 wiki 标题继承 raw 的 bookkeeping 前缀。
 
 LLM provider 通过 `LLM_PROVIDERS` dict 注册（`endpoint` / `default_model` / `env_key` / `env_key_file` / `fixed_temperature`）。`fixed_temperature` 字段覆盖用户传值，用于 kimi-k2.6 这种强制 `temperature=1` 的模型。key 从 `DEEPSEEK_API_KEY` / `KIMI_API_KEY` / `GEMINI_API_KEY` inline 值或对应 `*_API_KEY_FILE` 路径读取。Gemini 走 OpenAI-compat endpoint（`.../v1beta/openai/chat/completions`）共用现有 `LLMClient`。
 
