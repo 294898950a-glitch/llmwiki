@@ -108,6 +108,9 @@ class NotionClient:
     def delete_block(self, block_id: str) -> Dict[str, Any]:
         return self.request("DELETE", f"blocks/{block_id}")
 
+    def update_block(self, block_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.request("PATCH", f"blocks/{block_id}", payload)
+
 
 def require_env(env: Dict[str, str], key: str) -> str:
     value = env.get(key, "").strip()
@@ -554,6 +557,7 @@ def detect_command_name(argv: List[str]) -> str:
         "seed-related-pages",
         "rewrite-section",
         "link-pages",
+        "link-concepts-in-page",
     }
     for token in argv:
         if token in known_commands:
@@ -2356,6 +2360,59 @@ def build_rich_text_with_mentions(
     return segments or rich_text_value(text)
 
 
+def command_link_concepts_in_page(client: NotionClient, args: argparse.Namespace) -> int:
+    mention_map = parse_mention_map(args.mention_map)
+    if not mention_map:
+        raise NotionError("--mention-map is required (LABEL=page_id,...)")
+    link_style = getattr(args, "link_style", "link")
+    linkable_block_types = {"paragraph", "heading_2", "heading_3", "quote", "bulleted_list_item", "numbered_list_item"}
+    top_blocks = iterate_block_children(client, args.page_id)
+    touched: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+    for block in top_blocks:
+        btype = block.get("type")
+        if btype not in linkable_block_types:
+            continue
+        rt = block.get(btype, {}).get("rich_text", []) or []
+        plain = rich_text_plain_text(rt)
+        if not plain:
+            continue
+        if not any(label in plain for label in mention_map):
+            continue
+        has_existing_link = any(
+            seg.get("type") == "mention"
+            or (seg.get("type") == "text" and seg.get("text", {}).get("link"))
+            for seg in rt
+        )
+        if has_existing_link and not getattr(args, "force", False):
+            skipped.append({"block_id": block.get("id"), "reason": "already_has_link", "preview": plain[:60]})
+            continue
+        new_rt = build_rich_text_with_mentions(plain, mention_map, link_style)
+        bid = block.get("id")
+        if not bid:
+            continue
+        if getattr(args, "dry_run", False):
+            touched.append({"block_id": bid, "type": btype, "preview": plain[:60], "dry_run": True})
+            continue
+        try:
+            client.update_block(bid, {btype: {"rich_text": new_rt}})
+            touched.append({"block_id": bid, "type": btype, "preview": plain[:60]})
+        except NotionError as exc:
+            skipped.append({"block_id": bid, "reason": str(exc)})
+    payload = {
+        "wiki_page_id": args.page_id,
+        "link_style": link_style,
+        "labels": sorted(mention_map.keys()),
+        "touched_count": len(touched),
+        "skipped_count": len(skipped),
+        "touched": touched,
+        "skipped": skipped,
+        "dry_run": getattr(args, "dry_run", False),
+    }
+    print(json.dumps(audit_success("link-concepts-in-page", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_link_pages(
     client: NotionClient,
     wiki_database_id: str,
@@ -2977,6 +3034,13 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="mention: Notion page mention (semantic but UI under-renders API-created ones); link: text with notion.so href (robust blue clickable text); both: mention + link")
     rewrite_parser.add_argument("--dry-run", action="store_true")
 
+    link_concepts_parser = subparsers.add_parser("link-concepts-in-page")
+    link_concepts_parser.add_argument("page_id")
+    link_concepts_parser.add_argument("--mention-map", required=True, help="Comma-separated label=page_id pairs to auto-link throughout the page")
+    link_concepts_parser.add_argument("--link-style", choices=["mention", "link", "both"], default="link")
+    link_concepts_parser.add_argument("--force", action="store_true", help="Rewrite blocks even if they already contain a link/mention (default: skip)")
+    link_concepts_parser.add_argument("--dry-run", action="store_true")
+
     link_parser = subparsers.add_parser("link-pages")
     link_parser.add_argument("page_id")
     link_parser.add_argument("--add", action="append", default=[], help="Wiki page id to add to Related Pages relation (repeatable)")
@@ -3048,6 +3112,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_rewrite_section(client, args)
     if args.command == "link-pages":
         return command_link_pages(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "link-concepts-in-page":
+        return command_link_concepts_in_page(client, args)
     if args.command == "reference-check":
         return command_reference_check(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "seed-related-pages":
