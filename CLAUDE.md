@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-22.r11
+> **Version**: 2026-04-23.r12
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -44,7 +44,7 @@ llmwiki/
 ├── schema/
 │   └── notion_wiki_mapping.example.json
 ├── scripts/
-│   └── notion_wiki_compiler.py      # Notion API 执行层 + LLM API 封装，含 16 个子命令
+│   └── notion_wiki_compiler.py      # Notion API 执行层 + 多 provider LLM 封装（DeepSeek / Kimi），含 18 个子命令
 └── wiki/
     └── index.md                     # 历史调试遗留目录，当前不是主产物
 ```
@@ -199,7 +199,7 @@ llmwiki/
 
 ## 当前可用脚本
 
-`scripts/notion_wiki_compiler.py` 提供 16 个子命令：
+`scripts/notion_wiki_compiler.py` 提供 18 个子命令：
 
 - `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
 - `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
@@ -215,12 +215,20 @@ llmwiki/
 - `rewrite-section <page_id> --heading <text> --body <text> [--mention-map LABEL=ID,...] [--link-style mention|link|both] [--promote] [--dry-run]`：替换指定 heading 下的 body block；`--mention-map` 会把正文里的 literal label 转成 Notion page mention 或 text-link（可点击跳转）；`--promote` 去掉 `<placeholder>` marker
 - `link-pages <page_id> --add ID --remove ID [--ensure-property] [--dry-run]`：维护 Wiki 页的 `Related Pages` self-referencing relation；`--ensure-property` 若 Wiki DB 尚无该属性则程序化创建
 - `link-concepts-in-page <page_id> --mention-map LABEL=ID,...`：扫全页 top-level block，对任一 block 正文含 label 且尚无 link 的，重写 rich_text 插入 mention 或 text-link；批量补齐概念链接
-- `llm-refine <page_id> --heading <text> [--style-from-page-id <id>] [--style-note ...] [--source-page-id <id>] [--mention-map ...] [--link-style ...] [--preview]`：调 DeepSeek-reasoner API 做"有解读"的段落重写；Style J（锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说）为默认 style_note；按 heading 注入 section role guidance 避免各段重叠；reasoning + 生成内容完整落盘到 `llm-refine-log.jsonl`
+- `llm-refine <page_id> --heading <text> [--provider kimi|deepseek] [--style-from-page-id <id>] [--style-note ...] [--source-page-id <id>] [--mention-map ...] [--link-style ...] [--preview]`：调 LLM API 做单段"有解读"重写；Style J（锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说）为默认 style_note；按 heading 注入 section role guidance 避免各段重叠；条目型 section（关键机制/实现信号）走 JSON list mode 强制 bullet；reasoning + 生成内容完整落盘到 `llm-refine-log.jsonl`
+- `llm-refine-page <page_id> [--sections ...] [--provider ...]`：单次 API 调用整页重写，cross-section directive 强制各段用不同锚点 / 不同类比，根治段间同质化；default provider 为 kimi
+- `llm-validate <page_id> [--heading ...] [--provider deepseek|kimi] [--annotate] [--dry-run]`：**事后校验**，用另一 provider 对已写入的 wiki 页评估（按 5 项标准：有解读 vs 提要 / 段职责遵守 / 类比质量 / 风格合规 / 内在一致性），输出 JSON 含 pass/score 0-10/issues/strengths/suggestion；`--annotate` 时把评估作为 callout block append 到页面底部作为批注
 - `lint`：按 `Verification` 列出 Expired / Needs Review 的 Wiki 页
 
 所有子命令均写 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`（含 error 记录）。
 
-**LLM API 立场（2026-04-22 更新）**：此前 `LLM_EXTRACTION_DESIGN.md` 的立场是"脚本不调模型 API"；经实测后进入模式 B——`llm-refine` 已接入 DeepSeek-reasoner（OpenAI-compatible，`/v1/chat/completions`），脚本层可做有限度的语义判断级重写；其他语义工作（候选选择、冲突解释）仍归 Claude Code 会话层。
+**LLM API 立场（2026-04-23 更新）**：进入模式 B 的双 provider 校验闭环。
+- **Primary generator**（默认 `kimi` / `kimi-k2.6`）：通过 `llm-refine` / `llm-refine-page` 写入内容，不阻塞
+- **Post-hoc validator**（默认 `deepseek` / `deepseek-reasoner`）：事后用 `llm-validate --annotate` 评估并以 callout 形式批注
+- 两者独立运行，由用户决定何时跑 validate
+- 多候选选择、tier 4 停顿、冲突 diff 证据等仍归会话层
+
+LLM provider 通过 `LLM_PROVIDERS` dict 注册；`fixed_temperature` 字段支持 kimi-k2.6 这种强制 temperature=1 的模型；key 从 `DEEPSEEK_API_KEY` / `KIMI_API_KEY` inline 值或 `*_API_KEY_FILE` 路径读取。
 
 ## 设计评审
 

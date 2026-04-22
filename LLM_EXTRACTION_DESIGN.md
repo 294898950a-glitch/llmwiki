@@ -159,11 +159,15 @@ LLM 层负责高不确定性、需要语义判断的动作：
 
 ## 当前决定
 
-**2026-04-22 更新**：原立场（见下方旧版决定）已部分调整。用户观察到 wiki 页面输出"没有解读、没有精髓"——这是会话层精修成本高、产出慢的结构性问题。经多轮 style prompt 实验后，进入**模式 B 的有限形式**：
+**2026-04-23 更新**：在 2026-04-22 的"模式 B 有限形式"基础上扩展为**双 provider 校验闭环**：
 
-- **引入脚本内 LLM API 调用**：`scripts/notion_wiki_compiler.py` 的 `llm-refine` 子命令接入 DeepSeek-reasoner（OpenAI-compatible endpoint）做段落级"有解读"重写
-- **默认 prompt 固化为 Style J**：锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说；按 heading 注入 section role guidance 防止段间重叠
-- **reasoning + 生成内容完整落盘**：每次调用的 prompt / reasoning_content / content / usage 都写入 `raw/notion_dumps/YYYY-MM-DD-llm-refine-log.jsonl`，可回归比对
+- **Primary generator（默认 Kimi / `kimi-k2.6`）**：`llm-refine` / `llm-refine-page` 负责写入"有解读"内容。不等校验、直接落盘。
+- **Post-hoc validator（默认 DeepSeek / `deepseek-reasoner`）**：`llm-validate [--annotate]` 子命令对已写入的 wiki 页事后评估，按 5 项标准（有解读 vs 提要 / 段职责遵守 / 类比质量 / 风格合规 / 内在一致性）输出 JSON `{pass, score 0-10, issues, strengths, suggestion}`。`--annotate` 时把结果作为 callout block append 到页面底部做批注，不动正文。
+- **双 provider 独立运行**：不阻塞、不级联失败。validator 通过 provider 交叉（另一家模型看另一家的输出）降低单一模型偏好带来的盲点。
+- **脚本 provider 抽象**：`LLM_PROVIDERS` dict 注册 provider（`endpoint` / `default_model` / `env_key` / `env_key_file` / `fixed_temperature`）；key 从 `KIMI_API_KEY` / `DEEPSEEK_API_KEY` inline 值或 `*_API_KEY_FILE` 路径读取；`fixed_temperature` 用于 kimi-k2.6 这种强制 temperature=1 的模型覆盖用户传值。
+- **llm-refine-page 的整页模式**：单次 API 调用对多段做重写，注入 cross-section directive 强制各段用不同锚点 / 不同类比，从根上治理"段间同质化"（实测比多次单段调用更能避免所有段以同一引子开场）。
+- **默认 prompt 固化为 Style J**：锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说；按 heading 注入 section role guidance；条目型 section（关键机制 / 实现信号）自动走 JSON list mode。
+- **reasoning + 生成内容完整落盘**：prompt / reasoning_content / content / usage / provider / model 写入 `raw/notion_dumps/YYYY-MM-DD-llm-refine-log.jsonl`；validator 结果单独追加到同一 log 或 callout。
 
 ### 仍归会话层的工作
 
@@ -174,6 +178,7 @@ LLM 层负责高不确定性、需要语义判断的动作：
 - 高风险 tier 4 的 merge/split 决策
 - 样板页（如 QueryLoop）的 editorial 质量把关
 - 跨页面的结构一致性审查（通过 `reference-check` 后的人工判断）
+- validator 批注的最终采信或驳回（`llm-validate --annotate` 只留评审，不自动改正文）
 
 ### 原立场（2026-04-22 前）
 
@@ -183,7 +188,7 @@ LLM 层负责高不确定性、需要语义判断的动作：
 - **中期**：待候选排序与冲突策略稳定后，再考虑脚本内模型调用
 - **当前不做**：不在 `scripts/notion_wiki_compiler.py` 中直接接入模型 API
 
-这份立场是后续"候选排序 / 冲突处理 / 幂等策略"的前置条件。现已被 `llm-refine` 局部突破，但其他语义工作仍按原立场留在会话层。
+这份立场已被 `llm-refine` / `llm-refine-page` / `llm-validate` 三路 LLM 入口突破；其他语义工作（候选选择、冲突解释、tier 4 merge/split）仍按原立场留在会话层。
 
 ## 会话层留痕约定
 

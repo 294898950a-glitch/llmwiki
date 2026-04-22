@@ -7,9 +7,9 @@
 
 本项目当前目标不是生成本地 Markdown Wiki，而是实现 `raw -> compile -> wiki -> raw 回写` 的最小闭环。
 
-> **当前定位**：本项目处于 **alpha** 阶段。`raw → wiki` 写入链路已打通，概念网络已开始生长（QueryLoop / QueryEngine 精修中，5 个相邻概念作占位页），并已进入 LLM_EXTRACTION_DESIGN 的模式 B——`llm-refine` 子命令接入 DeepSeek-reasoner 做段落级"解读"重写。路线图与具体执行清单见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。
+> **当前定位**：本项目处于 **alpha** 阶段。`raw → wiki` 写入链路已打通，概念网络已开始生长（QueryLoop / QueryEngine 精修中，5 个相邻概念作占位页），并已进入 LLM_EXTRACTION_DESIGN 的**模式 B 双 provider 校验闭环**——Primary generator（默认 Kimi / `kimi-k2.6`）通过 `llm-refine` / `llm-refine-page` 写入；Post-hoc validator（默认 DeepSeek / `deepseek-reasoner`）通过 `llm-validate --annotate` 以 callout 形式批注。两者独立运行，validator 不阻塞写入。路线图与具体执行清单见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。
 >
-> **LLM API 配置**：`llm-refine` 需要 DeepSeek key。在 `.env` 里设 `DEEPSEEK_API_KEY=sk-...` 或 `DEEPSEEK_API_KEY_FILE=<路径>`。其他命令不依赖 LLM，只用 Notion API。
+> **LLM API 配置**：`llm-refine` / `llm-refine-page` / `llm-validate` 需要 provider key。默认 `kimi` 用 `KIMI_API_KEY` / `KIMI_API_KEY_FILE`；默认 validator `deepseek` 用 `DEEPSEEK_API_KEY` / `DEEPSEEK_API_KEY_FILE`。其他命令不依赖 LLM，只用 Notion API。
 
 ## 当前状态
 
@@ -56,7 +56,9 @@
 - `rewrite-section <page_id> --heading <text> --body <text> [--mention-map LABEL=ID,...] [--link-style mention|link|both] [--promote]` ——会话层精修入口；替换指定 heading 下的 body；`--mention-map` 把 literal label 转成 Notion page mention 或 text-link
 - `link-pages <page_id> --add ID --remove ID [--ensure-property]` ——维护 wiki-to-wiki 的 `Related Pages` relation；`--ensure-property` 可程序化创建该属性
 - `link-concepts-in-page <page_id> --mention-map LABEL=ID,...` ——扫全页 block 给含 label 且尚无 link 的段落批量补链接
-- `llm-refine <page_id> --heading <text> [--style-from-page-id <id>] [--style-note ...] [--source-page-id <id>] [--preview]` ——调 DeepSeek-reasoner 对段落做"有解读"的重写（不是提要）；默认 **Style J**（锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说），按 heading 注入 section role guidance 防止段间重叠；reasoning + 产出完整落盘
+- `llm-refine <page_id> --heading <text> [--provider kimi|deepseek] [--style-from-page-id <id>] [--style-note ...] [--source-page-id <id>] [--preview]` ——调 LLM API 对单段做"有解读"重写；默认 **Style J**（锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说），按 heading 注入 section role guidance 防段间重叠；条目型 section 自动走 JSON list mode；reasoning + 产出完整落盘
+- `llm-refine-page <page_id> [--sections ...] [--provider ...]` ——单次 API 调用整页重写，cross-section directive 强制各段用不同锚点 / 不同类比，根治段间同质化；default provider 为 kimi
+- `llm-validate <page_id> [--heading ...] [--provider deepseek|kimi] [--annotate]` ——**事后校验**子命令，用另一 provider 对已写入的 wiki 页做交叉评估（5 项标准：有解读 vs 提要 / 段职责 / 类比质量 / 风格合规 / 内在一致性）；输出 JSON pass/score/issues/strengths/suggestion；`--annotate` 时把结果作 callout block 批注到页面底部，不动正文
 - `lint`
 
 当前已确认的数据库结构：

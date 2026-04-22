@@ -1196,3 +1196,209 @@ v12 未做此清单。补：
 3. 然后再决定是：
    - 让代码继续保留这套启发式正文生成
    - 还是进一步收缩回真正的“骨架 + 摘录”模式
+
+---
+
+## v15 · 2026-04-22
+
+- **评审对象**：
+  - 当前 `/home/jay/projects/llmwiki` 整体项目状态
+  - `README.MD`
+  - `scripts/notion_wiki_compiler.py`
+- **对照对象**：
+  - Karpathy LLM Wiki 范式的公开衍生实现与说明
+  - 当前真实 Notion 使用状态（含 `QueryLoop` 页面）
+- **锚定 git 状态**：`c31aab7`（HEAD）之后的工作树
+- **评审者**：GPT-5 Codex
+- **本版定位**：不再只审 README 句子是否对齐，而是直接评估“这个项目离 Karpathy 风格的 LLM Wiki 还差多远”。
+
+### 1. 总体判断
+
+当前项目已经不是纯脚手架，但也还远没到成熟的 LLM Wiki。
+
+更准确的说法是：
+
+- 它已经是一个 **能运行的 Notion 双库编译器 alpha**
+- 还不是一个 **持续复利的知识对象系统**
+
+当前真正成立的是：
+- `raw -> compile -> wiki -> raw 回写` 闭环已打通
+- 实际 smoke test 已跑通
+- `QueryLoop` 这种真实页面已经能被整理到“主题页雏形”
+
+但还没有真正成立的是：
+- 稳定的知识复利
+- 高质量对象更新
+- 风险分级驱动的 merge / split / review
+- 成熟的概念网络生长
+
+### 2. 和 Karpathy 范式的核心差距
+
+#### 2.1 管道强于知识
+
+当前项目最强的是：
+- ingest
+- 写回
+- schema
+- 审计
+- 最小幂等
+
+最弱的是：
+- 单页知识密度
+- 老页面修订质量
+- 跨页面概念网络
+
+这意味着它现在更像“能把内容写进去”，还不像“能把知识真正编译出来”。
+
+#### 2.2 writeback 已有，compounding 还弱
+
+当前已实现：
+- 新 raw 能命中或新建 wiki
+- wiki 能被重复更新
+- raw 状态会回写
+
+但离真正 compounding 还差：
+- section-level 更新规则
+- 旧结论修订
+- 冲突证据保留
+- 对象级幂等
+- 摘要重写优先于无脑 append
+
+所以它现在更像“append-first”，不是“compound-first”。
+
+#### 2.3 内容整理仍偏模板化
+
+`QueryLoop` 页已经证明：
+- 系统能把原始章节推进成主题页
+- 会话层也能进一步整理
+
+但这仍然不是“系统稳定具备高密度整理能力”的证据。当前主要问题是：
+- 脚本模板仍偏启发式
+- 真正好的段落依赖会话层人工/半人工 editorial
+- 模板结构已经比内容质量更成熟
+
+#### 2.4 图谱还没长起来
+
+真正的 Karpathy 式 wiki，不是单页好看，而是对象之间开始持续形成关系网络。
+
+当前项目已经有：
+- `QueryLoop`
+
+但还没有系统长出：
+- `QueryEngine`
+- `Agent Runtime`
+- `Context Governance`
+- `Recovery Logic`
+- `Interrupt Handling`
+
+所以现在还处在“点状整理”，不是“图谱整理”。
+
+### 3. 当前成熟度评估
+
+如果按维度打分：
+
+- 基础设施：`75/100`
+- 编译闭环：`70/100`
+- 知识质量：`40/100`
+- 复利能力：`35/100`
+- 整体成熟度：`55/100`
+
+这不是否定项目进展，而是说明：
+- 现在已经越过“只是 demo”的阶段
+- 但还没进入“可以稳定积累长期知识资产”的阶段
+
+### 4. 最关键的短板
+
+按影响排序：
+
+1. **对象级 compounding 还没做实**
+   - 当前更像“把新材料写进页里”
+   - 还不像“对已有知识对象做修订、压缩、整合”
+
+2. **决策层还不够强**
+   - `same object / new facet / distinct object / ambiguous` 的分流还不够稳
+   - 高风险 merge / split / review 仍未真正下沉
+
+3. **深度整理仍主要依赖会话层**
+   - 脚本能起骨架、给启发式段落
+   - 但高质量永久笔记仍靠人工 + 会话层介入
+
+4. **概念网络没有进入自增长**
+   - 页与页之间还没开始稳定派生和沉淀
+
+### 5. 建议路线：从 Alpha 到 Karpathy-style
+
+#### 阶段 1：Alpha -> Usable
+
+目标：
+- 让你愿意每天把材料丢进去
+- 让系统默认不乱写
+
+重点：
+- 把 raw 输入摩擦压低
+- 把 auto-refine 收缩成保守模式
+- 先把单页产物做到“可读”
+
+#### 阶段 2：Usable -> Compounding
+
+目标：
+- 让知识对象真正“变厚”
+
+重点：
+- 引入对象级幂等
+- 增加 section-level 更新规则
+- 区分 update / new facet / new page / needs review
+
+#### 阶段 3：Compounding -> Reviewable
+
+目标：
+- 让系统能被审计、能解释
+
+重点：
+- decision log
+- evidence-preserving update
+- review queue
+
+#### 阶段 4：Reviewable -> Productized
+
+目标：
+- 再做前端和 webhook，把它变成低摩擦工作台
+
+重点：
+- capture UI
+- review UI
+- task / job 状态流
+
+### 6. 当前最值得做的不是前端，而是三件事
+
+1. 把单页整理质量做实
+   - 先把 `QueryLoop` 打成真正样板页
+
+2. 把相邻页面长出来
+   - `QueryEngine`
+   - `Context Governance`
+   - `Recovery Logic`
+
+3. 把“更新已有知识对象”做稳
+   - 重写摘要
+   - 合并证据
+   - 处理冲突
+   - 保持页面清晰
+
+### 7. 本版结论
+
+当前项目的真实定位应当是：
+
+- **不是 Karpathy 式成熟 LLM Wiki**
+- **而是一个已经打通写入链路、开始具备知识编译能力的 alpha 系统**
+
+这不是一句贬义判断，而是路线判断：
+- 现在主要矛盾不再是“能不能写进去”
+- 而是“写进去之后，能不能形成持续复利的知识对象库”
+
+### 8. 建议下一步
+
+1. 收缩对当前状态的宣传，避免把 alpha 说成成熟 wiki
+2. 把 `QueryLoop` 作为样板页，提炼出真正可复用的单页整理标准
+3. 优先做对象级 compounding，而不是继续堆入口或 UI
+4. 等 compounding / reviewable 两层稳定后，再认真做前端 + webhook
