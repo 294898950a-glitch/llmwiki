@@ -7,6 +7,7 @@
   "last_compounded_at_property": "Last Compounded At",
   "aliases_property": "Aliases",
   "topic_property": "Topic",
+  "related_pages_property": "Related Pages",
   "raw_title_property": "Name",
   "raw_source_url_property": "Source URL",
   "raw_status_property": "Status",

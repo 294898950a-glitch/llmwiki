@@ -65,6 +65,9 @@ class NotionClient:
     def retrieve_database(self, database_id: str) -> Dict[str, Any]:
         return self.request("GET", f"databases/{database_id}")
 
+    def update_database(self, database_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return self.request("PATCH", f"databases/{database_id}", payload)
+
     def search(self, query: str, page_size: int = 10) -> Dict[str, Any]:
         return self.request(
             "POST",
@@ -550,6 +553,7 @@ def detect_command_name(argv: List[str]) -> str:
         "reference-check",
         "seed-related-pages",
         "rewrite-section",
+        "link-pages",
     }
     for token in argv:
         if token in known_commands:
@@ -2263,6 +2267,118 @@ def command_check_editorial(
     return 0 if result["compliance"] == "green" else 1
 
 
+def ensure_related_pages_property(
+    client: NotionClient,
+    wiki_database_id: str,
+    prop_name: str = "Related Pages",
+) -> Dict[str, Any]:
+    db = client.retrieve_database(wiki_database_id)
+    props = db.get("properties", {})
+    existing = props.get(prop_name)
+    if existing and existing.get("type") == "relation":
+        rel = existing.get("relation", {})
+        if normalize_notion_id(rel.get("database_id")) == normalize_notion_id(wiki_database_id):
+            return {"action": "already_exists", "property": prop_name}
+    payload = {
+        "properties": {
+            prop_name: {
+                "relation": {
+                    "database_id": wiki_database_id,
+                    "type": "single_property",
+                    "single_property": {},
+                }
+            }
+        }
+    }
+    client.update_database(wiki_database_id, payload)
+    return {"action": "created", "property": prop_name}
+
+
+def parse_mention_map(raw: Optional[str]) -> Dict[str, str]:
+    mapping: Dict[str, str] = {}
+    if not raw:
+        return mapping
+    for item in raw.split(","):
+        item = item.strip()
+        if not item or "=" not in item:
+            continue
+        label, pid = item.split("=", 1)
+        label = label.strip()
+        pid = pid.strip()
+        if label and pid:
+            mapping[label] = pid
+    return mapping
+
+
+def build_rich_text_with_mentions(text: str, mention_map: Dict[str, str]) -> List[Dict[str, Any]]:
+    if not mention_map:
+        return rich_text_value(text)
+    labels = sorted(mention_map.keys(), key=len, reverse=True)
+    pattern = "|".join(re.escape(l) for l in labels)
+    segments: List[Dict[str, Any]] = []
+    pos = 0
+    for match in re.finditer(pattern, text):
+        if match.start() > pos:
+            segments.append({"type": "text", "text": {"content": text[pos:match.start()]}})
+        label = match.group(0)
+        segments.append(
+            {
+                "type": "mention",
+                "mention": {"type": "page", "page": {"id": mention_map[label]}},
+            }
+        )
+        pos = match.end()
+    if pos < len(text):
+        segments.append({"type": "text", "text": {"content": text[pos:]}})
+    return segments or rich_text_value(text)
+
+
+def command_link_pages(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    rel_prop = mapping.get("related_pages_property")
+    if not rel_prop:
+        raise NotionError("mapping missing 'related_pages_property'; update schema/notion_wiki_mapping.example.json")
+    if getattr(args, "ensure_property", False):
+        ensure_related_pages_property(client, wiki_database_id, rel_prop)
+    database = client.retrieve_database(wiki_database_id)
+    if rel_prop not in database.get("properties", {}):
+        raise NotionError(
+            f"Wiki database has no {rel_prop!r} property; rerun with --ensure-property or add it in Notion"
+        )
+    page = client.retrieve_page(args.page_id)
+    existing = page.get("properties", {}).get(rel_prop, {}).get("relation", []) or []
+    existing_ids = [v.get("id") for v in existing if v.get("id")]
+    existing_norm = {normalize_notion_id(pid): pid for pid in existing_ids}
+    add_ids_raw = args.add or []
+    remove_ids_raw = args.remove or []
+    remove_norm = {normalize_notion_id(pid) for pid in remove_ids_raw}
+    for pid in add_ids_raw:
+        existing_norm.setdefault(normalize_notion_id(pid), pid)
+    for key in list(existing_norm.keys()):
+        if key in remove_norm:
+            existing_norm.pop(key, None)
+    new_ids = list(existing_norm.values())
+    if not getattr(args, "dry_run", False):
+        client.update_page(
+            args.page_id,
+            {"properties": {rel_prop: {"relation": [{"id": pid} for pid in new_ids]}}},
+        )
+    payload = {
+        "wiki_page_id": args.page_id,
+        "property": rel_prop,
+        "previous_related_count": len(existing_ids),
+        "new_related_count": len(new_ids),
+        "new_related_ids": new_ids,
+        "dry_run": getattr(args, "dry_run", False),
+    }
+    print(json.dumps(audit_success("link-pages", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_rewrite_section(client: NotionClient, args: argparse.Namespace) -> int:
     page_id = args.page_id
     heading = args.heading
@@ -2290,17 +2406,19 @@ def command_rewrite_section(client: NotionClient, args: argparse.Namespace) -> i
         except NotionError as exc:
             print(f"WARN: failed to delete block {bid}: {exc}", file=sys.stderr)
 
+    mention_map = parse_mention_map(getattr(args, "mention_map", None))
     new_blocks: List[Dict[str, Any]] = []
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
     if not paragraphs:
         paragraphs = [body]
     for para in paragraphs:
         for chunk in chunk_text(para):
+            rich = build_rich_text_with_mentions(chunk, mention_map) if mention_map else rich_text_value(chunk)
             new_blocks.append(
                 {
                     "object": "block",
                     "type": "paragraph",
-                    "paragraph": {"rich_text": rich_text_value(chunk)},
+                    "paragraph": {"rich_text": rich},
                 }
             )
     if not dry_run:
@@ -2608,6 +2726,11 @@ def command_seed_related_pages(
                     props[verification_prop] = property_payload_for_value(vmeta, chosen_status)
                 except NotionError:
                     pass
+        related_prop = mapping.get("related_pages_property")
+        if related_prop and related_prop in props_meta:
+            rel_meta = props_meta[related_prop]
+            if rel_meta.get("type") == "relation":
+                props[related_prop] = {"relation": [{"id": source_page_id}]}
         new_page = client.create_page({
             "parent": {"database_id": wiki_database_id},
             "properties": props,
@@ -2815,7 +2938,15 @@ def build_parser() -> argparse.ArgumentParser:
     rewrite_parser.add_argument("--heading", required=True, help="Heading text to rewrite under (heading_2 or heading_3)")
     rewrite_parser.add_argument("--body", required=True, help="New body text to place under the heading (paragraphs chunked on newlines)")
     rewrite_parser.add_argument("--promote", action="store_true", help="After rewriting, remove first paragraph starting with <placeholder> marker to promote from placeholder to real page")
+    rewrite_parser.add_argument("--mention-map", help="Comma-separated label=page_id pairs; literal label occurrences in body become Notion page mentions")
     rewrite_parser.add_argument("--dry-run", action="store_true")
+
+    link_parser = subparsers.add_parser("link-pages")
+    link_parser.add_argument("page_id")
+    link_parser.add_argument("--add", action="append", default=[], help="Wiki page id to add to Related Pages relation (repeatable)")
+    link_parser.add_argument("--remove", action="append", default=[], help="Wiki page id to remove from Related Pages relation (repeatable)")
+    link_parser.add_argument("--ensure-property", action="store_true", help="Create Related Pages relation property on Wiki DB if missing")
+    link_parser.add_argument("--dry-run", action="store_true")
 
     reference_parser = subparsers.add_parser("reference-check")
     reference_parser.add_argument("reference_page_id", help="Wiki page acting as exemplar (e.g., QueryLoop once refined to green)")
@@ -2879,6 +3010,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_consolidate_evidence(client, args)
     if args.command == "rewrite-section":
         return command_rewrite_section(client, args)
+    if args.command == "link-pages":
+        return command_link_pages(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "reference-check":
         return command_reference_check(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "seed-related-pages":
