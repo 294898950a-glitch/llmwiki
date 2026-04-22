@@ -35,6 +35,12 @@ LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
         "env_key_file": "KIMI_API_KEY_FILE",
         "fixed_temperature": "1.0",
     },
+    "gemini": {
+        "endpoint": "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+        "default_model": "gemini-2.5-flash",
+        "env_key": "GEMINI_API_KEY",
+        "env_key_file": "GEMINI_API_KEY_FILE",
+    },
 }
 
 
@@ -4206,6 +4212,430 @@ def command_resolve_decision(args: argparse.Namespace) -> int:
     return 0
 
 
+GEMINI_ARBITER_SYSTEM_PROMPT = (
+    "你是永久笔记质量的第三方仲裁员。你将看到一段 Kimi 产出的永久笔记 heading 内容，以及 DeepSeek 对它的 FAIL 校验意见。\n"
+    "\n"
+    "任务：判 DeepSeek 的 FAIL 是否成立。\n"
+    "- DeepSeek 指出的问题是否真实、严重？\n"
+    "- Kimi 的产出是否真的需要重写（而不是小修就可用）？\n"
+    "\n"
+    "评判原则：\n"
+    "- 不要无脑附和 DeepSeek；如果它提的是鸡蛋里挑骨头 / 过度苛刻 / 个人风格偏好差异，应推翻 FAIL（uphold_fail=false）。\n"
+    "- 也不要为了推翻而推翻；如果 Kimi 产出确实空洞、缺解读、越界、与事实矛盾，该维持 FAIL 就维持（uphold_fail=true）。\n"
+    "- 阈值：只有当 Kimi 确实需要整段重写才 uphold；小修建议（加一句、改个词）不应 uphold。\n"
+    "\n"
+    "输出必须是且仅是一个 JSON（不要 markdown、不要前言）：\n"
+    '{\n'
+    '  "uphold_fail": true/false,\n'
+    '  "reasoning": "一两句话说明判据"\n'
+    '}\n'
+)
+
+
+def parse_gemini_json(raw: str) -> Optional[Dict[str, Any]]:
+    if not raw:
+        return None
+    raw = raw.strip()
+    fence = re.match(r"```(?:json)?\s*(.*?)\s*```", raw, re.DOTALL)
+    candidate = fence.group(1).strip() if fence else raw
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, ValueError):
+        obj_match = re.search(r"\{.*\}", candidate, re.DOTALL)
+        if not obj_match:
+            return None
+        try:
+            parsed = json.loads(obj_match.group(0))
+        except (json.JSONDecodeError, ValueError):
+            return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def gemini_arbitrate(
+    gemini_client: "LLMClient",
+    wiki_title: str,
+    heading: str,
+    kimi_content: str,
+    deepseek_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    user_prompt = (
+        f"词条：{wiki_title or '(未命名)'}\n"
+        f"Heading：{heading}\n\n"
+        "Kimi 产出：\n---\n"
+        f"{kimi_content or '(空)'}\n"
+        "---\n\n"
+        "DeepSeek FAIL 意见：\n"
+        f"- score: {deepseek_result.get('score')}\n"
+        f"- issues: {deepseek_result.get('issues') or []}\n"
+        f"- suggestion: {deepseek_result.get('suggestion') or ''}\n\n"
+        "请仲裁。"
+    )
+    try:
+        response = gemini_client.chat(
+            system=GEMINI_ARBITER_SYSTEM_PROMPT,
+            user=user_prompt,
+            max_tokens=2000,
+        )
+    except NotionError as exc:
+        return {"uphold_fail": True, "reasoning": f"gemini_call_error: {exc}", "error": True}
+
+    choices = response.get("choices") or []
+    raw_output = ""
+    if choices:
+        raw_output = (choices[0].get("message", {}).get("content") or "").strip()
+
+    parsed = parse_gemini_json(raw_output)
+    if not parsed:
+        return {
+            "uphold_fail": True,
+            "reasoning": f"gemini_parse_failed; default to uphold. raw={raw_output[:200]!r}",
+            "error": True,
+            "usage": response.get("usage", {}),
+        }
+    return {
+        "uphold_fail": bool(parsed.get("uphold_fail", True)),
+        "reasoning": str(parsed.get("reasoning", "")),
+        "usage": response.get("usage", {}),
+    }
+
+
+def _capture_command_stdout_json(fn, *fn_args, **fn_kwargs) -> Tuple[Dict[str, Any], int]:
+    """Run a command_* function, capture its stdout, parse as JSON.
+
+    Commands like command_llm_refine_page / command_llm_validate end with a single
+    print(json.dumps(audit_success(...))); this helper reuses them in pipeline
+    flows without a big refactor. Side effects (Notion writes, logs) still happen.
+    """
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        exit_code = fn(*fn_args, **fn_kwargs)
+    raw = buf.getvalue().strip()
+    if not raw:
+        return {}, exit_code
+    try:
+        return json.loads(raw), exit_code
+    except json.JSONDecodeError:
+        return {"raw_stdout_head": raw[:500]}, exit_code
+
+
+def _build_compile_args_for_pipeline(
+    raw_page_id: str,
+    force: bool,
+) -> argparse.Namespace:
+    return argparse.Namespace(
+        page_id=raw_page_id,
+        title=None,
+        canonical_id=None,
+        verification=None,
+        compounded_level=None,
+        last_compounded_at=None,
+        append_heading=None,
+        increment_compounded_level=False,
+        title_property=None,
+        canonical_id_property=None,
+        verification_property=None,
+        compounded_level_property=None,
+        last_compounded_at_property=None,
+        raw_title_property=None,
+        raw_source_url_property=None,
+        raw_status_property=None,
+        raw_processed_at_property=None,
+        raw_target_wiki_page_property=None,
+        raw_compiled_status=None,
+        force=force,
+        auto_refine=True,
+        strict_alias=False,
+        strict_fuzzy=False,
+        emit_diff=False,
+        merge_mode="append",
+        replace_heading=None,
+    )
+
+
+def _build_refine_page_args_for_pipeline(wiki_page_id: str, provider: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        page_id=wiki_page_id,
+        sections="",
+        provider=provider,
+        model=None,
+        source_page_id=None,
+        style_from_page_id=None,
+        style_note="",
+        mention_map=None,
+        link_style="link",
+        preview=False,
+        max_tokens=16000,
+        temperature=0.4,
+    )
+
+
+def _build_validate_args_for_pipeline(wiki_page_id: str, provider: str, annotate: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        page_id=wiki_page_id,
+        heading=None,
+        provider=provider,
+        model=None,
+        annotate=annotate,
+        dry_run=False,
+        max_tokens=10000,
+    )
+
+
+def _build_editorial_args_for_pipeline(wiki_page_id: str) -> argparse.Namespace:
+    return argparse.Namespace(
+        page_id=wiki_page_id,
+        all=False,
+        limit=50,
+    )
+
+
+def command_pipeline(
+    client: NotionClient,
+    env: Dict[str, str],
+    raw_database_id: str,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    stages: List[Dict[str, Any]] = []
+
+    # Stage 1: compile-from-raw --auto-refine
+    compile_args = _build_compile_args_for_pipeline(args.raw_page_id, force=args.force_refine)
+    compile_payload, _ = _capture_command_stdout_json(
+        command_compile_from_raw,
+        client,
+        raw_database_id,
+        wiki_database_id,
+        mapping,
+        compile_args,
+    )
+    action = compile_payload.get("action")
+    wiki_block = compile_payload.get("wiki") or {}
+    wiki_page_id = (
+        wiki_block.get("page_id")
+        or compile_payload.get("page_id")
+        or compile_payload.get("target_wiki_page_id")
+        or compile_payload.get("existing_wiki_page_id")
+    )
+    stages.append({"stage": "compile", "status": "ok", "action": action, "wiki_page_id": wiki_page_id})
+
+    if not wiki_page_id:
+        stages.append({"stage": "abort", "reason": "no_wiki_page_id_from_compile", "compile_payload_head": {k: compile_payload.get(k) for k in ("action", "error")}})
+        print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "overall_status": "error", "stages": stages}), ensure_ascii=False, indent=2))
+        return 1
+
+    # Gate A: skipped_unchanged / skipped_duplicate_body → stop unless --force-refine
+    if action in ("skipped_unchanged", "skipped_duplicate_body") and not args.force_refine:
+        stages.append({"stage": "gate_skip", "reason": f"compile returned {action}; use --force-refine to override"})
+        print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "skipped_by_gate", "stages": stages}), ensure_ascii=False, indent=2))
+        return 0
+
+    if args.skip_refine:
+        stages.append({"stage": "refine_skipped_by_flag"})
+    else:
+        # Stage 2: llm-refine-page round 1
+        refine_args = _build_refine_page_args_for_pipeline(wiki_page_id, args.refine_provider)
+        try:
+            refine_llm = build_llm_client(env, args.refine_provider, None)
+            refine_payload, _ = _capture_command_stdout_json(
+                command_llm_refine_page,
+                client,
+                refine_llm,
+                wiki_database_id,
+                mapping,
+                refine_args,
+            )
+            stages.append({"stage": "refine_round_1", "status": "ok", "section_count": refine_payload.get("section_count"), "model": refine_payload.get("model")})
+        except NotionError as exc:
+            stages.append({"stage": "refine_round_1", "status": "error", "error": str(exc)})
+            print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "error", "stages": stages}), ensure_ascii=False, indent=2))
+            return 1
+
+    if args.skip_validate:
+        stages.append({"stage": "validate_skipped_by_flag"})
+        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+        print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "incomplete_no_validate", "stages": stages}), ensure_ascii=False, indent=2))
+        return 0
+
+    # Stage 3: llm-validate round 1 (annotate)
+    validate_round_1 = _run_validate_capture(client, env, wiki_database_id, mapping, wiki_page_id, args.validate_provider, annotate=True)
+    stages.append({"stage": "validate_round_1", **_summarize_validate(validate_round_1)})
+
+    round_1_fails = _collect_fails(validate_round_1)
+    if not round_1_fails:
+        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+        print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "passed_round_1", "stages": stages}), ensure_ascii=False, indent=2))
+        return 0
+
+    # Stage 4: Gemini arbiter — one call per failed heading
+    try:
+        gemini_client = build_llm_client(env, "gemini", None)
+    except NotionError as exc:
+        stages.append({"stage": "gemini_init_error", "error": str(exc)})
+        print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "error_no_gemini", "stages": stages}), ensure_ascii=False, indent=2))
+        return 1
+
+    # Read current (post-refine) section bodies for arbiter input
+    top_blocks = iterate_block_children(client, wiki_page_id)
+    page_meta = client.retrieve_page(wiki_page_id)
+    database = client.retrieve_database(wiki_database_id)
+    title_prop = mapping.get("title_property") or detect_title_property(database)
+    wiki_title = extract_title(page_meta, title_prop) if title_prop else ""
+
+    arbiter_results: List[Dict[str, Any]] = []
+    for fail in round_1_fails:
+        heading_text = fail.get("heading", "")
+        _, body = find_section_body(top_blocks, heading_text)
+        current_text = "\n\n".join(extract_block_text(b) for b in body if extract_block_text(b).strip()).strip()
+        verdict = gemini_arbitrate(gemini_client, wiki_title, heading_text, current_text, fail)
+        arbiter_results.append({
+            "heading": heading_text,
+            "uphold_fail": verdict.get("uphold_fail"),
+            "reasoning": verdict.get("reasoning"),
+        })
+
+    upheld = [r for r in arbiter_results if r.get("uphold_fail")]
+    overturned = [r for r in arbiter_results if not r.get("uphold_fail")]
+    stages.append({
+        "stage": "gemini_arbiter",
+        "model": gemini_client.model,
+        "upheld_count": len(upheld),
+        "overturned_count": len(overturned),
+        "results": arbiter_results,
+    })
+
+    # Add a callout summarizing the arbiter verdict
+    _append_arbiter_callout(client, wiki_page_id, gemini_client.model, arbiter_results)
+
+    if not upheld:
+        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+        print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "passed_via_gemini_override", "stages": stages}), ensure_ascii=False, indent=2))
+        return 0
+
+    # Stage 5: Kimi refine round 2
+    refine_args_r2 = _build_refine_page_args_for_pipeline(wiki_page_id, args.refine_provider)
+    # Limit sections to the ones Gemini upheld (save cost)
+    refine_args_r2.sections = ",".join(r["heading"] for r in upheld)
+    try:
+        refine_llm_r2 = build_llm_client(env, args.refine_provider, None)
+        _capture_command_stdout_json(
+            command_llm_refine_page,
+            client,
+            refine_llm_r2,
+            wiki_database_id,
+            mapping,
+            refine_args_r2,
+        )
+        stages.append({"stage": "refine_round_2", "status": "ok", "sections_rewritten": refine_args_r2.sections})
+    except NotionError as exc:
+        stages.append({"stage": "refine_round_2", "status": "error", "error": str(exc)})
+        print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "error_round_2_refine", "stages": stages}), ensure_ascii=False, indent=2))
+        return 1
+
+    # Stage 6: llm-validate round 2 (annotate)
+    validate_round_2 = _run_validate_capture(client, env, wiki_database_id, mapping, wiki_page_id, args.validate_provider, annotate=True)
+    stages.append({"stage": "validate_round_2", **_summarize_validate(validate_round_2)})
+
+    round_2_fails = _collect_fails(validate_round_2)
+    _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+
+    overall = "passed_round_2" if not round_2_fails else "round_2_still_failing"
+    print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": overall, "stages": stages}), ensure_ascii=False, indent=2))
+    return 0 if not round_2_fails else 1
+
+
+def _run_validate_capture(
+    client: NotionClient,
+    env: Dict[str, str],
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+    provider: str,
+    annotate: bool,
+) -> Dict[str, Any]:
+    llm = build_llm_client(env, provider, None)
+    args = _build_validate_args_for_pipeline(wiki_page_id, provider, annotate)
+    payload, _ = _capture_command_stdout_json(
+        command_llm_validate,
+        client,
+        llm,
+        wiki_database_id,
+        mapping,
+        args,
+    )
+    return payload
+
+
+def _summarize_validate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "pass_count": payload.get("pass_count"),
+        "fail_count": payload.get("fail_count"),
+        "error_count": payload.get("error_count"),
+        "avg_score": payload.get("avg_score"),
+        "validator_model": payload.get("validator_model"),
+    }
+
+
+def _collect_fails(validate_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    results = validate_payload.get("results", []) or []
+    return [r for r in results if r.get("pass") is False]
+
+
+def _run_and_append_editorial(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+    stages: List[Dict[str, Any]],
+) -> None:
+    try:
+        result = check_editorial_compliance(client, wiki_database_id, mapping, wiki_page_id)
+        stages.append({
+            "stage": "check_editorial",
+            "compliance": result.get("compliance"),
+            "issue_count": result.get("issue_count"),
+        })
+    except NotionError as exc:
+        stages.append({"stage": "check_editorial", "error": str(exc)})
+
+
+def _append_arbiter_callout(
+    client: NotionClient,
+    wiki_page_id: str,
+    gemini_model: str,
+    arbiter_results: List[Dict[str, Any]],
+) -> None:
+    upheld = [r for r in arbiter_results if r.get("uphold_fail")]
+    overturned = [r for r in arbiter_results if not r.get("uphold_fail")]
+    intro = (
+        f"Gemini 仲裁 · {today_iso_date()} · {gemini_model}\n"
+        f"维持 DeepSeek FAIL: {len(upheld)} 段 · 推翻: {len(overturned)} 段"
+    )
+    blocks: List[Dict[str, Any]] = [{
+        "object": "block",
+        "type": "callout",
+        "callout": {"icon": {"emoji": "⚖️"}, "rich_text": rich_text_value(intro)},
+    }]
+    for r in arbiter_results:
+        h = r.get("heading", "")
+        uphold = r.get("uphold_fail")
+        reasoning = (r.get("reasoning") or "")[:400]
+        verdict = "维持 FAIL" if uphold else "推翻 FAIL"
+        emoji = "❌" if uphold else "✅"
+        text = f"[{h}] {verdict}\n仲裁理由：{reasoning}"
+        blocks.append({
+            "object": "block",
+            "type": "callout",
+            "callout": {"icon": {"emoji": emoji}, "rich_text": rich_text_value(text)},
+        })
+    try:
+        client.append_block_children(wiki_page_id, blocks)
+    except NotionError as exc:
+        print(f"WARN: failed to append arbiter callout: {exc}", file=sys.stderr)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal Notion Wiki compiler for llmwiki")
     parser.add_argument("--env-file", default=str(ENV_PATH), help="Path to .env file")
@@ -4422,6 +4852,17 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("--rationale", default="", help="Free-text explanation of the decision")
     resolve_parser.add_argument("--resolver", default="", help="Who made the decision; defaults to 'session-layer'")
 
+    pipeline_parser = subparsers.add_parser(
+        "pipeline",
+        help="Full T1+T2 flow for one raw: compile-from-raw --auto-refine → llm-refine-page (Kimi) → llm-validate (DeepSeek, annotate) → Gemini arbiter on FAIL → Kimi round 2 if upheld → check-editorial. Max 2 Kimi rounds.",
+    )
+    pipeline_parser.add_argument("raw_page_id", help="Raw Inbox page id to compile")
+    pipeline_parser.add_argument("--refine-provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="Primary generator (default: kimi)")
+    pipeline_parser.add_argument("--validate-provider", choices=sorted(LLM_PROVIDERS), default="deepseek", help="Validator (default: deepseek)")
+    pipeline_parser.add_argument("--force-refine", action="store_true", help="Even if compile returns skipped_unchanged/skipped_duplicate_body, continue into LLM refine (default: stop)")
+    pipeline_parser.add_argument("--skip-refine", action="store_true", help="Skip llm-refine-page stage; go straight from compile to validate")
+    pipeline_parser.add_argument("--skip-validate", action="store_true", help="Skip llm-validate + Gemini arbiter (only compile + optional refine)")
+
     return parser
 
 
@@ -4510,6 +4951,15 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_list_review_queue(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "resolve-decision":
         return command_resolve_decision(args)
+    if args.command == "pipeline":
+        return command_pipeline(
+            client,
+            env,
+            require_env(env, "NOTION_RAW_INBOX_DB_ID"),
+            require_env(env, "NOTION_WIKI_DB_ID"),
+            mapping,
+            args,
+        )
     parser.error(f"Unknown command: {args.command}")
     return 2
 
