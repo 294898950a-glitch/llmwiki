@@ -1595,8 +1595,13 @@ def apply_low_risk_refinement(
         appended_structured_summary = True
 
     appended_deepening = False
-    deepening_markers = ["核心判断", "实现信号", "关联概念", "与相邻概念的区别", "原文证据"]
-    if any(marker not in existing_body_text for marker in deepening_markers):
+    # Previous logic used `any(marker not in body)` which always re-triggered
+    # when `build_deepening_blocks` conditionally skipped markers (e.g. 实现信号
+    # only appears for topics matching the agent/system topic map). Result: every
+    # --force-refine run appended another 补充整理 wrapper, accumulating 4+ stale
+    # copies on 量化入门 / Pop Mart pages. Gate on the wrapper heading itself
+    # instead — one 补充整理 per page, period.
+    if "补充整理" not in existing_body_text:
         client.append_block_children(
             wiki_page_id,
             build_deepening_blocks(semantic_title or current_title, note),
@@ -3953,39 +3958,127 @@ def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) ->
     append_heading_prefix = args.heading_prefix or "增量更新"
     blocks = iterate_block_children(client, page_id)
 
+    # Wrapper-style headings that should appear at most once per page. If multiple
+    # copies exist (from earlier pre-dedup-fix compile runs), keep the FIRST and
+    # remove later duplicates — the first copy is the one llm-refine-page wrote
+    # clean content under; later copies carry heuristic bootstrap bodies that
+    # never got refined.
+    unique_wrapper_headings = ("结构化整理", "补充整理")
+
+    # Partition blocks into {append_heading_prefix} sections for content-based dedup,
+    # plus identify wrapper-heading duplicates separately.
     sections: List[Tuple[Dict[str, Any], List[Dict[str, Any]]]] = []
     current: Optional[Tuple[Dict[str, Any], List[Dict[str, Any]]]] = None
-    for block in blocks:
+    wrapper_first_seen: Dict[str, int] = {}  # prefix → first heading idx
+    wrapper_duplicate_ranges: List[Tuple[int, int]] = []  # [start, end_exclusive)
+    wrapper_start_idx: Optional[int] = None
+    wrapper_current_prefix: Optional[str] = None
+
+    def finalize_wrapper_range(end_idx: int):
+        nonlocal wrapper_start_idx, wrapper_current_prefix
+        if wrapper_start_idx is not None and wrapper_current_prefix is not None:
+            first_idx = wrapper_first_seen.get(wrapper_current_prefix)
+            if first_idx is not None and first_idx != wrapper_start_idx:
+                wrapper_duplicate_ranges.append((wrapper_start_idx, end_idx))
+        wrapper_start_idx = None
+        wrapper_current_prefix = None
+
+    for bi, block in enumerate(blocks):
         heading_text = ""
         if block.get("type") == "heading_2":
             heading_text = rich_text_plain_text(block.get("heading_2", {}).get("rich_text", []))
+        # Track wrapper-heading ranges (for 结构化整理 / 补充整理 dedup)
+        matched_wrapper = next((p for p in unique_wrapper_headings if heading_text.startswith(p)), None)
+        if matched_wrapper is not None:
+            finalize_wrapper_range(bi)
+            wrapper_start_idx = bi
+            wrapper_current_prefix = matched_wrapper
+            if matched_wrapper not in wrapper_first_seen:
+                wrapper_first_seen[matched_wrapper] = bi
+        elif heading_text.startswith(append_heading_prefix):
+            # new 增量更新 heading closes any open wrapper
+            finalize_wrapper_range(bi)
+        # Partition for 增量更新-prefix content dedup (unchanged logic)
         if heading_text.startswith(append_heading_prefix):
             if current is not None:
                 sections.append(current)
             current = (block, [])
         elif current is not None:
             current[1].append(block)
+    finalize_wrapper_range(len(blocks))
     if current is not None:
         sections.append(current)
 
-    seen: Dict[str, int] = {}
-    to_delete: List[Dict[str, Any]] = []
-    kept_indices: List[int] = []
-    for idx, (heading, body) in enumerate(sections):
-        key_parts = [extract_block_text(b) for b in body]
-        key = "\n".join(p for p in key_parts if p).strip()
+    # Key each 增量更新 section by its first non-empty paragraph text (the raw
+    # excerpt — canonical identifier). Earliest occurrence wins; later sections
+    # with matching key get deleted entirely (heading + body). This works even
+    # when later sections have extra heuristic cruft appended: the raw excerpt
+    # paragraph is the anchor, not the full body concatenation.
+    def section_key(body_blocks: List[Dict[str, Any]]) -> str:
+        for b in body_blocks:
+            btype = b.get("type")
+            if btype == "heading_2":
+                # stop at next wrapper heading — don't fold it into the key
+                break
+            if btype in ("paragraph", "quote", "bulleted_list_item", "numbered_list_item"):
+                t = extract_block_text(b).strip()
+                if t:
+                    return t[:500]
+        return ""
+
+    # Group sections by key first; for each group pick the "richest" one as
+    # the survivor. Ranking: (a) sections whose body contains a 结构化整理 or
+    # 补充整理 wrapper win over bare raw-only sections (they hold Kimi refined
+    # content); (b) among equally-refined, more body blocks wins; (c) earliest
+    # wins as tiebreaker. Without this, 保留 earliest would drop Kimi content
+    # when the first section was a bare raw excerpt and a later section
+    # contained the wrappers (observed on Pop Mart page during development).
+    def section_richness_rank(body_blocks: List[Dict[str, Any]]) -> Tuple[int, int, int]:
+        has_refined_wrapper = 0
+        for b in body_blocks:
+            if b.get("type") == "heading_2":
+                txt = rich_text_plain_text(b.get("heading_2", {}).get("rich_text", []))
+                if any(txt.startswith(p) for p in ("结构化整理", "补充整理")):
+                    has_refined_wrapper = 1
+                    break
+        return (has_refined_wrapper, len(body_blocks), 0)
+
+    key_groups: Dict[str, List[int]] = {}
+    keyless_indices: List[int] = []
+    section_keys: List[str] = []
+    for idx, (_heading, body) in enumerate(sections):
+        key = section_key(body)
+        section_keys.append(key)
         if not key:
-            kept_indices.append(idx)
+            keyless_indices.append(idx)
             continue
-        if key in seen:
-            older_idx = seen[key]
-            older_heading, older_body = sections[older_idx]
-            to_delete.append(older_heading)
-            to_delete.extend(older_body)
-            if older_idx in kept_indices:
-                kept_indices.remove(older_idx)
-        seen[key] = idx
-        kept_indices.append(idx)
+        key_groups.setdefault(key, []).append(idx)
+
+    to_delete: List[Dict[str, Any]] = []
+    kept_indices: List[int] = list(keyless_indices)
+    for key, group_indices in key_groups.items():
+        if len(group_indices) == 1:
+            kept_indices.append(group_indices[0])
+            continue
+        # Pick the survivor by richness; break ties by earliest (smallest idx)
+        best_idx = max(
+            group_indices,
+            key=lambda i: section_richness_rank(sections[i][1]) + (-i,),
+        )
+        kept_indices.append(best_idx)
+        for i in group_indices:
+            if i == best_idx:
+                continue
+            heading, body = sections[i]
+            to_delete.append(heading)
+            to_delete.extend(body)
+
+    # Collect wrapper-heading duplicate block ranges into to_delete
+    wrapper_blocks_removed = 0
+    for start, end in wrapper_duplicate_ranges:
+        for block in blocks[start:end]:
+            to_delete.append(block)
+            wrapper_blocks_removed += 1
 
     callouts_to_delete: List[Dict[str, Any]] = []
     if getattr(args, "drop_validator_callouts", False):
@@ -4010,11 +4103,22 @@ def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) ->
             if any(m in text for m in validator_markers):
                 callouts_to_delete.append(block)
 
-    deleted_ids: List[str] = []
+    # De-duplicate block IDs before delete — a block can be flagged by BOTH
+    # the section dedup path and the wrapper-duplicate path (when a duplicate
+    # 增量更新 section wraps a duplicate 补充整理 wrapper). Collect unique ids
+    # in insertion order so audit output stays stable.
+    seen_ids: set = set()
+    unique_to_delete: List[Dict[str, Any]] = []
     for block in to_delete + callouts_to_delete:
-        block_id = block.get("id")
-        if not block_id:
+        bid = block.get("id")
+        if not bid or bid in seen_ids:
             continue
+        seen_ids.add(bid)
+        unique_to_delete.append(block)
+
+    deleted_ids: List[str] = []
+    for block in unique_to_delete:
+        block_id = block["id"]
         if getattr(args, "dry_run", False):
             deleted_ids.append(block_id)
             continue
@@ -4030,8 +4134,9 @@ def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) ->
         "sections_total": len(sections),
         "sections_kept": len(kept_indices),
         "blocks_removed": len(deleted_ids),
-        "dedup_removed": len(to_delete),
-        "callouts_removed": len(callouts_to_delete),
+        "section_duplicates_flagged": len(to_delete),
+        "wrapper_duplicates_flagged": wrapper_blocks_removed,
+        "callouts_flagged": len(callouts_to_delete),
         "removed_block_ids": deleted_ids,
     }
     print(json.dumps(audit_success("cleanup-wiki-page", payload), ensure_ascii=False, indent=2))
