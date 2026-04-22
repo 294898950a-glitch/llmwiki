@@ -2420,21 +2420,58 @@ def build_rich_text_with_mentions(
     return segments or rich_text_value(text)
 
 
-LLM_REFINE_SYSTEM_PROMPT = (
-    "你是永久笔记的编辑器。你的任务是把输入的段落从\"提要\"升级为\"有解读\"的永久笔记。\n"
+LLM_REFINE_SYSTEM_PROMPT_BASE = (
+    "你是永久笔记的编辑器。读者是一个懂 agent 系统架构的工程师/产品人；他已经看过"
+    "教科书式描述，需要的是对他自己思维框架的扩展，不是入门介绍。\n"
     "\n"
     "\"提要\"和\"解读\"的区别：\n"
-    "- 提要：说 X 是什么、X 做什么，中性描述\n"
-    "- 解读：说 X 的非显见判据、X 和相邻概念的张力、X 容易被搞错的点、X 的一句话核心洞察\n"
+    "- 提要：说 X 是什么、X 做什么，中性描述；读起来像在复述材料\n"
+    "- 解读：说 X 的非显见判据、X 和相邻概念的张力、X 容易被搞错的那条线、X 的一句话核心洞察\n"
     "\n"
     "改写约束：\n"
-    "1. 不要空洞形容词和正确的废话（如\"重要\"、\"核心\"、\"关键\"这些词不带具体内容就不要用）\n"
+    "1. 不要空洞形容词和正确的废话（\"重要/核心/关键\"没有具体内容不要用）\n"
     "2. 每段要有一个可被反驳的论断，不是中性转述\n"
-    "3. 如果能举一个可操作的判据（\"最直接的问题是：...\"、\"测试方式：...\"），加上去\n"
+    "3. 尽量举可操作判据（\"测试方式：...\" / \"判据是：...\"）；避免抽象描述\n"
     "4. 指出常见误解或相邻概念被搞混的那条线\n"
-    "5. 保持紧凑，每段一个核心判断；避免罗列式多段\n"
-    "6. 输出纯文本段落，空行分段。不要返回 heading、不要前言、不要 markdown、不要解释你做了什么\n"
+    "5. 不要用玩具例子（\"比如小明和小红\"）或过度简化的比喻\n"
+    "6. 保持紧凑，每段一个核心判断；必要时可多段，但不要为凑字数罗列\n"
+    "7. 输出纯文本段落，空行分段。不要返回 heading、不要前言、不要 markdown、不要解释你做了什么\n"
+    "8. 对齐已给出的样本风格（如果有）：模仿样本的论断密度、判据方式、段落组织，不要自创一套\n"
 )
+
+
+def build_llm_refine_system_prompt(style_samples: List[Dict[str, str]], style_note: str) -> str:
+    parts: List[str] = [LLM_REFINE_SYSTEM_PROMPT_BASE]
+    if style_samples:
+        parts.append("\n## 读者认可的样本风格\n")
+        parts.append("以下是读者已经认可的\"有解读\"写法。改写时模仿这些样本的论断密度、"
+                     "判据方式、段落节奏，不要偏离它们的风格基调：\n")
+        for i, sample in enumerate(style_samples, 1):
+            parts.append(f"\n### 样本 {i}：{sample.get('label', '')}\n")
+            parts.append(sample.get("text", "").strip())
+            parts.append("\n")
+    if style_note.strip():
+        parts.append("\n## 本次额外的风格要求\n")
+        parts.append(style_note.strip())
+        parts.append("\n")
+    return "".join(parts)
+
+
+def fetch_style_samples(
+    client: NotionClient,
+    style_from_page_id: str,
+    sample_headings: Tuple[str, ...] = ("定义", "核心判断", "关联概念"),
+) -> List[Dict[str, str]]:
+    blocks = iterate_block_children(client, style_from_page_id)
+    samples: List[Dict[str, str]] = []
+    for heading_text in sample_headings:
+        _, body = find_section_body(blocks, heading_text)
+        text = "\n\n".join(
+            extract_block_text(b) for b in body if extract_block_text(b).strip()
+        ).strip()
+        if text:
+            samples.append({"label": heading_text, "text": text})
+    return samples
 
 
 def command_llm_refine(
@@ -2488,10 +2525,16 @@ def command_llm_refine(
         user_prompt_parts.extend(["", "额外要求：", args.extra_instruction])
     user_prompt = "\n".join(user_prompt_parts)
 
+    style_samples: List[Dict[str, str]] = []
+    if getattr(args, "style_from_page_id", None):
+        style_samples = fetch_style_samples(notion_client, args.style_from_page_id)
+    style_note = getattr(args, "style_note", "") or ""
+    system_prompt = build_llm_refine_system_prompt(style_samples, style_note)
+
     response = deepseek_client.chat(
-        system=LLM_REFINE_SYSTEM_PROMPT,
+        system=system_prompt,
         user=user_prompt,
-        max_tokens=getattr(args, "max_tokens", 4096),
+        max_tokens=getattr(args, "max_tokens", 10000),
         temperature=getattr(args, "temperature", 0.4),
     )
     choices = response.get("choices") or []
@@ -2563,7 +2606,15 @@ def command_llm_refine(
     }
     log_path = append_jsonl_log(
         daily_log_filename("llm-refine-log.jsonl"),
-        {**payload, "prompt": user_prompt, "generated_body": new_body},
+        {
+            **payload,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "style_from_page_id": getattr(args, "style_from_page_id", None),
+            "style_sample_count": len(style_samples),
+            "style_note": style_note,
+            "generated_body": new_body,
+        },
     )
     payload["log_path"] = str(log_path)
     print(json.dumps(audit_success("llm-refine", payload), ensure_ascii=False, indent=2))
@@ -3249,6 +3300,8 @@ def build_parser() -> argparse.ArgumentParser:
     llm_parser.add_argument("--heading", required=True, help="Section heading to rewrite")
     llm_parser.add_argument("--source-page-id", help="Optional source wiki/raw page id to include as context")
     llm_parser.add_argument("--extra-instruction", default="", help="Optional extra instruction appended to the prompt")
+    llm_parser.add_argument("--style-from-page-id", help="Wiki page id whose 定义 / 核心判断 / 关联概念 sections are fed as few-shot style samples")
+    llm_parser.add_argument("--style-note", default="", help="Inline style guidance appended to system prompt (禁令 / 倾向 / 读者层次描述)")
     llm_parser.add_argument("--model", default=DEFAULT_DEEPSEEK_MODEL, help="DeepSeek model (default: deepseek-reasoner)")
     llm_parser.add_argument("--max-tokens", type=int, default=10000)
     llm_parser.add_argument("--temperature", type=float, default=0.4)
