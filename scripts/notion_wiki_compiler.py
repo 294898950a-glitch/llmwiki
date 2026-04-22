@@ -618,6 +618,7 @@ def detect_command_name(argv: List[str]) -> str:
         "link-pages",
         "link-concepts-in-page",
         "llm-refine",
+        "llm-refine-page",
     }
     for token in argv:
         if token in known_commands:
@@ -2833,6 +2834,271 @@ def command_llm_refine(
     return 0
 
 
+def parse_whole_page_response(text: str) -> Optional[Dict[str, Any]]:
+    """Parse an LLM whole-page response as {heading: {content|items}}."""
+    stripped = text.strip()
+    fence = re.match(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL)
+    if fence:
+        stripped = fence.group(1).strip()
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict):
+            return obj
+    except (json.JSONDecodeError, ValueError):
+        pass
+    for match in re.finditer(r"\{.*\}", stripped, re.DOTALL):
+        try:
+            obj = json.loads(match.group(0))
+            if isinstance(obj, dict) and obj:
+                return obj
+        except (json.JSONDecodeError, ValueError):
+            continue
+    return None
+
+
+WHOLE_PAGE_CROSS_SECTION_DIRECTIVE = (
+    "\n\n## 整页协调约束（必须遵守）\n"
+    "- 每段使用**不同的锚点开场**：不要所有段都从 LangChain AgentExecutor 中断重启切入；可以轮换 LangChain / ReAct / AutoGPT / ChatGPT / 一般 agent 循环 / 没有 agent 的单次模型调用 等不同锚点\n"
+    "- 每段使用**不同的类比**：如果段 A 用游戏存档，段 B 就不能再用游戏存档——应轮换 Google Docs 自动保存 / Notion 多端同步 / ChatGPT 会话历史 / 手机 APP 切后台 等\n"
+    "- 禁止跨段内容重复：同一个测试判据 / 同一个结论句不能出现在两段里\n"
+    "- 每段只做自己的职责（role 里的界定），不越界到其他段的内容范围\n"
+)
+
+
+def command_llm_refine_page(
+    notion_client: NotionClient,
+    deepseek_client: DeepSeekClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    page_id = args.page_id
+    if getattr(args, "sections", ""):
+        sections = [s.strip() for s in args.sections.split(",") if s.strip()]
+    else:
+        sections = ["定义", "为什么重要", "关键机制", "核心判断", "实现信号", "与相邻概念的区别"]
+
+    top_blocks = iterate_block_children(notion_client, page_id)
+    database = notion_client.retrieve_database(wiki_database_id)
+    title_prop = mapping.get("title_property") or detect_title_property(database)
+    page = notion_client.retrieve_page(page_id)
+    title = extract_title(page, title_prop) if title_prop else ""
+
+    section_info: List[Tuple[str, Dict[str, Any], List[Dict[str, Any]], str]] = []
+    for s in sections:
+        heading_block, body = find_section_body(top_blocks, s)
+        if heading_block is None:
+            print(f"WARN: section {s!r} not found on page {page_id!r}, skip", file=sys.stderr)
+            continue
+        current = "\n\n".join(
+            extract_block_text(b) for b in body if extract_block_text(b).strip()
+        ).strip()
+        section_info.append((s, heading_block, body, current))
+    if not section_info:
+        raise NotionError("no recognized sections on page to refine")
+
+    source_context = ""
+    if getattr(args, "source_page_id", None):
+        source_context = read_page_body_text(notion_client, args.source_page_id)
+
+    style_samples: List[Dict[str, str]] = []
+    if getattr(args, "style_from_page_id", None):
+        style_samples = fetch_style_samples(notion_client, args.style_from_page_id)
+    style_note = getattr(args, "style_note", "") or ""
+    if not style_note.strip():
+        style_note = LLM_REFINE_DEFAULT_STYLE_NOTE
+    system_prompt = (
+        build_llm_refine_system_prompt(style_samples, style_note)
+        + WHOLE_PAGE_CROSS_SECTION_DIRECTIVE
+    )
+
+    prompt_parts: List[str] = [
+        f"词条：{title or '(未命名)'}",
+        "",
+        "该页将被整体重写。为下列每个 section 产出新内容，保证彼此不重复且各司其职。",
+        "",
+    ]
+    for s, _hb, _body, current in section_info:
+        role = LLM_SECTION_ROLE_GUIDANCE.get(s, "")
+        list_spec = LLM_LIST_SECTION_SPEC.get(s)
+        prompt_parts.append(f"### section: {s}")
+        if role:
+            prompt_parts.append(f"职责：{role}")
+        if list_spec:
+            prompt_parts.append(
+                f"输出类型：list（{list_spec['min_items']}-{list_spec['max_items']} 条，"
+                f"每条 {list_spec['max_chars_per_item']} 字以内）"
+            )
+        else:
+            prompt_parts.append("输出类型：paragraph（可多段，段间用 \\n\\n）")
+        prompt_parts.append("")
+        prompt_parts.append("当前段内容：")
+        prompt_parts.append("---")
+        prompt_parts.append(current or "(空)")
+        prompt_parts.append("---")
+        prompt_parts.append("")
+
+    if source_context:
+        prompt_parts.extend(
+            [
+                "源页 / 相邻材料（供判据和张力参考）：",
+                "---",
+                source_context,
+                "---",
+                "",
+            ]
+        )
+
+    example = {
+        "定义": {"content": "...\n\n..."},
+        "关键机制": {"items": ["...", "..."]},
+        "核心判断": {"content": "..."},
+    }
+    prompt_parts.extend(
+        [
+            "",
+            "## 输出格式（必须严格遵守）",
+            "",
+            "输出必须是且仅是一个 JSON 对象，key 是上面的 section 名，value 结构：",
+            '- paragraph 段：{"content": "多段正文，\\n\\n 分段"}',
+            '- list 段：{"items": ["第1条", "第2条", ...]}',
+            "",
+            "示例：",
+            json.dumps(example, ensure_ascii=False, indent=2),
+            "",
+            "严禁：markdown 代码块、前言、解释、多余文字、省略号。只输出完整 JSON。",
+        ]
+    )
+    user_prompt = "\n".join(prompt_parts)
+
+    response = deepseek_client.chat(
+        system=system_prompt,
+        user=user_prompt,
+        max_tokens=getattr(args, "max_tokens", 16000),
+        temperature=getattr(args, "temperature", 0.4),
+    )
+    choices = response.get("choices") or []
+    if not choices:
+        raise NotionError(f"DeepSeek returned no choices: {response}")
+    message = choices[0].get("message", {})
+    raw_output = (message.get("content") or "").strip()
+    reasoning = message.get("reasoning_content") or ""
+    usage = response.get("usage") or {}
+
+    if not raw_output:
+        raise NotionError(f"DeepSeek returned empty content; reasoning={reasoning[:200]!r}")
+
+    parsed = parse_whole_page_response(raw_output)
+    if parsed is None:
+        raise NotionError(f"Failed to parse whole-page JSON response; head={raw_output[:400]!r}")
+
+    if getattr(args, "preview", False):
+        preview_payload = {
+            "wiki_page_id": page_id,
+            "sections_requested": [s for s, *_ in section_info],
+            "sections_returned": list(parsed.keys()),
+            "model": deepseek_client.model,
+            "preview": True,
+            "parsed": parsed,
+            "reasoning": reasoning,
+            "usage": usage,
+        }
+        print(json.dumps(audit_success("llm-refine-page", preview_payload), ensure_ascii=False, indent=2))
+        return 0
+
+    mention_map = parse_mention_map(getattr(args, "mention_map", None))
+    link_style = getattr(args, "link_style", "link")
+    results: List[Dict[str, Any]] = []
+    for s, heading_block, body, _ in section_info:
+        section_rewrite = parsed.get(s)
+        if not isinstance(section_rewrite, dict):
+            print(f"WARN: no rewrite for section {s!r} in LLM response", file=sys.stderr)
+            continue
+        deleted_ids: List[str] = []
+        for b in body:
+            bid = b.get("id")
+            if not bid:
+                continue
+            try:
+                notion_client.delete_block(bid)
+                deleted_ids.append(bid)
+            except NotionError as exc:
+                print(f"WARN: failed to delete {bid}: {exc}", file=sys.stderr)
+        new_blocks: List[Dict[str, Any]] = []
+        render_mode = "paragraph"
+        if "items" in section_rewrite and isinstance(section_rewrite["items"], list):
+            render_mode = "bulleted_list_item"
+            for item in section_rewrite["items"]:
+                if not isinstance(item, str) or not item.strip():
+                    continue
+                for chunk in chunk_text(item.strip()):
+                    rich = (
+                        build_rich_text_with_mentions(chunk, mention_map, link_style)
+                        if mention_map
+                        else rich_text_value(chunk)
+                    )
+                    new_blocks.append(
+                        {
+                            "object": "block",
+                            "type": "bulleted_list_item",
+                            "bulleted_list_item": {"rich_text": rich},
+                        }
+                    )
+        elif "content" in section_rewrite and isinstance(section_rewrite["content"], str):
+            content_text = section_rewrite["content"]
+            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content_text) if p.strip()]
+            if not paragraphs:
+                paragraphs = [content_text]
+            for para in paragraphs:
+                for chunk in chunk_text(para):
+                    rich = (
+                        build_rich_text_with_mentions(chunk, mention_map, link_style)
+                        if mention_map
+                        else rich_text_value(chunk)
+                    )
+                    new_blocks.append(
+                        {
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {"rich_text": rich},
+                        }
+                    )
+        else:
+            print(f"WARN: section {s!r} rewrite has neither items nor content", file=sys.stderr)
+            continue
+        if new_blocks:
+            notion_client.append_block_children(page_id, new_blocks, after=heading_block["id"])
+        results.append(
+            {
+                "heading": s,
+                "render_mode": render_mode,
+                "deleted_block_count": len(deleted_ids),
+                "new_block_count": len(new_blocks),
+            }
+        )
+
+    payload = {
+        "wiki_page_id": page_id,
+        "model": deepseek_client.model,
+        "section_count": len(results),
+        "sections": results,
+        "usage": usage,
+    }
+    log_path = append_jsonl_log(
+        daily_log_filename("llm-refine-log.jsonl"),
+        {
+            **payload,
+            "system_prompt": system_prompt,
+            "user_prompt": user_prompt,
+            "raw_output": raw_output,
+            "reasoning": reasoning,
+        },
+    )
+    payload["log_path"] = str(log_path)
+    print(json.dumps(audit_success("llm-refine-page", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_link_concepts_in_page(client: NotionClient, args: argparse.Namespace) -> int:
     mention_map = parse_mention_map(args.mention_map)
     if not mention_map:
@@ -3507,6 +3773,19 @@ def build_parser() -> argparse.ArgumentParser:
                                 help="mention: Notion page mention (semantic but UI under-renders API-created ones); link: text with notion.so href (robust blue clickable text); both: mention + link")
     rewrite_parser.add_argument("--dry-run", action="store_true")
 
+    llm_page_parser = subparsers.add_parser("llm-refine-page")
+    llm_page_parser.add_argument("page_id")
+    llm_page_parser.add_argument("--sections", default="", help="Comma-separated heading list; default = 定义,为什么重要,关键机制,核心判断,实现信号,与相邻概念的区别")
+    llm_page_parser.add_argument("--source-page-id")
+    llm_page_parser.add_argument("--style-from-page-id")
+    llm_page_parser.add_argument("--style-note", default="")
+    llm_page_parser.add_argument("--model", default=DEFAULT_DEEPSEEK_MODEL)
+    llm_page_parser.add_argument("--max-tokens", type=int, default=16000)
+    llm_page_parser.add_argument("--temperature", type=float, default=0.4)
+    llm_page_parser.add_argument("--mention-map")
+    llm_page_parser.add_argument("--link-style", choices=["mention", "link", "both"], default="link")
+    llm_page_parser.add_argument("--preview", action="store_true")
+
     llm_parser = subparsers.add_parser("llm-refine")
     llm_parser.add_argument("page_id", help="Wiki page id to refine")
     llm_parser.add_argument("--heading", required=True, help="Section heading to rewrite")
@@ -3604,6 +3883,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "llm-refine":
         deepseek = DeepSeekClient(resolve_deepseek_key(env), model=args.model)
         return command_llm_refine(
+            client,
+            deepseek,
+            require_env(env, "NOTION_WIKI_DB_ID"),
+            mapping,
+            args,
+        )
+    if args.command == "llm-refine-page":
+        deepseek = DeepSeekClient(resolve_deepseek_key(env), model=args.model)
+        return command_llm_refine_page(
             client,
             deepseek,
             require_env(env, "NOTION_WIKI_DB_ID"),
