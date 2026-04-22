@@ -119,13 +119,20 @@
 
 ## 冲突处理
 
-当前系统不做自动 diff merge，只做 append。
+脚本提供三种 merge 模式（`compile-from-raw --merge-mode`）：
 
-所以冲突处理先采用保守约束：
+| 模式 | 行为 | 典型用法 |
+|---|---|---|
+| `append`（默认） | 追加一个新的 `增量更新` block；旧内容全部保留 | 常规低风险冲突、首次 compile |
+| `propose` | 只计算"候选 wiki 页 + 预期写入 block"的结构化预览，不写入 Notion | 会话层需要先看清差异再决定时 |
+| `replace` | 与 `--replace-heading <text>` 配合；找到指定 heading，删该 heading 下的原 body，append 新 raw 正文 | 明确知道要重写某一 section 时（如 `定义 / 核心判断` 经会话层 editorial 收敛后） |
 
-- 不要静默覆盖旧结论
-- 不要因为新资料出现，就直接替换页面旧摘要
-- 如果新旧信息冲突，先记录“冲突存在”，再决定是否重写摘要
+通用约束（三种模式都适用）：
+
+- 不要静默覆盖旧结论：`replace` 必须显式指定 heading
+- 不要因为新资料出现就直接替换页面旧摘要：默认仍是 `append`
+- 如果新旧信息冲突，先记录"冲突存在"，再决定是否重写摘要
+- `--emit-diff` 可以与 `append` 同用，追加 `差异分析 YYYY-MM-DD` 代码块做证据保留
 
 当前阶段推荐策略：
 

@@ -93,6 +93,8 @@ python scripts/notion_wiki_compiler.py check-editorial --all --limit 50
 
 脚本检查：必填属性 4 项是否为空、title 是否仍带"第N章"前缀或未切分的冒号、正文是否包含 `定义 / 核心判断 / 关联概念 / 原文证据` 四个 heading_2、`原文证据` 条目是否 ≤ 4、`增量更新` section 是否有重复。
 
+`原文证据` 条数超过 4 时可直接用 `consolidate-evidence <page_id> --keep 4` 裁剪；若要替换某个 heading（如 `定义 / 核心判断`）下的内容，用 `compile-from-raw --merge-mode replace --replace-heading <text>` 由脚本做删-加操作。
+
 输出 `green`（零问题）/ `yellow`（≤2 问题）/ `red`（>2 问题），exit code 0（green）或 1（其他）。会话层应把 `yellow` / `red` 页面作为下一轮 live editorial 的候选队列。
 
 ## 后续演进

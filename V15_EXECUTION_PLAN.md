@@ -39,15 +39,23 @@ v15 §8.1 要求"收缩对当前状态的宣传，避免把 alpha 说成成熟 w
 
 **目标**：对象级 compounding——从 append-first 换到 compound-first。
 
-- [ ] **代码侧**（我）：
-  - **section-level merge 钩子**：`compile-from-raw` 新增 `--merge-mode {append|propose|replace}`
+- [x] **代码侧**（我，2026-04-22）：
+  - **section-level merge 钩子**：`compile-from-raw --merge-mode {append,propose,replace}`
     - `append`：现状，追加 `增量更新` block
-    - `propose`：不写入 wiki，把"拟 merge 内容 + 目标 section"输出到 stdout JSON，供会话层决定
-    - `replace`：替换指定 heading 下的段落（需显式 `--replace-heading <name>`）
-  - **consolidate-evidence 子命令**：`consolidate-evidence <page_id> [--keep N]`，对"原文证据" section 保留最近 N 条（按出现顺序或 last_edited_time），其余删除。
-- [ ] **文档侧**（我）：`MERGE_STRATEGY.md` §冲突处理段补 "merge / propose / replace 三模式"；`EDITORIAL_POLICY.md` §机器化检查段链接 `consolidate-evidence`。
-- [ ] **会话层**：接管 `propose` 输出，决定是 append / replace / skip；决策走 `log-session-event`。
-- [ ] **产出**：1 笔 `feat(compile): add --merge-mode {append,propose,replace}`；1 笔 `feat(cleanup): add consolidate-evidence subcommand`；1-2 笔 docs。
+    - `propose`：不写入 wiki，输出结构化预览（候选 wiki 页 / match_strategy / 预期写入 block 数 / existing_body_hash 等）
+    - `replace`：与 `--replace-heading <text>` 配合，找到 heading 删原 body block 再 append 新正文
+  - **consolidate-evidence 子命令**：`consolidate-evidence <page_id> [--heading <text>] [--keep N] [--dry-run]`
+    - 默认对"原文证据" heading 下的证据 block 保留前 4 条（对齐 EDITORIAL_POLICY 上限）
+    - 支持 `--heading` 覆盖其他 section、`--keep` 覆盖条数上限、`--dry-run` 预演
+  - 新增 `find_upsert_target` helper 把 upsert_note_to_wiki 的候选查找抽成独立函数，供 propose / replace / append 三路共用
+  - 新增 `find_section_body` helper 定位 heading_2/heading_3 及其 body block 范围
+- [x] **文档侧**（我，2026-04-22）：
+  - `MERGE_STRATEGY.md` §冲突处理重写为"三模式对照表 + 通用约束"
+  - `EDITORIAL_POLICY.md` §机器化检查段链接 `consolidate-evidence` 和 `--merge-mode replace`
+  - `README.MD` 已实现能力段新增 `--merge-mode` 三行 + `consolidate-evidence` 一行
+  - `CLAUDE.md` Version r7→r8，脚本清单 9→10 个子命令
+- [ ] **会话层**（剩余，非脚本）：接管 `propose` 输出，决定 append / replace / skip；决策走 `log-session-event`
+- **产出**：`feat(compile): add --merge-mode` + `feat(cleanup): add consolidate-evidence` + `docs: wire compounding into 5 docs`。
 
 ## 2. v15 §5 四阶段路线图落地清单
 

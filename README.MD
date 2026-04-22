@@ -43,11 +43,12 @@
 - `inspect-schema --database raw|wiki`
 - `search <query>`
 - `upsert-note`
-- `compile-from-raw <page_id>` ——支持 `--force` / `--auto-refine` / `--strict-alias` / `--strict-fuzzy` / `--emit-diff`
-- `compile-queue --status <S> --limit N` ——支持 `--retry-failed` / `--filter PROP=VALUE`（可重复）/ 同样的 strict/emit-diff flags
+- `compile-from-raw <page_id>` ——支持 `--force` / `--auto-refine` / `--strict-alias` / `--strict-fuzzy` / `--emit-diff` / `--merge-mode {append,propose,replace}`（+ `--replace-heading` 配合 replace）
+- `compile-queue --status <S> --limit N` ——支持 `--retry-failed` / `--filter PROP=VALUE`（可重复）/ 同样的 strict/emit-diff/merge-mode flags
 - `log-session-event` ——会话层留痕入口（写 `session-log.jsonl`）
 - `cleanup-wiki-page <page_id>` ——去重页面内重复的 `增量更新` section，支持 `--dry-run`
 - `check-editorial [<page_id>] [--all --limit N]` ——按 `EDITORIAL_POLICY.md` 的 checklist 机器化评估 wiki 页的永久笔记达标度，返回 green/yellow/red 分级
+- `consolidate-evidence <page_id> [--heading <text>] [--keep N] [--dry-run]` ——把指定 heading（默认"原文证据"）下的证据条数截到 `--keep` 以内
 - `lint`
 
 当前已确认的数据库结构：
@@ -120,6 +121,11 @@
   - compile-log 里现在始终存 raw body 截取（≤ 8000 字符）
   - update 路径下若上一次 compile 留有 body_text，则计算段落级 unified diff 并 append 为 `差异分析 YYYY-MM-DD` 代码块
 - Raw Inbox 多维过滤：`compile-queue --filter PROP=VALUE`（可重复）与 `--status` 合成 AND 过滤，覆盖 status/select/rich_text/title/checkbox/number/multi_select 常见类型
+- `compile-from-raw --merge-mode {append,propose,replace}`：对象级 compounding 的代码层入口
+  - `append`（默认）：追加 `增量更新` block，行为同此前
+  - `propose`：只输出"候选 wiki 页 + 预期写入 block"的结构化预览，不写入 Notion，供会话层决定 update/merge/skip
+  - `replace`：与 `--replace-heading <text>` 配合；找到指定 heading，删该 heading 下的原 body block，append 新的 raw 正文段落
+- `consolidate-evidence <page_id>`：对"原文证据"（或指定 heading）下的证据 block 做截断，默认保留前 4 条以对齐 EDITORIAL_POLICY 上限；支持 `--dry-run`
 - `check-editorial` 按 `EDITORIAL_POLICY.md` 的 checklist 对 wiki 页做机器化评估：
   - 检查必填属性（Canonical ID / Verification / Compounded Level / Last Compounded At）
   - 检查 title 是否已收束（无"第N章"前缀、无冒号切分残留）
