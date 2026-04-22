@@ -1553,3 +1553,252 @@ README 写：
    - `Roadmap`
 3. 把 `QueryLoop / QueryEngine / 占位页` 这类 live 结果从总定位段移出，单列到 `Live Examples`
 4. 把 `V15_EXECUTION_PLAN.md` 这类路线图信息从“当前状态”剥离，只在 `Roadmap` 里引用
+
+---
+
+## v17 · 2026-04-23
+
+- **评审对象**：
+  - `README.MD`（工作树，未提交）
+- **对照对象**：
+  - `scripts/notion_wiki_compiler.py`
+  - `LLM_EXTRACTION_DESIGN.md`
+  - `EDITORIAL_POLICY.md`
+  - `CLAUDE.md`
+  - `V15_EXECUTION_PLAN.md`
+- **锚定 git 状态**：`2253378` 之后，已包含 `27cdef8 docs(readme): restructure per v16 review`
+- **评审者**：GPT-5 Codex
+- **本版定位**：确认 v16 提出的 README 重构建议是否已经落地，以及是否还存在新的明显漂移。
+
+### 1. 本轮结论
+
+这版 README 已经明显好于 v16 评审时的状态，主要改动方向是对的：
+
+- 已按建议拆成：
+  - `Current Position`
+  - `Implemented`
+  - `Live Examples`
+  - `Known Limits`
+  - `Roadmap`
+- “9 个子命令”这一硬错误已消失，改成“权威清单以代码为准”
+- `Live Examples` 收缩为两条稳定引用：
+  - smoke test
+  - `QueryLoop` 样板页
+- prompt 细节、validator 评分标准、editorial checklist 等说明，已经成功下沉到二级文档
+
+### 2. 和代码/文档的一致性判断
+
+当前 README 的主线已经和代码及设计文档基本一致：
+
+- `Current Position` 里对三层结构的判断成立：
+  - Notion I/O
+  - 启发式编译
+  - LLM refine / validate
+- `Implemented` 中的命令分类与 `build_parser()` 注册内容一致
+- `Live Examples` 不再混入短周期运行态结果
+- `Known Limits` 的几条关键限制与代码现状相符：
+  - 对象级 compounding 未做实
+  - 决策层仍偏弱
+  - validator 不自动改正文
+  - `check-editorial` 不驱动自动补段
+
+### 3. 剩余问题（已从“错误”降到“精修建议”）
+
+1. **`Current Position` 仍略密**
+
+   三层定义是对的，但第一段信息密度高，对第一次进项目的人仍稍重。  
+   这不是错误，只是后续如果还要继续精修，可以再压一句。
+
+2. **`Implemented` 仍有少量技术细节可以继续下沉**
+
+   例如：
+   - “prompt / reasoning / content / usage 全量落盘”
+   - “Related Pages self-referencing relation + 正文 page mention 双实现”
+
+   这些都成立，但如果未来还想再瘦身，可以进一步移到二级文档。  
+   目前保留也不构成失真。
+
+3. **`Known Limits` 现在是 README 里最值钱的部分**
+
+   这段已经相当诚实，后续不建议再随意压缩，否则 README 会重新失去可信度。
+
+### 4. 本版结论
+
+- README 现在已经从“需要结构重写”进入“可以作为正式状态文档使用”的阶段。
+- 当前已不再存在 v16 那种明显错误或分层混乱问题。
+- 剩下的是可选的风格级瘦身，不是必须立即修复的问题。
+
+### 5. 建议下一步
+
+1. README 可以暂时收口，不必继续大改
+2. 后续若再动 README，优先只做两类动作：
+   - 小幅压缩 `Current Position`
+   - 继续把 `Implemented` 里的少量技术细节下沉
+3. 更值得投入的工作已经不在 README，而在：
+   - `QueryLoop` / `QueryEngine` 等样板页的持续精修
+   - 对象级 compounding
+   - reviewable / validator 工作流稳定化
+
+---
+
+## v18 · 2026-04-23
+
+- **评审对象**：
+  - 当前项目整体完整性（代码 + README + 设计文档）
+- **对照对象**：
+  - `README.MD`
+  - `scripts/notion_wiki_compiler.py`
+  - `LLM_EXTRACTION_DESIGN.md`
+  - `MERGE_STRATEGY.md`
+  - `EDITORIAL_POLICY.md`
+  - `V15_EXECUTION_PLAN.md`
+- **锚定 git 状态**：`27cdef8` 之后的项目状态
+- **评审者**：GPT-5 Codex
+- **本版定位**：不是再审 README 句子，而是从“系统完整性”角度判断下一步最该补什么闭环。
+
+### 1. 当前系统已经具备的层
+
+当前项目已经明显不是早期的单一 ingest 脚本，而是至少有了 5 层：
+
+1. **输入层**
+   - Raw Inbox
+2. **执行层**
+   - compile / queue / merge-mode / cleanup
+3. **精修层**
+   - `llm-refine`
+   - `llm-refine-page`
+4. **校验层**
+   - `check-editorial`
+   - `reference-check`
+   - `llm-validate`
+5. **审计层**
+   - audit / compile / session / llm logs
+
+因此，下一步的主要矛盾已经不再是“模块不够”，而是**这些模块还没闭成完整系统**。
+
+### 2. 当前最缺的不是工具，而是闭环
+
+#### 2.1 决策闭环未完成
+
+系统已经能：
+- 找候选
+- 给 warning
+- strict stop
+- 留 diff
+- 留 session log
+
+但还不能形成正式流程：
+
+`发现不确定 → 进入 review → 人做决定 → 决定被记录 → 再执行`
+
+当前缺的是：
+- review queue
+- decision object
+- decision status
+
+也就是说，系统现在有“发现风险”的能力，但没有“正式处理风险”的对象。
+
+#### 2.2 对象级 compounding 闭环未完成
+
+系统现在能：
+- append
+- propose
+- replace
+- diff
+- refine
+
+但还不能稳定回答：
+- 什么时候该更新摘要
+- 什么时候该补 section
+- 什么时候该停止 append
+- 什么时候该 split 成新对象
+
+这说明系统还没有真正的**知识对象生命周期管理**。
+
+#### 2.3 质量状态闭环未完成
+
+现在已有：
+- `check-editorial`
+- `reference-check`
+- `llm-validate`
+
+但这三个结果仍然是并列工具输出，还没有汇总成一个统一的 page quality state。
+
+系统还缺：
+- `draft / review_required / validated / ready`
+  或等价状态机
+
+否则你能检查，但不能把检查结果纳入正式流程。
+
+#### 2.4 人机协作闭环未完成
+
+目前已经有：
+- `log-session-event`
+- `rewrite-section`
+- `link-pages`
+- `link-concepts-in-page`
+
+但会话层介入仍然偏 ad hoc。  
+系统还没有把：
+
+`发现问题 → 会话层决策 → 正式回写 → 更新状态`
+
+定义成标准工作流。
+
+### 3. 从系统完整性看，下一步优先级
+
+#### P0：补 review queue / decision object
+
+让高风险 case 进入正式流程，而不是停留在：
+- warning
+- strict flag
+- 人工记忆
+
+#### P1：补对象级 compounding 状态机
+
+让系统能管理：
+- growing
+- stable
+- stale
+- conflicted
+
+或等价的对象生命周期，而不只是继续 append。
+
+#### P2：补统一 quality state
+
+把：
+- `check-editorial`
+- `llm-validate`
+- `reference-check`
+
+的结果汇总成单一页面状态，而不是三个平行工具结果。
+
+#### P3：把会话层工作流标准化
+
+让人工 / 会话层介入不再是临时处理，而是系统流程的一部分。
+
+### 4. 本版结论
+
+从系统完整性看，当前项目最缺的不是：
+- 更多命令
+- 更多字段
+- 更多前端
+
+而是三个正式闭环：
+
+1. **决策闭环**
+2. **对象生命周期闭环**
+3. **质量状态闭环**
+
+这三条补上之后，项目才会从：
+- “功能很多的 alpha”
+
+走向：
+- “可以持续运行的知识系统”
+
+### 5. 建议下一步
+
+1. 先补 review queue / decision object
+2. 再补对象级 compounding 状态机
+3. 再把 `check-editorial` / `llm-validate` 汇成统一状态
+4. 最后再考虑前端和 webhook 的产品化推进
