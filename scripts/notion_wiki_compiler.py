@@ -3882,6 +3882,330 @@ def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) ->
     return 0
 
 
+DECISION_SOURCES = {"editorial", "audit", "verification", "failures"}
+DECISION_STATUSES = {"open", "in_review", "resolved", "dropped"}
+
+
+def decisions_log_path() -> Path:
+    return ensure_raw_dumps_dir() / "decisions.jsonl"
+
+
+def build_decision_id(source: str, subject_page_id: Optional[str], trigger_key: str) -> str:
+    payload = f"{source}::{subject_page_id or ''}::{trigger_key}"
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def load_decisions_state() -> Dict[str, Dict[str, Any]]:
+    path = decisions_log_path()
+    if not path.exists():
+        return {}
+    state: Dict[str, Dict[str, Any]] = {}
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            rid = record.get("id")
+            if rid:
+                state[rid] = record
+    return state
+
+
+def append_decision_record(record: Dict[str, Any]) -> Path:
+    path = decisions_log_path()
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    return path
+
+
+def render_editorial_issues(issues: List[Dict[str, Any]]) -> List[str]:
+    rendered: List[str] = []
+    for issue in issues:
+        check = issue.get("check", "")
+        if check == "required_property_empty":
+            rendered.append(f"empty:{issue.get('property')}")
+        elif check == "required_property_missing_in_schema":
+            rendered.append(f"schema_missing:{issue.get('property')}")
+        elif check == "missing_heading":
+            rendered.append(f"missing_heading:{issue.get('heading')}")
+        elif check == "too_many_evidence_items":
+            rendered.append(f"evidence_over_limit:{issue.get('count')}")
+        elif check == "duplicate_update_sections":
+            rendered.append(f"dup_updates:{issue.get('count')}")
+        elif check == "title_not_normalized":
+            rendered.append("title_not_normalized")
+        elif check == "title_contains_delimiter":
+            rendered.append("title_has_delimiter")
+        else:
+            rendered.append(check or "unknown")
+    return rendered
+
+
+def collect_editorial_signals(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    limit: int = 50,
+) -> List[Dict[str, Any]]:
+    pages = query_database_pages(client, wiki_database_id, None, page_size=20, max_pages=5)
+    if limit:
+        pages = pages[:limit]
+    signals: List[Dict[str, Any]] = []
+    for page in pages:
+        page_id = page.get("id")
+        if not page_id:
+            continue
+        try:
+            result = check_editorial_compliance(client, wiki_database_id, mapping, page_id)
+        except NotionError:
+            continue
+        compliance = result.get("compliance")
+        if compliance not in ("yellow", "red"):
+            continue
+        rendered = render_editorial_issues(result.get("issues") or [])
+        trigger_key = f"{compliance}:{'|'.join(sorted(rendered))[:200]}"
+        signals.append({
+            "source": f"editorial_{compliance}",
+            "subject_page_id": page_id,
+            "trigger": f"check-editorial {compliance}: {', '.join(rendered[:3])}" if rendered else f"check-editorial {compliance}",
+            "trigger_key": trigger_key,
+            "evidence": {
+                "compliance": compliance,
+                "title": result.get("title"),
+                "issues": rendered,
+            },
+        })
+    return signals
+
+
+def iter_recent_audit_records(days: int = 7) -> List[Dict[str, Any]]:
+    dump_dir = ensure_raw_dumps_dir()
+    today = dt.datetime.now(dt.timezone.utc).date()
+    records: List[Dict[str, Any]] = []
+    for delta in range(max(1, days)):
+        d = today - dt.timedelta(days=delta)
+        path = dump_dir / f"{d.strftime('%Y-%m-%d')}-audit-log.jsonl"
+        if not path.exists():
+            continue
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return records
+
+
+def collect_audit_review_required(days: int = 7) -> List[Dict[str, Any]]:
+    seen_keys: set = set()
+    signals: List[Dict[str, Any]] = []
+    for record in iter_recent_audit_records(days=days):
+        if not record.get("review_required"):
+            continue
+        page_id = record.get("page_id") or record.get("wiki_page_id")
+        raw_page_id = record.get("raw_page_id") or ""
+        strategy = record.get("match_strategy", "unknown")
+        trigger_key = f"{strategy}:{page_id or ''}:{raw_page_id}"
+        if trigger_key in seen_keys:
+            continue
+        seen_keys.add(trigger_key)
+        signals.append({
+            "source": "audit_review_required",
+            "subject_page_id": page_id,
+            "trigger": f"compile {strategy} hit flagged review_required",
+            "trigger_key": trigger_key,
+            "evidence": {
+                "match_strategy": strategy,
+                "raw_page_id": raw_page_id or None,
+                "command": record.get("command"),
+                "last_seen": record.get("timestamp"),
+            },
+        })
+    return signals
+
+
+def collect_verification_needs_review(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    database = client.retrieve_database(wiki_database_id)
+    title_prop = mapping.get("title_property") or detect_title_property(database) or "Name"
+    verification_prop = mapping.get("verification_property") or "Verification"
+    prop_meta = database.get("properties", {}).get(verification_prop)
+    if not prop_meta:
+        return []
+    prop_type = prop_meta.get("type")
+    if prop_type == "status":
+        filter_body = {"property": verification_prop, "status": {"equals": "Needs Review"}}
+    elif prop_type == "select":
+        filter_body = {"property": verification_prop, "select": {"equals": "Needs Review"}}
+    else:
+        return []
+    try:
+        pages = query_database_pages(client, wiki_database_id, filter_body)
+    except NotionError:
+        return []
+    signals: List[Dict[str, Any]] = []
+    for page in pages:
+        page_id = page.get("id")
+        if not page_id:
+            continue
+        title = extract_title(page, title_prop) if title_prop else ""
+        signals.append({
+            "source": "verification_needs_review",
+            "subject_page_id": page_id,
+            "trigger": f"Verification = Needs Review: {title}" if title else "Verification = Needs Review",
+            "trigger_key": f"needs_review:{page_id}",
+            "evidence": {"title": title, "verification_property": verification_prop},
+        })
+    return signals
+
+
+def collect_compile_failures(days: int = 7) -> List[Dict[str, Any]]:
+    seen_keys: set = set()
+    signals: List[Dict[str, Any]] = []
+    for record in iter_recent_audit_records(days=days):
+        if record.get("status") != "error":
+            continue
+        command = record.get("command", "") or ""
+        if not command.startswith("compile-"):
+            continue
+        raw_page_id = record.get("raw_page_id") or ""
+        error = record.get("error", "") or ""
+        trigger_key = f"{command}:{raw_page_id}:{error[:100]}"
+        if trigger_key in seen_keys:
+            continue
+        seen_keys.add(trigger_key)
+        signals.append({
+            "source": "compile_failure",
+            "subject_page_id": None,
+            "trigger": f"{command} failed: {error[:80]}",
+            "trigger_key": trigger_key,
+            "evidence": {
+                "command": command,
+                "raw_page_id": raw_page_id or None,
+                "error": error,
+                "last_seen": record.get("timestamp"),
+            },
+        })
+    return signals
+
+
+def command_list_review_queue(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    source_arg = (args.source or "all").strip()
+    if source_arg == "all":
+        requested = set(DECISION_SOURCES)
+    else:
+        requested = {s.strip() for s in source_arg.split(",") if s.strip()}
+        invalid = requested - DECISION_SOURCES
+        if invalid:
+            raise NotionError(f"Unknown source(s): {sorted(invalid)}; allowed: {sorted(DECISION_SOURCES)}")
+
+    signals: List[Dict[str, Any]] = []
+    if "editorial" in requested:
+        signals.extend(collect_editorial_signals(client, wiki_database_id, mapping, limit=args.editorial_limit))
+    if "audit" in requested:
+        signals.extend(collect_audit_review_required(days=args.days))
+    if "verification" in requested:
+        signals.extend(collect_verification_needs_review(client, wiki_database_id, mapping))
+    if "failures" in requested:
+        signals.extend(collect_compile_failures(days=args.days))
+
+    state = load_decisions_state()
+    new_decisions: List[Dict[str, Any]] = []
+    existing_open: List[Dict[str, Any]] = []
+    skipped_resolved: List[Dict[str, Any]] = []
+
+    for signal in signals:
+        did = build_decision_id(signal["source"], signal["subject_page_id"], signal["trigger_key"])
+        existing = state.get(did)
+        if existing:
+            status = existing.get("status")
+            if status in ("resolved", "dropped"):
+                skipped_resolved.append({"id": did, "status": status, "trigger": signal["trigger"]})
+                continue
+            existing_open.append({"id": did, "status": status, "trigger": signal["trigger"], "subject_page_id": signal["subject_page_id"]})
+            continue
+        record = {
+            "timestamp": iso_now(),
+            "id": did,
+            "event_type": "raised",
+            "source": signal["source"],
+            "subject_page_id": signal["subject_page_id"],
+            "trigger": signal["trigger"],
+            "evidence": signal["evidence"],
+            "status": "open",
+            "resolver": None,
+            "rationale": None,
+        }
+        new_decisions.append(record)
+
+    summary: Dict[str, Any] = {
+        "sources_checked": sorted(requested),
+        "signal_count": len(signals),
+        "new_decision_count": len(new_decisions),
+        "existing_open_count": len(existing_open),
+        "skipped_resolved_count": len(skipped_resolved),
+        "new": new_decisions,
+        "existing_open": existing_open,
+        "skipped_resolved": skipped_resolved,
+    }
+
+    if args.emit_decisions and not args.dry_run:
+        for record in new_decisions:
+            append_decision_record(record)
+        summary["emitted"] = True
+        summary["log_path"] = str(decisions_log_path())
+    else:
+        summary["emitted"] = False
+
+    print(json.dumps(audit_success("list-review-queue", summary), ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_resolve_decision(args: argparse.Namespace) -> int:
+    if args.status not in DECISION_STATUSES:
+        raise NotionError(f"--status must be one of {sorted(DECISION_STATUSES)}")
+    if args.status == "open":
+        raise NotionError("--status cannot be 'open' (decisions start as 'open' via list-review-queue --emit-decisions)")
+    state = load_decisions_state()
+    existing = state.get(args.id)
+    if not existing:
+        raise NotionError(f"Decision id not found in decisions.jsonl: {args.id}")
+    prior_status = existing.get("status")
+    if prior_status == args.status:
+        raise NotionError(f"Decision {args.id} already in status '{args.status}'")
+    record = {
+        "timestamp": iso_now(),
+        "id": args.id,
+        "event_type": "resolved",
+        "source": existing.get("source"),
+        "subject_page_id": existing.get("subject_page_id"),
+        "trigger": existing.get("trigger"),
+        "status": args.status,
+        "resolver": args.resolver or "session-layer",
+        "rationale": args.rationale or "",
+        "prior_status": prior_status,
+    }
+    log_path = append_decision_record(record)
+    record["log_path"] = str(log_path)
+    print(json.dumps(audit_success("resolve-decision", record), ensure_ascii=False, indent=2))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Minimal Notion Wiki compiler for llmwiki")
     parser.add_argument("--env-file", default=str(ENV_PATH), help="Path to .env file")
@@ -4075,6 +4399,29 @@ def build_parser() -> argparse.ArgumentParser:
     lint_parser.add_argument("--verification-property")
     lint_parser.add_argument("--expired-values", nargs="*")
 
+    review_parser = subparsers.add_parser(
+        "list-review-queue",
+        help="Aggregate review signals (editorial yellow/red, alias/fuzzy review_required, Verification=Needs Review, compile failures) into decision records.",
+    )
+    review_parser.add_argument(
+        "--source",
+        default="all",
+        help="Comma-separated subset of {editorial,audit,verification,failures} or 'all'",
+    )
+    review_parser.add_argument("--editorial-limit", type=int, default=50, help="Max wiki pages to scan for editorial check")
+    review_parser.add_argument("--days", type=int, default=7, help="Lookback window in days for audit-log / compile failures")
+    review_parser.add_argument("--emit-decisions", action="store_true", help="Append new (unseen) signals to decisions.jsonl as decision records")
+    review_parser.add_argument("--dry-run", action="store_true", help="With --emit-decisions, preview what would be appended without writing")
+
+    resolve_parser = subparsers.add_parser(
+        "resolve-decision",
+        help="Transition a decision id to a terminal status by appending a resolution record to decisions.jsonl.",
+    )
+    resolve_parser.add_argument("id", help="Decision id (from list-review-queue output)")
+    resolve_parser.add_argument("--status", required=True, choices=sorted(DECISION_STATUSES - {"open"}), help="Target status")
+    resolve_parser.add_argument("--rationale", default="", help="Free-text explanation of the decision")
+    resolve_parser.add_argument("--resolver", default="", help="Who made the decision; defaults to 'session-layer'")
+
     return parser
 
 
@@ -4159,6 +4506,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_seed_related_pages(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "lint":
         return command_lint(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "list-review-queue":
+        return command_list_review_queue(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "resolve-decision":
+        return command_resolve_decision(args)
     parser.error(f"Unknown command: {args.command}")
     return 2
 
