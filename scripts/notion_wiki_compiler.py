@@ -8,6 +8,8 @@ import hashlib
 import json
 import re
 import sys
+import http.client
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -172,14 +174,40 @@ class LLMClient:
             method="POST",
             headers=headers,
         )
-        try:
-            with urllib.request.urlopen(request, timeout=300) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise NotionError(f"{self.provider} HTTP {exc.code}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise NotionError(f"{self.provider} network error: {exc}") from exc
+        # Retry on transient network/chunked-read errors with exponential backoff.
+        # HTTP 4xx (client errors, e.g. 400 / 401 / 404) never retry — they're caller bugs.
+        # HTTP 5xx + IncompleteRead + connection reset / URLError retry up to max_attempts.
+        max_attempts = 3
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=300) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                # Only retry on 5xx; surface 4xx immediately
+                if 500 <= exc.code < 600 and attempt < max_attempts:
+                    last_exc = NotionError(f"{self.provider} HTTP {exc.code} (attempt {attempt}/{max_attempts}): {detail[:300]}")
+                    print(f"WARN: {last_exc}; retrying in {attempt * 2}s", file=sys.stderr)
+                    time.sleep(attempt * 2)
+                    continue
+                raise NotionError(f"{self.provider} HTTP {exc.code}: {detail}") from exc
+            except (urllib.error.URLError, http.client.IncompleteRead, ConnectionError, TimeoutError) as exc:
+                last_exc = exc
+                if attempt < max_attempts:
+                    print(f"WARN: {self.provider} transient error (attempt {attempt}/{max_attempts}): {exc}; retrying in {attempt * 2}s", file=sys.stderr)
+                    time.sleep(attempt * 2)
+                    continue
+                raise NotionError(f"{self.provider} network error after {max_attempts} attempts: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                last_exc = exc
+                if attempt < max_attempts:
+                    print(f"WARN: {self.provider} JSON decode error (attempt {attempt}/{max_attempts}): {exc}; retrying in {attempt * 2}s", file=sys.stderr)
+                    time.sleep(attempt * 2)
+                    continue
+                raise NotionError(f"{self.provider} JSON decode failure after {max_attempts} attempts: {exc}") from exc
+        # Unreachable; loop either returned or raised
+        raise NotionError(f"{self.provider} failed after {max_attempts} attempts: {last_exc}")
 
 
 # Backwards compat alias
@@ -3959,8 +3987,31 @@ def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) ->
         seen[key] = idx
         kept_indices.append(idx)
 
+    callouts_to_delete: List[Dict[str, Any]] = []
+    if getattr(args, "drop_validator_callouts", False):
+        # Remove all callout blocks left behind by llm-validate --annotate and
+        # Gemini arbiter. Pattern: top-level callout whose rich_text matches a
+        # validator / arbiter intro line or per-heading PASS/FAIL entry.
+        validator_markers = (
+            "DeepSeek 校验",
+            "Kimi 校验",
+            "Gemini 仲裁",
+            " · PASS · ",
+            " · FAIL · ",
+            "维持 FAIL",
+            "推翻 FAIL",
+            "平均分 ",
+            "校验失败",
+        )
+        for block in blocks:
+            if block.get("type") != "callout":
+                continue
+            text = extract_block_text(block) or ""
+            if any(m in text for m in validator_markers):
+                callouts_to_delete.append(block)
+
     deleted_ids: List[str] = []
-    for block in to_delete:
+    for block in to_delete + callouts_to_delete:
         block_id = block.get("id")
         if not block_id:
             continue
@@ -3979,6 +4030,8 @@ def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) ->
         "sections_total": len(sections),
         "sections_kept": len(kept_indices),
         "blocks_removed": len(deleted_ids),
+        "dedup_removed": len(to_delete),
+        "callouts_removed": len(callouts_to_delete),
         "removed_block_ids": deleted_ids,
     }
     print(json.dumps(audit_success("cleanup-wiki-page", payload), ensure_ascii=False, indent=2))
@@ -4856,6 +4909,7 @@ def build_parser() -> argparse.ArgumentParser:
     cleanup_parser.add_argument("page_id")
     cleanup_parser.add_argument("--heading-prefix", default="增量更新", help="Only de-duplicate sections whose heading_2 starts with this prefix")
     cleanup_parser.add_argument("--dry-run", action="store_true", help="Report what would be deleted without calling Notion delete API")
+    cleanup_parser.add_argument("--drop-validator-callouts", action="store_true", help="Also remove top-level callout blocks left behind by llm-validate --annotate and Gemini arbiter")
 
     check_parser = subparsers.add_parser("check-editorial")
     check_parser.add_argument("page_id", nargs="?", default="", help="Wiki page id to check; omit when using --all")
