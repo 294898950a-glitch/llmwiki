@@ -91,8 +91,16 @@ class NotionClient:
     def retrieve_block_children(self, block_id: str, page_size: int = 100) -> Dict[str, Any]:
         return self.request("GET", f"blocks/{block_id}/children?page_size={page_size}")
 
-    def append_block_children(self, block_id: str, children: List[Dict[str, Any]]) -> Dict[str, Any]:
-        return self.request("PATCH", f"blocks/{block_id}/children", {"children": children})
+    def append_block_children(
+        self,
+        block_id: str,
+        children: List[Dict[str, Any]],
+        after: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"children": children}
+        if after:
+            payload["after"] = after
+        return self.request("PATCH", f"blocks/{block_id}/children", payload)
 
     def delete_block(self, block_id: str) -> Dict[str, Any]:
         return self.request("DELETE", f"blocks/{block_id}")
@@ -541,6 +549,7 @@ def detect_command_name(argv: List[str]) -> str:
         "consolidate-evidence",
         "reference-check",
         "seed-related-pages",
+        "rewrite-section",
     }
     for token in argv:
         if token in known_commands:
@@ -2254,6 +2263,82 @@ def command_check_editorial(
     return 0 if result["compliance"] == "green" else 1
 
 
+def command_rewrite_section(client: NotionClient, args: argparse.Namespace) -> int:
+    page_id = args.page_id
+    heading = args.heading
+    body = args.body
+    if not body.strip():
+        raise NotionError("--body must be non-empty text")
+
+    top_blocks = iterate_block_children(client, page_id)
+    heading_block, section_body = find_section_body(top_blocks, heading)
+    if heading_block is None:
+        raise NotionError(f"Heading {heading!r} not found on page {page_id!r}")
+
+    deleted_ids: List[str] = []
+    dry_run = getattr(args, "dry_run", False)
+    for b in section_body:
+        bid = b.get("id")
+        if not bid:
+            continue
+        if dry_run:
+            deleted_ids.append(bid)
+            continue
+        try:
+            client.delete_block(bid)
+            deleted_ids.append(bid)
+        except NotionError as exc:
+            print(f"WARN: failed to delete block {bid}: {exc}", file=sys.stderr)
+
+    new_blocks: List[Dict[str, Any]] = []
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
+    if not paragraphs:
+        paragraphs = [body]
+    for para in paragraphs:
+        for chunk in chunk_text(para):
+            new_blocks.append(
+                {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": rich_text_value(chunk)},
+                }
+            )
+    if not dry_run:
+        client.append_block_children(page_id, new_blocks, after=heading_block["id"])
+
+    promoted_block_id: Optional[str] = None
+    if getattr(args, "promote", False):
+        for b in top_blocks:
+            if b.get("type") == "paragraph":
+                text = extract_block_text(b).strip()
+                if text.startswith(PLACEHOLDER_MARKER):
+                    bid = b.get("id")
+                    if not bid:
+                        break
+                    if dry_run:
+                        promoted_block_id = bid
+                    else:
+                        try:
+                            client.delete_block(bid)
+                            promoted_block_id = bid
+                        except NotionError as exc:
+                            print(f"WARN: failed to delete placeholder marker: {exc}", file=sys.stderr)
+                    break
+
+    payload = {
+        "wiki_page_id": page_id,
+        "heading": heading,
+        "deleted_block_count": len(deleted_ids),
+        "deleted_block_ids": deleted_ids,
+        "new_block_count": len(new_blocks),
+        "promoted_from_placeholder": bool(promoted_block_id),
+        "removed_placeholder_block_id": promoted_block_id,
+        "dry_run": dry_run,
+    }
+    print(json.dumps(audit_success("rewrite-section", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
 def compare_page_to_reference(
     client: NotionClient,
     wiki_database_id: str,
@@ -2725,6 +2810,13 @@ def build_parser() -> argparse.ArgumentParser:
     consolidate_parser.add_argument("--keep", type=int, default=4, help="Number of evidence items to keep (default: 4 per EDITORIAL_POLICY)")
     consolidate_parser.add_argument("--dry-run", action="store_true")
 
+    rewrite_parser = subparsers.add_parser("rewrite-section")
+    rewrite_parser.add_argument("page_id")
+    rewrite_parser.add_argument("--heading", required=True, help="Heading text to rewrite under (heading_2 or heading_3)")
+    rewrite_parser.add_argument("--body", required=True, help="New body text to place under the heading (paragraphs chunked on newlines)")
+    rewrite_parser.add_argument("--promote", action="store_true", help="After rewriting, remove first paragraph starting with <placeholder> marker to promote from placeholder to real page")
+    rewrite_parser.add_argument("--dry-run", action="store_true")
+
     reference_parser = subparsers.add_parser("reference-check")
     reference_parser.add_argument("reference_page_id", help="Wiki page acting as exemplar (e.g., QueryLoop once refined to green)")
     reference_parser.add_argument("target_page_id", nargs="?", default="", help="Page to compare to reference; omit when using --all")
@@ -2785,6 +2877,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_check_editorial(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "consolidate-evidence":
         return command_consolidate_evidence(client, args)
+    if args.command == "rewrite-section":
+        return command_rewrite_section(client, args)
     if args.command == "reference-check":
         return command_reference_check(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "seed-related-pages":
