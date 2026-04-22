@@ -1402,3 +1402,154 @@ v12 未做此清单。补：
 2. 把 `QueryLoop` 作为样板页，提炼出真正可复用的单页整理标准
 3. 优先做对象级 compounding，而不是继续堆入口或 UI
 4. 等 compounding / reviewable 两层稳定后，再认真做前端 + webhook
+
+---
+
+## v16 · 2026-04-23
+
+- **评审对象**：
+  - `README.MD`（工作树，未提交）
+  - `scripts/notion_wiki_compiler.py`（工作树，未提交）
+- **对照对象**：
+  - `CLAUDE.md`
+  - `LLM_EXTRACTION_DESIGN.md`
+  - `EDITORIAL_POLICY.md`
+  - `V15_EXECUTION_PLAN.md`
+- **锚定 git 状态**：`c31aab7`（HEAD）之后的工作树
+- **评审者**：GPT-5 Codex
+- **本版定位**：针对“当前 README 是否和最新代码真实状态一致”的交叉审查，而不是继续讨论架构理想形态。
+
+### 1. 本轮最重要的变化
+
+和 v14 / v15 相比，项目的真实状态已经变了：
+
+- 不再只是：
+  - Notion I/O + 启发式 auto-refine
+- 现在已经明确进入三层：
+  - **Notion I/O 层**
+  - **启发式编译层**
+  - **LLM refine / validate 层**
+
+直接证据：
+- `LLMClient` 与 provider 配置已存在：`scripts/notion_wiki_compiler.py:21-35, 120-167`
+- `llm-refine`：`:2564`
+- `llm-refine-page`：`build_parser()` 注册
+- `llm-validate`：页面级事后校验并支持 `--annotate`
+
+因此，README 如果还沿用“完全没有 LLM / 只有规则脚本”的老叙述，就已经过时。
+
+### 2. README 与代码一致的部分
+
+- `alpha` 定位是对的：
+  - README 没再把系统写成成熟 wiki，这和代码现状一致。
+- LLM provider 配置说明基本成立：
+  - Kimi / DeepSeek 都已在代码中有 provider 配置与 key 解析。
+- 下面这些能力在代码中都能找到明确实现：
+  - `compile-from-raw --strict-alias / --strict-fuzzy / --emit-diff / --merge-mode`
+  - `compile-queue --retry-failed / --filter`
+  - `log-session-event`
+  - `cleanup-wiki-page`
+  - `check-editorial`
+  - `consolidate-evidence`
+  - `reference-check`
+  - `seed-related-pages`
+  - `rewrite-section`
+  - `link-pages`
+  - `link-concepts-in-page`
+  - `llm-refine`
+  - `llm-refine-page`
+  - `llm-validate`
+
+### 3. README 仍存在的明确问题
+
+#### 3.1 “9 个子命令”是错误的
+
+README 写：
+- “Notion API 执行层脚本已落地（9 个子命令）”
+
+但 `build_parser()` 当前实际注册的一级子命令远超 9 个，至少包括：
+- `inspect-schema`
+- `search`
+- `compile-from-raw`
+- `compile-queue`
+- `upsert-note`
+- `log-session-event`
+- `cleanup-wiki-page`
+- `check-editorial`
+- `consolidate-evidence`
+- `rewrite-section`
+- `llm-refine`
+- `llm-refine-page`
+- `llm-validate`
+- `link-concepts-in-page`
+- `link-pages`
+- `reference-check`
+- `seed-related-pages`
+- `lint`
+
+**判定**：这是当前 README 中最明确的一条硬错误。
+
+#### 3.2 README 的层次仍然混写
+
+当前 README 里混了 4 类信息：
+
+1. 已实现代码能力
+2. live 运行结果
+3. 设计意图 / 架构解释
+4. 下一阶段路线
+
+典型例子：
+- “概念网络已开始生长（QueryLoop / QueryEngine 精修中，5 个相邻概念作占位页）”
+  - 这是 live 运行结果，不是稳定系统状态
+- “概念图谱双实现”
+  - 这是架构解释，不是单条代码能力
+- `V15_EXECUTION_PLAN.md`
+  - 这是路线图，不是当前能力
+
+**判定**：README 当前不再是“文档失真”，而是“文档职责过载”。
+
+### 4. 对项目状态的更新判断
+
+这轮看完代码后，对项目成熟度的判断要比 v15 更精确：
+
+- 它仍然不是成熟 LLM Wiki
+- 但也已经不只是“Notion 双库编译器 alpha”
+
+当前更准确的定义应是：
+
+- **一个已经具备**
+  - Notion 编译能力
+  - review / cleanup / structural check
+  - LLM 单段重写
+  - LLM 整页重写
+  - LLM 事后 validator
+- **的知识编译器 alpha+**
+
+也就是说，项目已经开始从“写入系统”向“写入 + 精修 + 校验系统”过渡。
+
+### 5. 本版结论
+
+- README 比前几版更接近真实代码。
+- 但最新问题不再是“过度宣传成熟度”，而是：
+  - **子命令数量写错**
+  - **把 live 结果 / 架构解释 / 路线图混进状态文档**
+
+如果不收一下，README 会继续膨胀成：
+- 项目状态页
+- 功能手册
+- 运行日志
+- 路线图
+四者合一，后续维护成本会越来越高。
+
+### 6. 建议下一步
+
+1. 先修硬错误：
+   - 把“9 个子命令”改掉
+2. 再做结构分层：
+   - `Current Position`
+   - `Implemented`
+   - `Live Examples`
+   - `Known Limits`
+   - `Roadmap`
+3. 把 `QueryLoop / QueryEngine / 占位页` 这类 live 结果从总定位段移出，单列到 `Live Examples`
+4. 把 `V15_EXECUTION_PLAN.md` 这类路线图信息从“当前状态”剥离，只在 `Roadmap` 里引用
