@@ -2420,6 +2420,57 @@ def build_rich_text_with_mentions(
     return segments or rich_text_value(text)
 
 
+LLM_REFINE_DEFAULT_STYLE_NOTE = """风格：已知 AI 产品锚点 + 费曼深入浅出 + 日常类比 + 类比回溯解说。
+
+读者背景：
+- 用过 ChatGPT / Claude 这类对话式 AI
+- 大致听说 LangChain / AutoGPT 这些名字
+- 不熟悉工程领域——不要用 SIGSTOP / fork / 数据库事务 / Git / WAL / K8s 这类
+- 熟悉日常参照：Google Docs / Notion / ChatGPT 自身 / 游戏存档 / 手机 APP
+
+费曼侧：
+- 从读者能观察到的现象出发（"想想你用 ChatGPT 时..."）
+- 让读者自己推出结论（"你会发现"、"想想看"）
+- 带亲和感，不学术腔
+
+锚点：
+- 选一个熟悉 AI 框架（LangChain AgentExecutor / ReAct）切入，描述很短
+- 指出它在具体场景下的行为（超时 / 重开 / 网络断）
+
+类比（必用其一）：
+- 游戏存档 / 读档
+- Google Docs 自动保存
+- Notion 多端同步
+- ChatGPT 会话历史
+- 手机 APP 切后台
+- 用"这有点像..."、"类似你用..."（承认不完全）
+
+关键约束：类比必须回溯映射
+类比是脚手架，不是目的。用完类比后必须做"一对一映射回被讲解的概念"：
+- 类比里的 A 在当前概念里具体对应什么
+- 类比里的 B 在当前概念里具体对应什么
+- 类比哪里不完全贴合，明确指出来
+- 表达："回到 X 语境下，Y 其实就是..."、"对应到我们这里..."、"区别是..."
+- 严禁"类比收尾"——段落不能以类比本身结束，必须绕回概念
+- 读者读完必须能独立复述：在当前概念里，A 是什么、B 是什么、和类比的区别是什么
+
+节奏：
+- 观察 → 为什么 → 类比建桥 → 把类比组件映射回概念 → 指出类比边界
+- 每段结尾读者能"哦原来如此"，还能自己复述映射
+- 3 段紧凑
+
+禁忌：
+- 不用工程类比（OS / 数据库 / Git）
+- 不玩具比喻（小明小红）
+- 不空洞形容词（关键、核心、重要）
+- 不营销话术（颠覆、革命）
+- 不贬低产品
+- 不在第一段下定义
+- 不"由此可见"、"综上所述"
+- 不以类比作段落结尾
+"""
+
+
 LLM_REFINE_SYSTEM_PROMPT_BASE = (
     "你是永久笔记的编辑器。读者是一个懂 agent 系统架构的工程师/产品人；他已经看过"
     "教科书式描述，需要的是对他自己思维框架的扩展，不是入门介绍。\n"
@@ -2529,6 +2580,8 @@ def command_llm_refine(
     if getattr(args, "style_from_page_id", None):
         style_samples = fetch_style_samples(notion_client, args.style_from_page_id)
     style_note = getattr(args, "style_note", "") or ""
+    if not style_note.strip():
+        style_note = LLM_REFINE_DEFAULT_STYLE_NOTE
     system_prompt = build_llm_refine_system_prompt(style_samples, style_note)
 
     response = deepseek_client.chat(
