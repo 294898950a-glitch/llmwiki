@@ -2310,7 +2310,20 @@ def parse_mention_map(raw: Optional[str]) -> Dict[str, str]:
     return mapping
 
 
-def build_rich_text_with_mentions(text: str, mention_map: Dict[str, str]) -> List[Dict[str, Any]]:
+def build_rich_text_with_mentions(
+    text: str,
+    mention_map: Dict[str, str],
+    link_style: str = "mention",
+) -> List[Dict[str, Any]]:
+    """Build rich_text segments with inline page references.
+
+    link_style='mention': use Notion mention type (preferred semantically, but
+        UI may under-render when created via API);
+    link_style='link': use text with href link pointing at notion.so URL
+        (renders as blue underlined clickable text, robust across clients);
+    link_style='both': emit mention + immediately a text-link with the same
+        label, belt-and-suspenders if mention renders empty.
+    """
     if not mention_map:
         return rich_text_value(text)
     labels = sorted(mention_map.keys(), key=len, reverse=True)
@@ -2321,12 +2334,22 @@ def build_rich_text_with_mentions(text: str, mention_map: Dict[str, str]) -> Lis
         if match.start() > pos:
             segments.append({"type": "text", "text": {"content": text[pos:match.start()]}})
         label = match.group(0)
-        segments.append(
-            {
-                "type": "mention",
-                "mention": {"type": "page", "page": {"id": mention_map[label]}},
-            }
-        )
+        target_id = mention_map[label]
+        if link_style in ("mention", "both"):
+            segments.append(
+                {
+                    "type": "mention",
+                    "mention": {"type": "page", "page": {"id": target_id}},
+                }
+            )
+        if link_style in ("link", "both"):
+            url = f"https://www.notion.so/{normalize_notion_id(target_id)}"
+            segments.append(
+                {
+                    "type": "text",
+                    "text": {"content": label, "link": {"url": url}},
+                }
+            )
         pos = match.end()
     if pos < len(text):
         segments.append({"type": "text", "text": {"content": text[pos:]}})
@@ -2407,13 +2430,18 @@ def command_rewrite_section(client: NotionClient, args: argparse.Namespace) -> i
             print(f"WARN: failed to delete block {bid}: {exc}", file=sys.stderr)
 
     mention_map = parse_mention_map(getattr(args, "mention_map", None))
+    link_style = getattr(args, "link_style", "link")
     new_blocks: List[Dict[str, Any]] = []
     paragraphs = [p.strip() for p in re.split(r"\n\s*\n", body) if p.strip()]
     if not paragraphs:
         paragraphs = [body]
     for para in paragraphs:
         for chunk in chunk_text(para):
-            rich = build_rich_text_with_mentions(chunk, mention_map) if mention_map else rich_text_value(chunk)
+            rich = (
+                build_rich_text_with_mentions(chunk, mention_map, link_style)
+                if mention_map
+                else rich_text_value(chunk)
+            )
             new_blocks.append(
                 {
                     "object": "block",
@@ -2944,7 +2972,9 @@ def build_parser() -> argparse.ArgumentParser:
     rewrite_parser.add_argument("--heading", required=True, help="Heading text to rewrite under (heading_2 or heading_3)")
     rewrite_parser.add_argument("--body", required=True, help="New body text to place under the heading (paragraphs chunked on newlines)")
     rewrite_parser.add_argument("--promote", action="store_true", help="After rewriting, remove first paragraph starting with <placeholder> marker to promote from placeholder to real page")
-    rewrite_parser.add_argument("--mention-map", help="Comma-separated label=page_id pairs; literal label occurrences in body become Notion page mentions")
+    rewrite_parser.add_argument("--mention-map", help="Comma-separated label=page_id pairs; literal label occurrences in body become Notion page references")
+    rewrite_parser.add_argument("--link-style", choices=["mention", "link", "both"], default="link",
+                                help="mention: Notion page mention (semantic but UI under-renders API-created ones); link: text with notion.so href (robust blue clickable text); both: mention + link")
     rewrite_parser.add_argument("--dry-run", action="store_true")
 
     link_parser = subparsers.add_parser("link-pages")
