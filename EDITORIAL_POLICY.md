@@ -97,8 +97,11 @@ python scripts/notion_wiki_compiler.py check-editorial --all --limit 50
 
 输出 `green`（零问题）/ `yellow`（≤2 问题）/ `red`（>2 问题），exit code 0（green）或 1（其他）。会话层应把 `yellow` / `red` 页面作为下一轮 live editorial 的候选队列。
 
+**占位页豁免**：页面正文首段以 `<placeholder>` marker 开头时，`check-editorial` 返回 `compliance: "placeholder"` 而非 green/yellow/red。占位页由 `seed-related-pages` 创建，等待会话层精修为真实永久笔记；评估时跳过该页面以避免 red 噪音。
+
 ## 后续演进
 
 - **暂不强制**：当前 compile / upsert 不会因为 check-editorial 为非 green 而阻塞写入；后续可考虑加 `--enforce-editorial` flag 做硬门禁。
-- **自动补段**：未来可基于 `check-editorial` 结果，结合 Claude Code 会话层做"按缺段 append 骨架 + 留占位"的动作。
+- **自动补段**：`seed-related-pages` 已能批量创建占位页；未来可基于 `check-editorial` 结果对 yellow/red 页面反向跑 `--merge-mode replace` 批补段（需会话层准备新内容）。
 - **与 `--auto-refine` 的耦合**：`--auto-refine` 的 heading 模板应与本策略保持同步；如果 heading 名字或顺序在这里调整，脚本里的 `build_structured_refinement_blocks` / `build_deepening_blocks` / `REQUIRED_EDITORIAL_HEADINGS` 三处需要同步改。
+- **与 `reference-check` 的关系**：`check-editorial` 检查的是硬编码 checklist；`reference-check` 检查的是"与某个样板页的结构一致性"。两者互补：前者查通用底线，后者保证新页跟样板长得像。样板页本身应先通过 `check-editorial` 达到 green，再用作 reference。

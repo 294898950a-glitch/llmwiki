@@ -49,6 +49,8 @@
 - `cleanup-wiki-page <page_id>` ——去重页面内重复的 `增量更新` section，支持 `--dry-run`
 - `check-editorial [<page_id>] [--all --limit N]` ——按 `EDITORIAL_POLICY.md` 的 checklist 机器化评估 wiki 页的永久笔记达标度，返回 green/yellow/red 分级
 - `consolidate-evidence <page_id> [--heading <text>] [--keep N] [--dry-run]` ——把指定 heading（默认"原文证据"）下的证据条数截到 `--keep` 以内
+- `reference-check <reference_page_id> [<target_page_id>] [--all --limit N]` ——以样板页（如 QueryLoop）为基准，比对其他 wiki 页的结构（heading / 属性 / 证据数），输出 conformance 分级
+- `seed-related-pages <source_page_id> [--dry-run]` ——从 source 页的 `infer_related_concepts` 输出中，对未在 Wiki 存在的概念创建占位页（`<placeholder>` marker + `Verification = Needs Review`），等会话层精修
 - `lint`
 
 当前已确认的数据库结构：
@@ -126,13 +128,15 @@
   - `propose`：只输出"候选 wiki 页 + 预期写入 block"的结构化预览，不写入 Notion，供会话层决定 update/merge/skip
   - `replace`：与 `--replace-heading <text>` 配合；找到指定 heading，删该 heading 下的原 body block，append 新的 raw 正文段落
 - `consolidate-evidence <page_id>`：对"原文证据"（或指定 heading）下的证据 block 做截断，默认保留前 4 条以对齐 EDITORIAL_POLICY 上限；支持 `--dry-run`
+- `reference-check`：以样板页（QueryLoop 等）为基准做 page 级一致性比对；支持 `--all` 扫全库；比 `check-editorial` 多了"与样板对标"维度
+- `seed-related-pages`：从 source 页的 infer_related_concepts 输出，对 Wiki 缺失的概念建占位页（`<placeholder>` + `Verification = Needs Review` + 四段 heading 骨架）；会话层后续精修
 - `check-editorial` 按 `EDITORIAL_POLICY.md` 的 checklist 对 wiki 页做机器化评估：
   - 检查必填属性（Canonical ID / Verification / Compounded Level / Last Compounded At）
   - 检查 title 是否已收束（无"第N章"前缀、无冒号切分残留）
   - 检查正文是否至少含 `定义 / 核心判断 / 关联概念 / 原文证据` 四个 heading_2
   - 检查 `原文证据` 下的条数 ≤ 4
   - 检查 `增量更新` section 是否存在重复
-  - 输出 green（全绿）/ yellow（≤2 问题）/ red（>2 问题）；exit code 0/1 反映 green 与否
+  - 输出 green（全绿）/ yellow（≤2 问题）/ red（>2 问题）/ placeholder（占位页，豁免评估）；exit code 0/1 反映 green 与否
 - 可选的低风险整理（默认关闭，`--auto-refine` 开启）：
   - 章节标题自动收束为主题标题
   - 每次执行时向 wiki 页写入一整版**启发式正文**（不是单纯的骨架 + 摘录）：

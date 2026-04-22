@@ -22,18 +22,33 @@ v15 §8.1 要求"收缩对当前状态的宣传，避免把 alpha 说成成熟 w
 **目标**：让后续所有 wiki 页都能对齐到同一套单页标准。
 
 - [ ] **会话层**（用户或 agent）：真人把 `QueryLoop`（wiki id `3496e2cd-6e4f-81b2-b037-d76d653b9c1f`）手工精修到"green"——所有 4 个必需 heading 都有真实段落、原文证据 ≤ 4、无重复增量更新、Canonical ID 填到位。
-- [ ] **代码侧**（我）：新增 `reference-check <reference_page_id> <target_page_id>` 子命令，比对 target 与 reference 的结构差异（heading 缺失 / 证据数差 / 属性空）。输出 green/yellow/red + 具体 gap 清单。
-- [ ] **文档侧**（我）：`EDITORIAL_POLICY.md` 加一节 "QueryLoop 样板页参考"，贴出该页的 heading 顺序、属性约定、证据选取原则；同时更新 `REQUIRED_EDITORIAL_HEADINGS` 若 QueryLoop 定型后有调整。
-- [ ] **产出**：1 笔 `feat(lint): add reference-check for page conformance`；1 笔 `docs(editorial): anchor QueryLoop as exemplar page`。
+- [x] **代码侧**（我，2026-04-22）：
+  - `reference-check <reference_page_id> [<target_page_id>] [--all --limit N]` 子命令
+  - 新增 `extract_heading_structure` / `compare_page_to_reference` helper
+  - 对比 heading_2 集合 / 必填属性 / 证据数；输出 `conformance: green|yellow|red` + `missing_headings_vs_reference` / `missing_properties_vs_reference` / `extra_headings_vs_reference` 清单
+  - `--all` 模式扫全库，汇总 green/yellow/red 计数
+  - 识别占位页（`<placeholder>` marker 触发 `compliance: placeholder` 豁免）
+- [x] **文档侧**（我）：
+  - `EDITORIAL_POLICY.md` 加"占位页豁免"段 + reference-check 与 check-editorial 关系说明
+  - `CLAUDE.md` / `README.MD` 脚本清单补 `reference-check`
+- [ ] **会话层剩余**：QueryLoop 精修到 green，然后以它为 reference 对其他 wiki 页跑 `reference-check --all`。脚本就绪，等样板内容。
 
 ### 1.2 长出相邻页面（QueryEngine / Context Governance / Recovery Logic 等）
 
 **目标**：让概念网络从点变图。
 
-- [ ] **代码侧**（我）：新增 `seed-related-pages <source_page_id> [--dry-run]` 子命令。读 source 页 `Aliases` + body 内硬编码 topic map 命中的 `关联概念` label；对每个 label 检查 Wiki 库是否已有同名页；没有则创建**占位页**（仅 title + `Canonical ID` + `Verification=Needs Review` + 一段 placeholder 正文指向 source）。
-- [ ] **会话层**：占位页由会话层后续精修为真实 wiki 页。不同的会话分别认领概念。
-- [ ] **文档侧**（我）：`MERGE_STRATEGY.md` 加一节 "概念网络生长"，定义占位页语义（`Verification=Needs Review` + body 含 `<placeholder>` marker）；`check-editorial` 对占位页降级为"合格 placeholder"不计入 red。
-- [ ] **产出**：1 笔 `feat(graph): add seed-related-pages for placeholder creation`；1 笔 `docs(merge): define placeholder page semantics`；1 笔 `fix(lint): check-editorial recognizes placeholder pages`。
+- [x] **代码侧**（我，2026-04-22）：
+  - `seed-related-pages <source_page_id> [--dry-run]` 子命令
+  - 读 source 页 body，走 `infer_related_concepts` 拿 topic map 命中的概念标签
+  - 对每个概念 `search_in_database` 精确匹配标题；已存在就记录到 `existing_concept_pages`
+  - 不存在则 `create_page` 占位页：title = 概念名 / `Verification = Needs Review` / children = `build_placeholder_blocks`
+  - `build_placeholder_blocks` 输出：`<placeholder>` marker 段 + 定义 / 核心判断 / 关联概念 / 原文证据 四个 heading_2 + 各段 TBD 占位文字
+  - 跳过自引用（inferred concept 与 source title 同名）
+  - `--dry-run` 不真建，只输出计划
+- [x] **文档侧**（我）：
+  - `EDITORIAL_POLICY.md` "占位页豁免"段：`check-editorial` 识别 `<placeholder>` → `compliance: placeholder`
+  - `CLAUDE.md` / `README.MD` 脚本清单补 `seed-related-pages`
+- [ ] **会话层剩余**：跑过 `seed-related-pages <QueryLoop_id>` 后，会话层逐一把占位页精修为真实永久笔记；决策走 `log-session-event`。
 
 ### 1.3 "更新已有知识对象"做稳（重写摘要 / 合并证据 / 处理冲突）
 
