@@ -369,6 +369,27 @@ def read_page_body_text(client: NotionClient, page_id: str) -> str:
     return "\n\n".join(flatten_block_texts(client, page_id)).strip()
 
 
+def extract_heading_structure(blocks: List[Dict[str, Any]]) -> List[Tuple[str, str]]:
+    """Return ordered list of (heading_type, heading_text) tuples for heading_2 / heading_3 blocks."""
+    out: List[Tuple[str, str]] = []
+    for block in blocks:
+        btype = block.get("type")
+        if btype in ("heading_2", "heading_3"):
+            text = rich_text_plain_text(block.get(btype, {}).get("rich_text", [])).strip()
+            if text:
+                out.append((btype, text))
+    return out
+
+
+PLACEHOLDER_MARKER = "<placeholder>"
+
+
+def is_placeholder_page(body_text: str) -> bool:
+    if not body_text:
+        return False
+    return body_text.strip().startswith(PLACEHOLDER_MARKER)
+
+
 def find_section_body(
     blocks: List[Dict[str, Any]],
     heading_text: str,
@@ -492,6 +513,8 @@ def detect_command_name(argv: List[str]) -> str:
         "cleanup-wiki-page",
         "check-editorial",
         "consolidate-evidence",
+        "reference-check",
+        "seed-related-pages",
     }
     for token in argv:
         if token in known_commands:
@@ -2056,6 +2079,17 @@ def check_editorial_compliance(
     title_prop = mapping.get("title_property") or detect_title_property(database)
     title = extract_title(page, title_prop) if title_prop else ""
 
+    body_text = read_page_body_text(client, wiki_page_id)
+    if is_placeholder_page(body_text):
+        return {
+            "wiki_page_id": wiki_page_id,
+            "title": title,
+            "compliance": "placeholder",
+            "issue_count": 0,
+            "issues": [],
+            "note": "page body starts with <placeholder> marker; created by seed-related-pages, awaiting session-layer editorial",
+        }
+
     issues: List[Dict[str, Any]] = []
 
     required_prop_keys = [
@@ -2195,6 +2229,270 @@ def command_check_editorial(
     result = check_editorial_compliance(client, wiki_database_id, mapping, args.page_id)
     print(json.dumps(audit_success("check-editorial", result), ensure_ascii=False, indent=2))
     return 0 if result["compliance"] == "green" else 1
+
+
+def compare_page_to_reference(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    reference_page_id: str,
+    target_page_id: str,
+) -> Dict[str, Any]:
+    database = client.retrieve_database(wiki_database_id)
+    props_meta = database.get("properties", {})
+    title_prop = mapping.get("title_property") or detect_title_property(database)
+
+    def fetch_profile(page_id: str) -> Dict[str, Any]:
+        page = client.retrieve_page(page_id)
+        blocks = iterate_block_children(client, page_id)
+        headings = extract_heading_structure(blocks)
+        heading_2_set = [text for btype, text in headings if btype == "heading_2"]
+        evidence_count = count_evidence_items(blocks)
+        present_props = []
+        for candidate_key in (
+            "canonical_id_property",
+            "verification_property",
+            "compounded_level_property",
+            "last_compounded_at_property",
+            "aliases_property",
+            "topic_property",
+            "source_property",
+        ):
+            prop_name = mapping.get(candidate_key)
+            if prop_name and prop_name in props_meta:
+                value = extract_property_text(page, prop_name)
+                if value:
+                    present_props.append(prop_name)
+        body_text = "\n\n".join(extract_block_text(b) for b in blocks if extract_block_text(b))
+        return {
+            "page_id": page_id,
+            "title": extract_title(page, title_prop) if title_prop else "",
+            "heading_2_texts": heading_2_set,
+            "headings_all": headings,
+            "evidence_count": evidence_count,
+            "properties_filled": present_props,
+            "is_placeholder": is_placeholder_page(body_text),
+        }
+
+    reference_profile = fetch_profile(reference_page_id)
+    target_profile = fetch_profile(target_page_id)
+
+    ref_heading_set = set(reference_profile["heading_2_texts"])
+    target_heading_set = set(target_profile["heading_2_texts"])
+    missing_headings = sorted(ref_heading_set - target_heading_set)
+    extra_headings = sorted(target_heading_set - ref_heading_set)
+
+    ref_props = set(reference_profile["properties_filled"])
+    target_props = set(target_profile["properties_filled"])
+    missing_properties = sorted(ref_props - target_props)
+
+    issues: List[Dict[str, Any]] = []
+    for h in missing_headings:
+        issues.append({"check": "missing_heading_vs_reference", "heading": h})
+    for p in missing_properties:
+        issues.append({"check": "missing_property_vs_reference", "property": p})
+    if target_profile["evidence_count"] > reference_profile["evidence_count"] and reference_profile["evidence_count"] > 0:
+        issues.append({
+            "check": "evidence_count_exceeds_reference",
+            "reference_count": reference_profile["evidence_count"],
+            "target_count": target_profile["evidence_count"],
+        })
+    if target_profile["is_placeholder"]:
+        issues.append({"check": "target_is_placeholder", "hint": "target has <placeholder> marker; refine before conformance check"})
+
+    if not issues:
+        conformance = "green"
+    elif len(issues) <= 2:
+        conformance = "yellow"
+    else:
+        conformance = "red"
+
+    return {
+        "reference_page_id": reference_page_id,
+        "reference_title": reference_profile["title"],
+        "target_page_id": target_page_id,
+        "target_title": target_profile["title"],
+        "conformance": conformance,
+        "missing_headings_vs_reference": missing_headings,
+        "extra_headings_vs_reference": extra_headings,
+        "missing_properties_vs_reference": missing_properties,
+        "reference_evidence_count": reference_profile["evidence_count"],
+        "target_evidence_count": target_profile["evidence_count"],
+        "issue_count": len(issues),
+        "issues": issues,
+    }
+
+
+def command_reference_check(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    if not args.reference_page_id:
+        raise NotionError("reference-check requires a reference page id")
+    if args.all:
+        pages = query_database_pages(client, wiki_database_id, None, page_size=20, max_pages=5)
+        pages = pages[: args.limit] if args.limit else pages
+        results: List[Dict[str, Any]] = []
+        for page in pages:
+            pid = page.get("id")
+            if not pid or normalize_notion_id(pid) == normalize_notion_id(args.reference_page_id):
+                continue
+            results.append(
+                compare_page_to_reference(client, wiki_database_id, mapping, args.reference_page_id, pid)
+            )
+        summary = {
+            "reference_page_id": args.reference_page_id,
+            "scope": "all",
+            "checked_count": len(results),
+            "green": sum(1 for r in results if r["conformance"] == "green"),
+            "yellow": sum(1 for r in results if r["conformance"] == "yellow"),
+            "red": sum(1 for r in results if r["conformance"] == "red"),
+            "results": results,
+        }
+        print(json.dumps(audit_success("reference-check", summary), ensure_ascii=False, indent=2))
+        return 0 if all(r["conformance"] == "green" for r in results) else 1
+    if not args.target_page_id:
+        raise NotionError("reference-check requires <target_page_id> or --all")
+    result = compare_page_to_reference(client, wiki_database_id, mapping, args.reference_page_id, args.target_page_id)
+    print(json.dumps(audit_success("reference-check", result), ensure_ascii=False, indent=2))
+    return 0 if result["conformance"] == "green" else 1
+
+
+def build_placeholder_blocks(concept_label: str, source_title: str, source_page_id: str) -> List[Dict[str, Any]]:
+    marker_para = (
+        f"{PLACEHOLDER_MARKER} 此页面由 seed-related-pages 从源页 "
+        f"{source_title!r}（`{source_page_id}`）自动创建，等会话层精修为真实永久笔记。"
+    )
+    return [
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value(marker_para)},
+        },
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": rich_text_value("定义")},
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value(f"TBD：需会话层填入 {concept_label} 的定义。")},
+        },
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": rich_text_value("核心判断")},
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value("TBD：需会话层填入。")},
+        },
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": rich_text_value("关联概念")},
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value(f"源页：{source_title}（`{source_page_id}`）。其他关联由会话层补充。")},
+        },
+        {
+            "object": "block",
+            "type": "heading_2",
+            "heading_2": {"rich_text": rich_text_value("原文证据")},
+        },
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value("TBD：需会话层从源页或其他资料摘取 ≤ 4 条高价值引文。")},
+        },
+    ]
+
+
+def command_seed_related_pages(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    source_page_id = args.source_page_id
+    database = client.retrieve_database(wiki_database_id)
+    props_meta = database.get("properties", {})
+    title_prop = mapping.get("title_property") or detect_title_property(database)
+    title_prop_type = props_meta.get(title_prop, {}).get("type", "title") if title_prop else "title"
+    aliases_prop = mapping.get("aliases_property")
+    aliases_prop_type = props_meta.get(aliases_prop, {}).get("type") if aliases_prop and aliases_prop in props_meta else None
+    verification_prop = mapping.get("verification_property")
+
+    source_page = client.retrieve_page(source_page_id)
+    source_title = extract_title(source_page, title_prop) if title_prop else ""
+    if not source_title:
+        raise NotionError(f"source page {source_page_id!r} has no title under property {title_prop!r}")
+    source_body = read_page_body_text(client, source_page_id)
+    inferred_concepts = infer_related_concepts(source_title, source_body)
+
+    existing: List[Dict[str, Any]] = []
+    created: List[Dict[str, Any]] = []
+    skipped_as_source: List[str] = []
+    for concept in inferred_concepts:
+        if normalize(concept) == normalize(source_title):
+            skipped_as_source.append(concept)
+            continue
+        candidates = search_in_database(
+            client,
+            wiki_database_id,
+            concept,
+            title_prop,
+            title_prop_type,
+            aliases_prop,
+            aliases_prop_type,
+        )
+        exact_hit: Optional[Dict[str, Any]] = None
+        for page in candidates:
+            if normalize(extract_title(page, title_prop)) == normalize(concept):
+                exact_hit = page
+                break
+        if exact_hit:
+            existing.append({
+                "concept": concept,
+                "page_id": exact_hit.get("id"),
+                "title": extract_title(exact_hit, title_prop),
+            })
+            continue
+        if getattr(args, "dry_run", False):
+            created.append({"concept": concept, "page_id": None, "dry_run": True})
+            continue
+        props: Dict[str, Any] = {title_prop: title_property_payload(concept)}
+        if verification_prop and verification_prop in props_meta:
+            vmeta = props_meta[verification_prop]
+            try:
+                props[verification_prop] = property_payload_for_value(vmeta, "Needs Review")
+            except NotionError:
+                pass
+        new_page = client.create_page({
+            "parent": {"database_id": wiki_database_id},
+            "properties": props,
+            "children": build_placeholder_blocks(concept, source_title, source_page_id),
+        })
+        created.append({"concept": concept, "page_id": new_page.get("id"), "title": concept})
+
+    payload = {
+        "source_page_id": source_page_id,
+        "source_title": source_title,
+        "dry_run": getattr(args, "dry_run", False),
+        "inferred_concept_count": len(inferred_concepts),
+        "inferred_concepts": inferred_concepts,
+        "existing_concept_pages": existing,
+        "created_placeholder_pages": created,
+        "skipped_self_reference": skipped_as_source,
+    }
+    print(json.dumps(audit_success("seed-related-pages", payload), ensure_ascii=False, indent=2))
+    return 0
 
 
 def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) -> int:
@@ -2378,6 +2676,16 @@ def build_parser() -> argparse.ArgumentParser:
     consolidate_parser.add_argument("--keep", type=int, default=4, help="Number of evidence items to keep (default: 4 per EDITORIAL_POLICY)")
     consolidate_parser.add_argument("--dry-run", action="store_true")
 
+    reference_parser = subparsers.add_parser("reference-check")
+    reference_parser.add_argument("reference_page_id", help="Wiki page acting as exemplar (e.g., QueryLoop once refined to green)")
+    reference_parser.add_argument("target_page_id", nargs="?", default="", help="Page to compare to reference; omit when using --all")
+    reference_parser.add_argument("--all", action="store_true", help="Compare every page in the Wiki database (excluding reference itself)")
+    reference_parser.add_argument("--limit", type=int, default=50)
+
+    seed_parser = subparsers.add_parser("seed-related-pages")
+    seed_parser.add_argument("source_page_id", help="Source wiki page whose inferred related concepts seed placeholder pages")
+    seed_parser.add_argument("--dry-run", action="store_true", help="List would-be-created concepts without calling Notion create API")
+
     lint_parser = subparsers.add_parser("lint")
     lint_parser.add_argument("--title-property")
     lint_parser.add_argument("--verification-property")
@@ -2428,6 +2736,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_check_editorial(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "consolidate-evidence":
         return command_consolidate_evidence(client, args)
+    if args.command == "reference-check":
+        return command_reference_check(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "seed-related-pages":
+        return command_seed_related_pages(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "lint":
         return command_lint(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     parser.error(f"Unknown command: {args.command}")
