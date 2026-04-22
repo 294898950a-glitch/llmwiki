@@ -20,13 +20,21 @@
   - [`DESIGN_REVIEW.md`](./DESIGN_REVIEW.md)
 - README 评审记录已建立：
   - [`README_REVIEW.md`](./README_REVIEW.md)
-- 最小脚本骨架已落地：
+- Notion API 执行层脚本已落地（9 个子命令）：
   - [`scripts/notion_wiki_compiler.py`](./scripts/notion_wiki_compiler.py)
 - 字段映射模板已建立：
   - [`schema/notion_wiki_mapping.example.json`](./schema/notion_wiki_mapping.example.json)
+- 三份设计文档已分别定稿：
+  - [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)：LLM 抽取归属 + 会话层留痕约定
+  - [`MERGE_STRATEGY.md`](./MERGE_STRATEGY.md)：候选排序 / 冲突分级 / 合并策略
+  - [`EDITORIAL_POLICY.md`](./EDITORIAL_POLICY.md)：永久笔记结构 checklist
 - Raw / Wiki 两个 Notion 数据库的 schema 已完成首次探测
 - 第一次真实 `compile-from-raw` smoke test 已通过
-- `raw/notion_dumps/` 已开始落盘 schema 快照
+- `raw/notion_dumps/` 已开始落盘多类运行产物：
+  - `*-inspect-schema-<role>.json`（schema 快照，入库）
+  - `YYYY-MM-DD-audit-log.jsonl`（命令执行事件，本地）
+  - `YYYY-MM-DD-compile-log.jsonl`（compile 结构化结果，本地）
+  - `YYYY-MM-DD-session-log.jsonl`（会话层语义判断留痕，本地）
 
 当前脚本支持的命令：
 
@@ -219,7 +227,7 @@
 
 ## 当前限制
 
-这还是第一版骨架，下面这些能力还没有完成：
+当前闭环已跑通，下列能力仍未到位：
 
 - 还没有真正的 LLM 抽取：
   - 实体识别
@@ -273,23 +281,25 @@
 
 本项目已经在 git 仓库中，应继续做版本控制。
 
-当前建议：
+当前分工（基于多模型协作）：
 
-- 所有设计变更先更新：
-  - `CLAUDE.md`
-  - `DESIGN_REVIEW.md`
-  - `README.MD`
-- 所有脚本变更同步更新：
-  - `scripts/`
-  - `schema/`
-- 每完成一个清晰阶段就提交一次，不要把多类改动混成一个大 commit。
+- **Claude Opus 4.7 维护**：`README.MD` / `CLAUDE.md` / `scripts/` / `schema/` / `LLM_EXTRACTION_DESIGN.md` / `MERGE_STRATEGY.md` / `EDITORIAL_POLICY.md`
+- **GPT-5 Codex 维护**：`README_REVIEW.md` / `DESIGN_REVIEW.md` 两份评审文档
+- `CLAUDE.md` 每次实质性修改要 bump 版本号（日期.rN），便于 review 锚定
 
-推荐 commit 粒度：
+提交约定：
 
-- `docs: update notion dual-db architecture`
-- `feat: add compile-from-raw command`
-- `feat: add raw status writeback`
-- `refactor: split raw and wiki env config`
+- 每完成一个清晰阶段就提交一次，不要把多类改动混成一个大 commit
+- 代码改动和文档同步分开提交，review 文档独立提交
+
+近期真实 commit 示例（2026-04-22 窗口内）：
+
+- `feat(compile): fuzzy tier 4 + --filter + --emit-diff + body_text snapshot`
+- `feat(lint): add check-editorial subcommand for EDITORIAL_POLICY checklist`
+- `fix(extract): cover multi_select / number / checkbox / date / ... in extract_property_text`
+- `docs(editorial): define permanent note structure checklist`
+- `docs(llm-design): add session-layer audit trail convention`
+- `docs(review): add README_REVIEW v14`
 
 敏感信息约束：
 
