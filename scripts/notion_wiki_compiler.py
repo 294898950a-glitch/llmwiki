@@ -21,6 +21,21 @@ DEFAULT_MAX_QUERY_PAGES = 25
 DEEPSEEK_ENDPOINT = "https://api.deepseek.com/v1/chat/completions"
 DEFAULT_DEEPSEEK_MODEL = "deepseek-reasoner"
 
+LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
+    "deepseek": {
+        "endpoint": "https://api.deepseek.com/v1/chat/completions",
+        "default_model": "deepseek-reasoner",
+        "env_key": "DEEPSEEK_API_KEY",
+        "env_key_file": "DEEPSEEK_API_KEY_FILE",
+    },
+    "kimi": {
+        "endpoint": "https://api.moonshot.cn/v1/chat/completions",
+        "default_model": "kimi-latest",
+        "env_key": "KIMI_API_KEY",
+        "env_key_file": "KIMI_API_KEY_FILE",
+    },
+}
+
 
 class NotionError(RuntimeError):
     pass
@@ -114,10 +129,12 @@ class NotionClient:
         return self.request("PATCH", f"blocks/{block_id}", payload)
 
 
-class DeepSeekClient:
-    def __init__(self, api_key: str, model: str = DEFAULT_DEEPSEEK_MODEL):
+class LLMClient:
+    def __init__(self, api_key: str, endpoint: str, model: str, provider: str = "deepseek"):
         self.api_key = api_key
+        self.endpoint = endpoint
         self.model = model
+        self.provider = provider
 
     def chat(
         self,
@@ -141,7 +158,7 @@ class DeepSeekClient:
             "Content-Type": "application/json",
         }
         request = urllib.request.Request(
-            DEEPSEEK_ENDPOINT,
+            self.endpoint,
             data=body,
             method="POST",
             headers=headers,
@@ -151,24 +168,48 @@ class DeepSeekClient:
                 return json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace")
-            raise NotionError(f"DeepSeek HTTP {exc.code}: {detail}") from exc
+            raise NotionError(f"{self.provider} HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
-            raise NotionError(f"DeepSeek network error: {exc}") from exc
+            raise NotionError(f"{self.provider} network error: {exc}") from exc
 
 
-def resolve_deepseek_key(env: Dict[str, str]) -> str:
-    key = env.get("DEEPSEEK_API_KEY", "").strip()
+# Backwards compat alias
+DeepSeekClient = LLMClient
+
+
+def resolve_llm_key(env: Dict[str, str], provider: str) -> str:
+    cfg = LLM_PROVIDERS.get(provider)
+    if not cfg:
+        raise NotionError(f"unknown provider {provider!r}; choose from {sorted(LLM_PROVIDERS)}")
+    key = env.get(cfg["env_key"], "").strip()
     if key:
         return key
-    key_file = env.get("DEEPSEEK_API_KEY_FILE", "").strip()
+    key_file = env.get(cfg["env_key_file"], "").strip()
     if key_file:
         path = Path(key_file)
         if not path.exists():
-            raise NotionError(f"DEEPSEEK_API_KEY_FILE points to missing path: {path}")
+            raise NotionError(f"{cfg['env_key_file']} points to missing path: {path}")
         return path.read_text(encoding="utf-8").strip()
     raise NotionError(
-        "Set DEEPSEEK_API_KEY or DEEPSEEK_API_KEY_FILE in .env to use llm-refine"
+        f"Set {cfg['env_key']} or {cfg['env_key_file']} in .env to use provider {provider!r}"
     )
+
+
+def build_llm_client(env: Dict[str, str], provider: str, model_override: Optional[str] = None) -> LLMClient:
+    cfg = LLM_PROVIDERS.get(provider)
+    if not cfg:
+        raise NotionError(f"unknown provider {provider!r}")
+    return LLMClient(
+        api_key=resolve_llm_key(env, provider),
+        endpoint=cfg["endpoint"],
+        model=model_override or cfg["default_model"],
+        provider=provider,
+    )
+
+
+def resolve_deepseek_key(env: Dict[str, str]) -> str:
+    """Backwards compat shim."""
+    return resolve_llm_key(env, "deepseek")
 
 
 def require_env(env: Dict[str, str], key: str) -> str:
@@ -3779,7 +3820,8 @@ def build_parser() -> argparse.ArgumentParser:
     llm_page_parser.add_argument("--source-page-id")
     llm_page_parser.add_argument("--style-from-page-id")
     llm_page_parser.add_argument("--style-note", default="")
-    llm_page_parser.add_argument("--model", default=DEFAULT_DEEPSEEK_MODEL)
+    llm_page_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek")
+    llm_page_parser.add_argument("--model", default="", help="Model override; default uses provider's default_model")
     llm_page_parser.add_argument("--max-tokens", type=int, default=16000)
     llm_page_parser.add_argument("--temperature", type=float, default=0.4)
     llm_page_parser.add_argument("--mention-map")
@@ -3793,7 +3835,8 @@ def build_parser() -> argparse.ArgumentParser:
     llm_parser.add_argument("--extra-instruction", default="", help="Optional extra instruction appended to the prompt")
     llm_parser.add_argument("--style-from-page-id", help="Wiki page id whose 定义 / 核心判断 / 关联概念 sections are fed as few-shot style samples")
     llm_parser.add_argument("--style-note", default="", help="Inline style guidance appended to system prompt (禁令 / 倾向 / 读者层次描述)")
-    llm_parser.add_argument("--model", default=DEFAULT_DEEPSEEK_MODEL, help="DeepSeek model (default: deepseek-reasoner)")
+    llm_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek", help="LLM provider (default: deepseek)")
+    llm_parser.add_argument("--model", default="", help="Model override; default uses provider's default_model")
     llm_parser.add_argument("--max-tokens", type=int, default=10000)
     llm_parser.add_argument("--temperature", type=float, default=0.4)
     llm_parser.add_argument("--mention-map", help="Apply LABEL=page_id mentions to the generated body")
@@ -3881,19 +3924,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "link-concepts-in-page":
         return command_link_concepts_in_page(client, args)
     if args.command == "llm-refine":
-        deepseek = DeepSeekClient(resolve_deepseek_key(env), model=args.model)
+        llm = build_llm_client(env, args.provider, args.model or None)
         return command_llm_refine(
             client,
-            deepseek,
+            llm,
             require_env(env, "NOTION_WIKI_DB_ID"),
             mapping,
             args,
         )
     if args.command == "llm-refine-page":
-        deepseek = DeepSeekClient(resolve_deepseek_key(env), model=args.model)
+        llm = build_llm_client(env, args.provider, args.model or None)
         return command_llm_refine_page(
             client,
-            deepseek,
+            llm,
             require_env(env, "NOTION_WIKI_DB_ID"),
             mapping,
             args,
