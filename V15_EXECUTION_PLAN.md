@@ -48,7 +48,13 @@ v15 §8.1 要求"收缩对当前状态的宣传，避免把 alpha 说成成熟 w
 - [x] **文档侧**（我）：
   - `EDITORIAL_POLICY.md` "占位页豁免"段：`check-editorial` 识别 `<placeholder>` → `compliance: placeholder`
   - `CLAUDE.md` / `README.MD` 脚本清单补 `seed-related-pages`
-- [ ] **会话层剩余**：跑过 `seed-related-pages <QueryLoop_id>` 后，会话层逐一把占位页精修为真实永久笔记；决策走 `log-session-event`。
+- [x] **概念图谱的结构 + 表达双实现**（2026-04-22 补做）：
+  - 用户指出原先 seed 产物只是文字、无 Notion 链接 → 概念图谱数据层为零
+  - 新增 `Related Pages` self-referencing relation 属性（`ensure_related_pages_property` 程序化创建）
+  - 新增 `link-pages` 子命令维护 relation；`seed-related-pages` 自动回指 source
+  - `rewrite-section --mention-map LABEL=ID` 支持正文 page mention
+  - 给现有 7 个 wiki 页设全 Related Pages；QueryLoop / QueryEngine 的「关联概念」段重写为 mention
+- [ ] **会话层剩余**：跑过 `seed-related-pages <QueryLoop_id>` 后，会话层逐一把占位页精修为真实永久笔记；决策走 `log-session-event`。当前 QueryEngine 已精修至 green，剩 Agent Runtime / State Management / Context Governance / Recovery Logic / Interrupt Handling 五页待精修。
 
 ### 1.3 "更新已有知识对象"做稳（重写摘要 / 合并证据 / 处理冲突）
 

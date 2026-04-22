@@ -50,7 +50,9 @@
 - `check-editorial [<page_id>] [--all --limit N]` ——按 `EDITORIAL_POLICY.md` 的 checklist 机器化评估 wiki 页的永久笔记达标度，返回 green/yellow/red 分级
 - `consolidate-evidence <page_id> [--heading <text>] [--keep N] [--dry-run]` ——把指定 heading（默认"原文证据"）下的证据条数截到 `--keep` 以内
 - `reference-check <reference_page_id> [<target_page_id>] [--all --limit N]` ——以样板页（如 QueryLoop）为基准，比对其他 wiki 页的结构（heading / 属性 / 证据数），输出 conformance 分级
-- `seed-related-pages <source_page_id> [--dry-run]` ——从 source 页的 `infer_related_concepts` 输出中，对未在 Wiki 存在的概念创建占位页（`<placeholder>` marker + `Verification = Needs Review`），等会话层精修
+- `seed-related-pages <source_page_id> [--dry-run]` ——从 source 页的 `infer_related_concepts` 输出中，对未在 Wiki 存在的概念创建占位页（`<placeholder>` marker + `Verification = Needs Review` + `Related Pages` 回指 source）
+- `rewrite-section <page_id> --heading <text> --body <text> [--mention-map LABEL=ID,...] [--promote]` ——会话层精修入口；替换指定 heading 下的 body；`--mention-map` 把 literal label 转成 Notion page mention（可点击跳转）
+- `link-pages <page_id> --add ID --remove ID [--ensure-property]` ——维护 wiki-to-wiki 的 `Related Pages` relation；`--ensure-property` 可程序化创建该属性
 - `lint`
 
 当前已确认的数据库结构：
@@ -129,7 +131,11 @@
   - `replace`：与 `--replace-heading <text>` 配合；找到指定 heading，删该 heading 下的原 body block，append 新的 raw 正文段落
 - `consolidate-evidence <page_id>`：对"原文证据"（或指定 heading）下的证据 block 做截断，默认保留前 4 条以对齐 EDITORIAL_POLICY 上限；支持 `--dry-run`
 - `reference-check`：以样板页（QueryLoop 等）为基准做 page 级一致性比对；支持 `--all` 扫全库；比 `check-editorial` 多了"与样板对标"维度
-- `seed-related-pages`：从 source 页的 infer_related_concepts 输出，对 Wiki 缺失的概念建占位页（`<placeholder>` + `Verification = Needs Review` + 四段 heading 骨架）；会话层后续精修
+- `seed-related-pages`：从 source 页的 infer_related_concepts 输出，对 Wiki 缺失的概念建占位页（`<placeholder>` + `Verification = Needs Review` + 四段 heading 骨架 + `Related Pages` 回指 source）；会话层后续精修
+- **概念图谱双实现**：
+  - 结构层：Wiki DB 的 `Related Pages` self-referencing relation（`link-pages` 维护，`seed-related-pages` 自动设置；`ensure_related_pages_property` 可程序化创建此属性）
+  - 表达层：正文 page mention（`rewrite-section --mention-map LABEL=ID`，literal label 替换为 `{type:mention, page:id}` rich_text chunk，渲染为可点击链接）
+  - 两者互补：relation 支持过滤/反查，mention 支持正文里的内联跳转
 - `check-editorial` 按 `EDITORIAL_POLICY.md` 的 checklist 对 wiki 页做机器化评估：
   - 检查必填属性（Canonical ID / Verification / Compounded Level / Last Compounded At）
   - 检查 title 是否已收束（无"第N章"前缀、无冒号切分残留）

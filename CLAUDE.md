@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-22.r9
+> **Version**: 2026-04-22.r10
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -198,7 +198,7 @@ llmwiki/
 
 ## 当前可用脚本
 
-`scripts/notion_wiki_compiler.py` 提供 12 个子命令：
+`scripts/notion_wiki_compiler.py` 提供 14 个子命令：
 
 - `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
 - `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
@@ -210,7 +210,9 @@ llmwiki/
 - `check-editorial [<page_id>] [--all --limit N]`：按 `EDITORIAL_POLICY.md` checklist 机器化评估 wiki 页永久笔记达标度，返回 green/yellow/red
 - `consolidate-evidence <page_id> [--heading <text>] [--keep N] [--dry-run]`：对指定 heading（默认"原文证据"）下的证据 block 做截断（默认保留前 4 条，对齐 EDITORIAL_POLICY）
 - `reference-check <reference_page_id> [<target_page_id>] [--all --limit N]`：以 reference 页（如 QueryLoop 样板）为基准比对其他页的结构 / 属性 / 证据数，输出 conformance green/yellow/red + 差距清单
-- `seed-related-pages <source_page_id> [--dry-run]`：读取 source 页的 `infer_related_concepts` 命中（硬编码 topic map），对未在 Wiki 中存在的概念建占位页（带 `<placeholder>` marker / `Verification = Needs Review`），等会话层精修
+- `seed-related-pages <source_page_id> [--dry-run]`：读取 source 页的 `infer_related_concepts` 命中（硬编码 topic map），对未在 Wiki 中存在的概念建占位页（带 `<placeholder>` marker / `Verification = Needs Review` / `Related Pages` 回指 source），等会话层精修
+- `rewrite-section <page_id> --heading <text> --body <text> [--mention-map LABEL=ID,...] [--promote] [--dry-run]`：替换指定 heading 下的 body block；`--mention-map` 会把正文里的 literal label 转成 Notion page mention（可点击跳转）；`--promote` 去掉 `<placeholder>` marker
+- `link-pages <page_id> --add ID --remove ID [--ensure-property] [--dry-run]`：维护 Wiki 页的 `Related Pages` self-referencing relation；`--ensure-property` 若 Wiki DB 尚无该属性则程序化创建
 - `lint`：按 `Verification` 列出 Expired / Needs Review 的 Wiki 页
 
 所有子命令均写 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`（含 error 记录）。

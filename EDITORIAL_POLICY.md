@@ -29,8 +29,9 @@
    - 这条笔记想留下的最重要结论
    - 必须是陈述性命题，不是问题或未决事项
 3. **关联概念**
-   - 与该对象在同一概念空间的其他 Wiki 页，最好以 Notion internal link 形式插入
-   - 若不存在对应 Wiki 页，用 Canonical ID 或主题名占位
+   - 与该对象在同一概念空间的其他 Wiki 页，**必须**同时以 Notion page mention（正文内联 `{type:mention, page:id}`）和 `Related Pages` relation 属性的形式建立链接
+   - 脚本支持：`rewrite-section --mention-map LABEL=ID` 产出 mention，`link-pages --add ID` 设置 relation
+   - 若对应 Wiki 页尚不存在，先用 `seed-related-pages` 建占位页，再在此段引用；不要只写纯文本概念名
 4. **原文证据**
    - 不超过 4 条来自原始材料的关键引文
    - 每条附 source URL 或 raw page id
