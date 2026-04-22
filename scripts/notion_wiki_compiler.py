@@ -369,6 +369,34 @@ def read_page_body_text(client: NotionClient, page_id: str) -> str:
     return "\n\n".join(flatten_block_texts(client, page_id)).strip()
 
 
+def find_section_body(
+    blocks: List[Dict[str, Any]],
+    heading_text: str,
+) -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Locate a top-level heading_2 or heading_3 by text and return (heading_block, body_blocks).
+
+    body_blocks are all subsequent top-level blocks until the next heading_2 or heading_3
+    (whichever comes first), or end of blocks. Returns (None, []) if not found.
+    """
+    normalized_target = normalize(heading_text)
+    heading_block: Optional[Dict[str, Any]] = None
+    body: List[Dict[str, Any]] = []
+    collecting = False
+    for block in blocks:
+        btype = block.get("type")
+        if btype in ("heading_2", "heading_3"):
+            text = rich_text_plain_text(block.get(btype, {}).get("rich_text", []))
+            if collecting:
+                break
+            if normalize(text) == normalized_target:
+                heading_block = block
+                collecting = True
+                continue
+        elif collecting:
+            body.append(block)
+    return heading_block, body
+
+
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
@@ -463,6 +491,7 @@ def detect_command_name(argv: List[str]) -> str:
         "log-session-event",
         "cleanup-wiki-page",
         "check-editorial",
+        "consolidate-evidence",
     }
     for token in argv:
         if token in known_commands:
@@ -1088,13 +1117,20 @@ def resolve_title_property_name(database: Dict[str, Any], mapping: Dict[str, Any
     return title_prop
 
 
-def upsert_note_to_wiki(
+def find_upsert_target(
     client: NotionClient,
+    database: Dict[str, Any],
     database_id: str,
     mapping: Dict[str, Any],
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
-    database = client.retrieve_database(database_id)
+    """Resolve which wiki page args.title / args.canonical_id should land on.
+
+    Returns a dict with exact_match, match_strategy, candidates,
+    fuzzy_candidate_ids, title_prop / title_prop_type. Raises NotionError
+    on --strict-alias / --strict-fuzzy / multi-candidate violations.
+    Does not write to Notion.
+    """
     title_prop = resolve_title_property_name(database, mapping, args.title_property)
     title_prop_type = database.get("properties", {}).get(title_prop, {}).get("type", "title")
     aliases_prop = mapping.get("aliases_property")
@@ -1200,6 +1236,29 @@ def upsert_note_to_wiki(
                 "proceeding to create new page. Use --strict-fuzzy to hard-stop.",
                 file=sys.stderr,
             )
+
+    return {
+        "exact_match": exact_match,
+        "match_strategy": match_strategy,
+        "candidates": candidates,
+        "fuzzy_candidate_ids": fuzzy_candidate_ids,
+        "title_prop": title_prop,
+        "title_prop_type": title_prop_type,
+    }
+
+
+def upsert_note_to_wiki(
+    client: NotionClient,
+    database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    database = client.retrieve_database(database_id)
+    target = find_upsert_target(client, database, database_id, mapping, args)
+    exact_match = target["exact_match"]
+    match_strategy = target["match_strategy"]
+    candidates = target["candidates"]
+    fuzzy_candidate_ids = target["fuzzy_candidate_ids"]
 
     append_heading = args.append_heading or mapping.get("append_heading", "增量更新")
     if exact_match:
@@ -1432,6 +1491,123 @@ def compile_raw_page(
         strict_alias=getattr(args, "strict_alias", False),
         strict_fuzzy=getattr(args, "strict_fuzzy", False),
     )
+
+    merge_mode = getattr(args, "merge_mode", "append")
+    if merge_mode not in {"append", "propose", "replace"}:
+        raise NotionError(f"--merge-mode must be append|propose|replace, got {merge_mode!r}")
+
+    if merge_mode == "propose":
+        wiki_database = client.retrieve_database(wiki_database_id)
+        target = find_upsert_target(client, wiki_database, wiki_database_id, mapping, upsert_args)
+        append_heading = upsert_args.append_heading or mapping.get("append_heading", "增量更新")
+        proposed_blocks = build_append_blocks(note, append_heading, source_url)
+        existing_body = ""
+        existing_body_hash: Optional[str] = None
+        if target["exact_match"]:
+            existing_body = read_page_body_text(client, target["exact_match"]["id"])
+            existing_body_hash = sha256_text(existing_body) if existing_body else None
+        return {
+            "timestamp": iso_now(),
+            "action": "proposed",
+            "raw_page_id": raw_page_id,
+            "raw_title": title,
+            "body_hash": body_hash,
+            "body_text": truncate_body_text(note),
+            "source_url": source_url,
+            "target": {
+                "exact_match_page_id": target["exact_match"]["id"] if target["exact_match"] else None,
+                "match_strategy": target["match_strategy"],
+                "fuzzy_candidate_ids": target["fuzzy_candidate_ids"],
+                "existing_body_hash": existing_body_hash,
+                "existing_body_excerpt": truncate_body_text(existing_body, 2000) if existing_body else "",
+            },
+            "proposed_append_block_count": len(proposed_blocks),
+            "proposed_append_heading": append_heading,
+            "raw_updates": [],
+            "warnings": ["merge-mode=propose: no writes performed; rerun without --merge-mode=propose to commit"],
+        }
+
+    if merge_mode == "replace":
+        replace_heading = getattr(args, "replace_heading", None)
+        if not replace_heading:
+            raise NotionError("--merge-mode=replace requires --replace-heading <heading_text>")
+        wiki_database = client.retrieve_database(wiki_database_id)
+        target = find_upsert_target(client, wiki_database, wiki_database_id, mapping, upsert_args)
+        if not target["exact_match"]:
+            raise NotionError("--merge-mode=replace requires an existing wiki page match; none found")
+        wiki_page_id = target["exact_match"]["id"]
+        top_blocks = iterate_block_children(client, wiki_page_id)
+        heading_block, section_body = find_section_body(top_blocks, replace_heading)
+        if heading_block is None:
+            raise NotionError(
+                f"Heading {replace_heading!r} not found on wiki page {wiki_page_id!r}"
+            )
+        deleted_ids: List[str] = []
+        for b in section_body:
+            bid = b.get("id")
+            if not bid:
+                continue
+            try:
+                client.delete_block(bid)
+                deleted_ids.append(bid)
+            except NotionError as exc:
+                print(f"WARN: failed to delete block {bid}: {exc}", file=sys.stderr)
+        new_blocks: List[Dict[str, Any]] = []
+        for chunk in chunk_text(note):
+            new_blocks.append(
+                {
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": rich_text_value(chunk)},
+                }
+            )
+        if source_url:
+            new_blocks.append(
+                {
+                    "object": "block",
+                    "type": "bookmark",
+                    "bookmark": {"url": source_url},
+                }
+            )
+        client.append_block_children(heading_block["id"], new_blocks)
+
+        raw_props_meta = raw_database.get("properties", {})
+        raw_updates: Dict[str, Any] = {}
+        status_prop_name = args.raw_status_property or mapping.get("raw_status_property")
+        processed_at_prop_name = args.raw_processed_at_property or mapping.get("raw_processed_at_property")
+        target_prop_name = args.raw_target_wiki_page_property or mapping.get("raw_target_wiki_page_property")
+        compiled_status = args.raw_compiled_status or mapping.get("raw_compiled_status", "Compiled")
+        if status_prop_name and status_prop_name in raw_props_meta:
+            raw_updates[status_prop_name] = property_payload_for_value(raw_props_meta[status_prop_name], compiled_status)
+        if processed_at_prop_name and processed_at_prop_name in raw_props_meta:
+            raw_updates[processed_at_prop_name] = property_payload_for_value(raw_props_meta[processed_at_prop_name], today_iso_date())
+        if target_prop_name and target_prop_name in raw_props_meta:
+            target_meta = raw_props_meta[target_prop_name]
+            if target_meta.get("type") == "relation" and relation_targets_database(target_meta, wiki_database_id):
+                raw_updates[target_prop_name] = property_payload_for_value(target_meta, [wiki_page_id])
+        if raw_updates:
+            client.update_page(raw_page_id, {"properties": raw_updates})
+
+        return {
+            "timestamp": iso_now(),
+            "action": "section_replaced",
+            "raw_page_id": raw_page_id,
+            "raw_title": title,
+            "body_hash": body_hash,
+            "body_text": truncate_body_text(note),
+            "source_url": source_url,
+            "wiki": {
+                "page_id": wiki_page_id,
+                "replaced_heading": replace_heading,
+                "deleted_block_count": len(deleted_ids),
+                "deleted_block_ids": deleted_ids,
+                "new_block_count": len(new_blocks),
+                "match_strategy": target["match_strategy"],
+            },
+            "raw_updates": list(raw_updates.keys()),
+        }
+
+    # Default: merge_mode == "append"
     wiki_result = upsert_note_to_wiki(client, wiki_database_id, mapping, upsert_args)
 
     raw_props_meta = raw_database.get("properties", {})
@@ -1936,6 +2112,59 @@ def check_editorial_compliance(
     }
 
 
+def command_consolidate_evidence(client: NotionClient, args: argparse.Namespace) -> int:
+    page_id = args.page_id
+    keep = max(1, int(args.keep))
+    heading_text = args.heading or "原文证据"
+    top_blocks = iterate_block_children(client, page_id)
+    heading_block, section_body = find_section_body(top_blocks, heading_text)
+    if heading_block is None:
+        payload = {
+            "wiki_page_id": page_id,
+            "heading": heading_text,
+            "action": "skipped",
+            "reason": "heading_not_found",
+        }
+        print(json.dumps(audit_success("consolidate-evidence", payload), ensure_ascii=False, indent=2))
+        return 0
+
+    kept_block_ids: List[str] = []
+    removed_block_ids: List[str] = []
+    evidence_seen = 0
+    for block in section_body:
+        btype = block.get("type")
+        if btype in ("quote", "bulleted_list_item", "paragraph"):
+            if not extract_block_text(block).strip():
+                continue
+            evidence_seen += 1
+            bid = block.get("id")
+            if not bid:
+                continue
+            if evidence_seen <= keep:
+                kept_block_ids.append(bid)
+            else:
+                if getattr(args, "dry_run", False):
+                    removed_block_ids.append(bid)
+                    continue
+                try:
+                    client.delete_block(bid)
+                    removed_block_ids.append(bid)
+                except NotionError as exc:
+                    print(f"WARN: failed to delete block {bid}: {exc}", file=sys.stderr)
+
+    payload = {
+        "wiki_page_id": page_id,
+        "heading": heading_text,
+        "keep": keep,
+        "evidence_seen": evidence_seen,
+        "kept_block_ids": kept_block_ids,
+        "removed_block_ids": removed_block_ids,
+        "dry_run": getattr(args, "dry_run", False),
+    }
+    print(json.dumps(audit_success("consolidate-evidence", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_check_editorial(
     client: NotionClient,
     wiki_database_id: str,
@@ -2071,6 +2300,9 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--strict-alias", action="store_true")
     compile_parser.add_argument("--strict-fuzzy", action="store_true")
     compile_parser.add_argument("--emit-diff", action="store_true")
+    compile_parser.add_argument("--merge-mode", choices=["append", "propose", "replace"], default="append",
+                                help="append: default, append 增量更新 block; propose: readonly preview; replace: replace content under --replace-heading")
+    compile_parser.add_argument("--replace-heading", help="heading text to replace content under (only used with --merge-mode=replace)")
 
     queue_parser = subparsers.add_parser("compile-queue")
     queue_parser.add_argument("--status", default="Not started")
@@ -2099,6 +2331,8 @@ def build_parser() -> argparse.ArgumentParser:
     queue_parser.add_argument("--emit-diff", action="store_true")
     queue_parser.add_argument("--retry-failed", action="store_true")
     queue_parser.add_argument("--filter", action="append", default=[], help="Repeatable; additional Raw Inbox filter as PROP=VALUE")
+    queue_parser.add_argument("--merge-mode", choices=["append", "propose", "replace"], default="append")
+    queue_parser.add_argument("--replace-heading", help="Only used with --merge-mode=replace")
 
     upsert_parser = subparsers.add_parser("upsert-note")
     upsert_parser.add_argument("--title", required=True)
@@ -2137,6 +2371,12 @@ def build_parser() -> argparse.ArgumentParser:
     check_parser.add_argument("page_id", nargs="?", default="", help="Wiki page id to check; omit when using --all")
     check_parser.add_argument("--all", action="store_true", help="Check every page in the Wiki database (bounded by --limit)")
     check_parser.add_argument("--limit", type=int, default=50, help="Max pages to inspect when --all is set")
+
+    consolidate_parser = subparsers.add_parser("consolidate-evidence")
+    consolidate_parser.add_argument("page_id")
+    consolidate_parser.add_argument("--heading", default="原文证据", help="Heading text to consolidate under (default: 原文证据)")
+    consolidate_parser.add_argument("--keep", type=int, default=4, help="Number of evidence items to keep (default: 4 per EDITORIAL_POLICY)")
+    consolidate_parser.add_argument("--dry-run", action="store_true")
 
     lint_parser = subparsers.add_parser("lint")
     lint_parser.add_argument("--title-property")
@@ -2186,6 +2426,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_cleanup_wiki_page(client, args)
     if args.command == "check-editorial":
         return command_check_editorial(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "consolidate-evidence":
+        return command_consolidate_evidence(client, args)
     if args.command == "lint":
         return command_lint(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     parser.error(f"Unknown command: {args.command}")
