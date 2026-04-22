@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-22.r6
+> **Version**: 2026-04-22.r7
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -11,11 +11,11 @@
 
 1. `raw/`：原始资料层。存放从 Notion Inbox、网页剪藏、PDF 或其他来源抓下来的只读快照，用于审计、追溯和重跑。
 2. `schema/` 与 `scripts/`：逻辑层。负责定义属性映射、判定规则、upsert 策略和 lint 规则。
-3. Notion Wiki：最终产物层。所有正式知识对象以 Wiki 数据库页面形式存在，支持 Verification、Relation、状态管理和后续协作。
+3. Notion Wiki：最终产物层。当前是 **alpha 编译器**，`raw → wiki` 写入链路已打通；"知识复利"仍是目标而非已达成的状态，单页质量、对象级 compounding、概念网络生长都依赖 Claude Code 会话层介入。完整路线图见 `V15_EXECUTION_PLAN.md`。
 
 ## 当前阶段
 
-**手动迭代期**。先把最小闭环跑通：`inspect-schema -> search -> decide -> upsert -> lint`。不要过早把字段、分类法或写作模板定死。每次运行前先观察真实数据库结构，再决定映射。
+**手动迭代期 + alpha**。最小闭环 `inspect-schema → search → compile-from-raw → check-editorial` 已跑通，但不等于系统成熟。不要过早把字段、分类法或写作模板定死；每次运行前先观察真实数据库结构，再决定映射。
 
 **核心原则**：你是 Wiki 维护者，不是笔记归档器。默认优先更新既有页面，而不是新建页面。只有在找不到可信候选页面时，才允许新建页面。
 
@@ -31,6 +31,7 @@ llmwiki/
 ├── EDITORIAL_POLICY.md              # 永久笔记结构 checklist 与脚本/会话分工
 ├── LLM_EXTRACTION_DESIGN.md         # LLM 抽取归属、执行策略、会话层留痕约定
 ├── MERGE_STRATEGY.md                # 候选排序、冲突分级与合并策略
+├── V15_EXECUTION_PLAN.md            # 基于 review v15 成熟度评估的四阶段执行方案
 ├── README.MD                        # 项目状态说明
 ├── README_REVIEW.md                 # README 与实际状态一致性评审
 ├── raw/

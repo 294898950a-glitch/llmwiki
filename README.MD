@@ -7,6 +7,8 @@
 
 本项目当前目标不是生成本地 Markdown Wiki，而是实现 `raw -> compile -> wiki -> raw 回写` 的最小闭环。
 
+> **当前定位**：本项目处于 **alpha** 阶段。`raw → wiki` 写入链路已打通，但"知识复利（compounding）"尚未稳定——单页质量依赖会话层 editorial、概念网络未成图、对象级幂等未做实。路线图与具体执行清单见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。不要把当前状态当成成熟 wiki。
+
 ## 当前状态
 
 截至 `2026-04-22`，项目已经完成：
@@ -319,6 +321,7 @@
 - [`EDITORIAL_POLICY.md`](./EDITORIAL_POLICY.md)：永久笔记结构与分工 checklist
 - [`LLM_EXTRACTION_DESIGN.md`](./LLM_EXTRACTION_DESIGN.md)：LLM 抽取归属、执行策略、会话层留痕约定
 - [`MERGE_STRATEGY.md`](./MERGE_STRATEGY.md)：候选排序、冲突处理与合并策略
+- [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)：基于 review v15 成熟度评估的四阶段执行方案
 - [`README.MD`](./README.MD)：项目状态说明
 - [`README_REVIEW.md`](./README_REVIEW.md)：README 与实际状态一致性评审
 - [`schema/notion_wiki_mapping.example.json`](./schema/notion_wiki_mapping.example.json)：字段映射模板
