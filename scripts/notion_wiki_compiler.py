@@ -30,9 +30,10 @@ LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
     },
     "kimi": {
         "endpoint": "https://api.moonshot.cn/v1/chat/completions",
-        "default_model": "kimi-latest",
+        "default_model": "kimi-k2.6",
         "env_key": "KIMI_API_KEY",
         "env_key_file": "KIMI_API_KEY_FILE",
+        "fixed_temperature": "1.0",
     },
 }
 
@@ -130,11 +131,12 @@ class NotionClient:
 
 
 class LLMClient:
-    def __init__(self, api_key: str, endpoint: str, model: str, provider: str = "deepseek"):
+    def __init__(self, api_key: str, endpoint: str, model: str, provider: str = "deepseek", fixed_temperature: Optional[float] = None):
         self.api_key = api_key
         self.endpoint = endpoint
         self.model = model
         self.provider = provider
+        self.fixed_temperature = fixed_temperature
 
     def chat(
         self,
@@ -143,10 +145,11 @@ class LLMClient:
         max_tokens: int = 10000,
         temperature: float = 0.4,
     ) -> Dict[str, Any]:
+        effective_temperature = self.fixed_temperature if self.fixed_temperature is not None else temperature
         payload = {
             "model": self.model,
             "max_tokens": max_tokens,
-            "temperature": temperature,
+            "temperature": effective_temperature,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -199,11 +202,14 @@ def build_llm_client(env: Dict[str, str], provider: str, model_override: Optiona
     cfg = LLM_PROVIDERS.get(provider)
     if not cfg:
         raise NotionError(f"unknown provider {provider!r}")
+    fixed_temp_raw = cfg.get("fixed_temperature")
+    fixed_temp = float(fixed_temp_raw) if fixed_temp_raw is not None else None
     return LLMClient(
         api_key=resolve_llm_key(env, provider),
         endpoint=cfg["endpoint"],
         model=model_override or cfg["default_model"],
         provider=provider,
+        fixed_temperature=fixed_temp,
     )
 
 
