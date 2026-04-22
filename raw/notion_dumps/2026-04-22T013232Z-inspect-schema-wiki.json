@@ -1,0 +1,15 @@
+{
+  "database_role": "wiki",
+  "database_id": "3486e2cd-6e4f-80a2-884a-ed978f8e81d6",
+  "title_property": "Name",
+  "properties": {
+    "Canonical ID": "unique_id",
+    "Source": "relation",
+    "Aliases": "rich_text",
+    "Last Compounded At": "date",
+    "Compounded Level": "number",
+    "Topic": "rich_text",
+    "Verification": "status",
+    "Name": "title"
+  }
+}

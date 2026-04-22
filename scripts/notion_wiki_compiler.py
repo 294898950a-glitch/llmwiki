@@ -381,6 +381,32 @@ def extract_heading_structure(blocks: List[Dict[str, Any]]) -> List[Tuple[str, s
     return out
 
 
+def normalize_heading_text(text: str) -> str:
+    """Strip trailing ISO date stamp (e.g. "结构化整理 2026-04-21" -> "结构化整理") and normalize spacing."""
+    if not text:
+        return ""
+    stripped = re.sub(r"\s*\d{4}-\d{2}-\d{2}\s*$", "", text).strip()
+    return stripped
+
+
+def conceptual_heading_set(blocks: List[Dict[str, Any]]) -> List[str]:
+    """Return deduped list of conceptual headings (heading_2 ∪ heading_3), date-stamps stripped."""
+    seen: set = set()
+    out: List[str] = []
+    for btype, text in extract_heading_structure(blocks):
+        if btype not in ("heading_2", "heading_3"):
+            continue
+        normalized = normalize_heading_text(text)
+        if not normalized:
+            continue
+        key = normalize(normalized)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(normalized)
+    return out
+
+
 PLACEHOLDER_MARKER = "<placeholder>"
 
 
@@ -2114,10 +2140,7 @@ def check_editorial_compliance(
         issues.append({"check": "title_contains_delimiter", "hint": "consider splitting before ：/:"})
 
     blocks = iterate_block_children(client, wiki_page_id)
-    heading_texts: List[str] = []
-    for b in blocks:
-        if b.get("type") == "heading_2":
-            heading_texts.append(rich_text_plain_text(b.get("heading_2", {}).get("rich_text", [])))
+    heading_texts = conceptual_heading_set(blocks)
     for required in REQUIRED_EDITORIAL_HEADINGS:
         if not any(required in h for h in heading_texts):
             issues.append({"check": "missing_heading", "heading": required})
@@ -2246,7 +2269,7 @@ def compare_page_to_reference(
         page = client.retrieve_page(page_id)
         blocks = iterate_block_children(client, page_id)
         headings = extract_heading_structure(blocks)
-        heading_2_set = [text for btype, text in headings if btype == "heading_2"]
+        conceptual = conceptual_heading_set(blocks)
         evidence_count = count_evidence_items(blocks)
         present_props = []
         for candidate_key in (
@@ -2267,7 +2290,7 @@ def compare_page_to_reference(
         return {
             "page_id": page_id,
             "title": extract_title(page, title_prop) if title_prop else "",
-            "heading_2_texts": heading_2_set,
+            "conceptual_headings": conceptual,
             "headings_all": headings,
             "evidence_count": evidence_count,
             "properties_filled": present_props,
@@ -2277,10 +2300,10 @@ def compare_page_to_reference(
     reference_profile = fetch_profile(reference_page_id)
     target_profile = fetch_profile(target_page_id)
 
-    ref_heading_set = set(reference_profile["heading_2_texts"])
-    target_heading_set = set(target_profile["heading_2_texts"])
-    missing_headings = sorted(ref_heading_set - target_heading_set)
-    extra_headings = sorted(target_heading_set - ref_heading_set)
+    ref_heading_set = {normalize(h): h for h in reference_profile["conceptual_headings"]}
+    target_heading_set = {normalize(h): h for h in target_profile["conceptual_headings"]}
+    missing_headings = sorted(ref_heading_set[k] for k in ref_heading_set.keys() - target_heading_set.keys())
+    extra_headings = sorted(target_heading_set[k] for k in target_heading_set.keys() - ref_heading_set.keys())
 
     ref_props = set(reference_profile["properties_filled"])
     target_props = set(target_profile["properties_filled"])
