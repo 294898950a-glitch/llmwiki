@@ -2300,6 +2300,18 @@ def compare_page_to_reference(
     reference_profile = fetch_profile(reference_page_id)
     target_profile = fetch_profile(target_page_id)
 
+    if target_profile["is_placeholder"]:
+        return {
+            "reference_page_id": reference_page_id,
+            "reference_title": reference_profile["title"],
+            "target_page_id": target_page_id,
+            "target_title": target_profile["title"],
+            "conformance": "placeholder",
+            "issue_count": 0,
+            "issues": [],
+            "note": "target is a placeholder page; exempt from reference comparison until session-layer editorial",
+        }
+
     ref_heading_set = {normalize(h): h for h in reference_profile["conceptual_headings"]}
     target_heading_set = {normalize(h): h for h in target_profile["conceptual_headings"]}
     missing_headings = sorted(ref_heading_set[k] for k in ref_heading_set.keys() - target_heading_set.keys())
@@ -2493,10 +2505,24 @@ def command_seed_related_pages(
         props: Dict[str, Any] = {title_prop: title_property_payload(concept)}
         if verification_prop and verification_prop in props_meta:
             vmeta = props_meta[verification_prop]
-            try:
-                props[verification_prop] = property_payload_for_value(vmeta, "Needs Review")
-            except NotionError:
-                pass
+            chosen_status = None
+            if vmeta.get("type") == "status":
+                existing_options = [
+                    opt.get("name")
+                    for opt in vmeta.get("status", {}).get("options", []) or []
+                    if opt.get("name")
+                ]
+                for candidate in ("Needs Review", "需要复核", "Unverified", "Pending", "To Review", "Draft"):
+                    if candidate in existing_options:
+                        chosen_status = candidate
+                        break
+            elif vmeta.get("type") in ("select", "rich_text"):
+                chosen_status = "Needs Review"
+            if chosen_status:
+                try:
+                    props[verification_prop] = property_payload_for_value(vmeta, chosen_status)
+                except NotionError:
+                    pass
         new_page = client.create_page({
             "parent": {"database_id": wiki_database_id},
             "properties": props,
