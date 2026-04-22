@@ -2420,6 +2420,79 @@ def build_rich_text_with_mentions(
     return segments or rich_text_value(text)
 
 
+LLM_LIST_SECTION_SPEC: Dict[str, Dict[str, Any]] = {
+    "关键机制": {
+        "min_items": 3,
+        "max_items": 5,
+        "item_hint": "X 背后的一条机制要点",
+        "max_chars_per_item": 150,
+    },
+    "实现信号": {
+        "min_items": 3,
+        "max_items": 5,
+        "item_hint": "一个可被外部 observe 的具体信号",
+        "max_chars_per_item": 150,
+    },
+}
+
+
+def parse_list_response(text: str) -> Optional[List[str]]:
+    """Try to parse an LLM response as a list of strings.
+
+    Accepts:
+      1. JSON object with 'items' key: {"items": ["...", "..."]}
+      2. Bare JSON array: ["...", "..."]
+      3. Markdown-ish bullet lines (fallback)
+    """
+    stripped = text.strip()
+    if stripped.startswith("```"):
+        fence_match = re.search(r"```(?:json)?\s*(.*?)\s*```", stripped, re.DOTALL)
+        if fence_match:
+            stripped = fence_match.group(1).strip()
+
+    try:
+        obj = json.loads(stripped)
+        if isinstance(obj, dict) and "items" in obj:
+            items = obj["items"]
+            if isinstance(items, list) and all(isinstance(x, str) for x in items):
+                return [s.strip() for s in items if s.strip()]
+        if isinstance(obj, list) and all(isinstance(x, str) for x in obj):
+            return [s.strip() for s in obj if s.strip()]
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    obj_match = re.search(r"\{.*?\"items\"\s*:\s*\[.*?\]\s*\}", stripped, re.DOTALL)
+    if obj_match:
+        try:
+            obj = json.loads(obj_match.group(0))
+            items = obj.get("items")
+            if isinstance(items, list) and all(isinstance(x, str) for x in items):
+                return [s.strip() for s in items if s.strip()]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    arr_match = re.search(r"\[\s*\".+?\"\s*(?:,\s*\".+?\"\s*)*\]", stripped, re.DOTALL)
+    if arr_match:
+        try:
+            arr = json.loads(arr_match.group(0))
+            if isinstance(arr, list) and all(isinstance(x, str) for x in arr):
+                return [s.strip() for s in arr if s.strip()]
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    lines = [l.strip() for l in stripped.splitlines() if l.strip()]
+    bullet_pat = re.compile(r"^[-*•]\s*(.+)$|^\d+[\.\)]\s*(.+)$")
+    extracted: List[str] = []
+    for line in lines:
+        m = bullet_pat.match(line)
+        if m:
+            extracted.append((m.group(1) or m.group(2)).strip())
+    if len(extracted) >= 2:
+        return extracted
+
+    return None
+
+
 LLM_SECTION_ROLE_GUIDANCE: Dict[str, str] = {
     "定义": (
         "这是「定义」段。职责：用 1-2 句话说清楚 X 是什么，让读者有一个初步的锚点。\n"
@@ -2589,6 +2662,7 @@ def command_llm_refine(
     if getattr(args, "source_page_id", None):
         source_context = read_page_body_text(notion_client, args.source_page_id)
 
+    list_spec = LLM_LIST_SECTION_SPEC.get(heading)
     user_prompt_parts: List[str] = [
         f"词条：{title or '(未命名)'}",
         f"待重写段 heading：{heading}",
@@ -2613,6 +2687,20 @@ def command_llm_refine(
                 "---",
                 source_context,
                 "---",
+            ]
+        )
+    if list_spec:
+        user_prompt_parts.extend(
+            [
+                "",
+                "**输出格式（必须严格遵守）**：",
+                "你的回答必须是且仅是一个 JSON 对象，不要任何解释、不要 markdown 代码块、不要前言：",
+                '{"items": ["第一条 ...", "第二条 ...", ...]}',
+                f"- items 数组长度 {list_spec['min_items']}-{list_spec['max_items']} 条",
+                f"- 每条内容是{list_spec['item_hint']}，紧凑 1-2 句（不超过 {list_spec['max_chars_per_item']} 字）",
+                "- 不要在条目内部写 bullet 符号、序号或多段落",
+                "- 不要类比 / 铺垫 / 回溯映射（这些留给其他段）",
+                "- 纯 JSON，前后不要任何文字",
             ]
         )
     if getattr(args, "extra_instruction", ""):
@@ -2668,26 +2756,52 @@ def command_llm_refine(
         except NotionError as exc:
             print(f"WARN: failed to delete block {bid}: {exc}", file=sys.stderr)
 
-    new_blocks: List[Dict[str, Any]] = []
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", new_body) if p.strip()]
-    if not paragraphs:
-        paragraphs = [new_body]
     mention_map = parse_mention_map(getattr(args, "mention_map", None))
     link_style = getattr(args, "link_style", "link")
-    for para in paragraphs:
-        for chunk in chunk_text(para):
-            rich = (
-                build_rich_text_with_mentions(chunk, mention_map, link_style)
-                if mention_map
-                else rich_text_value(chunk)
+    new_blocks: List[Dict[str, Any]] = []
+    render_mode = "paragraph"
+    list_items: Optional[List[str]] = None
+    if list_spec:
+        list_items = parse_list_response(new_body)
+    if list_items:
+        render_mode = "bulleted_list_item"
+        for item in list_items:
+            for chunk in chunk_text(item):
+                rich = (
+                    build_rich_text_with_mentions(chunk, mention_map, link_style)
+                    if mention_map
+                    else rich_text_value(chunk)
+                )
+                new_blocks.append(
+                    {
+                        "object": "block",
+                        "type": "bulleted_list_item",
+                        "bulleted_list_item": {"rich_text": rich},
+                    }
+                )
+    else:
+        if list_spec:
+            print(
+                f"WARN: expected JSON list for heading {heading!r} but failed to parse; falling back to paragraph",
+                file=sys.stderr,
             )
-            new_blocks.append(
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": rich},
-                }
-            )
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", new_body) if p.strip()]
+        if not paragraphs:
+            paragraphs = [new_body]
+        for para in paragraphs:
+            for chunk in chunk_text(para):
+                rich = (
+                    build_rich_text_with_mentions(chunk, mention_map, link_style)
+                    if mention_map
+                    else rich_text_value(chunk)
+                )
+                new_blocks.append(
+                    {
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {"rich_text": rich},
+                    }
+                )
     if new_blocks:
         notion_client.append_block_children(page_id, new_blocks, after=heading_block["id"])
 
@@ -2697,6 +2811,8 @@ def command_llm_refine(
         "model": deepseek_client.model,
         "deleted_block_count": len(deleted_ids),
         "new_block_count": len(new_blocks),
+        "render_mode": render_mode,
+        "list_item_count": len(list_items) if list_items else 0,
         "reasoning": reasoning,
         "usage": usage,
     }
