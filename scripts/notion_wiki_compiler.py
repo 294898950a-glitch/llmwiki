@@ -4082,26 +4082,7 @@ def command_cleanup_wiki_page(client: NotionClient, args: argparse.Namespace) ->
 
     callouts_to_delete: List[Dict[str, Any]] = []
     if getattr(args, "drop_validator_callouts", False):
-        # Remove all callout blocks left behind by llm-validate --annotate and
-        # Gemini arbiter. Pattern: top-level callout whose rich_text matches a
-        # validator / arbiter intro line or per-heading PASS/FAIL entry.
-        validator_markers = (
-            "DeepSeek 校验",
-            "Kimi 校验",
-            "Gemini 仲裁",
-            " · PASS · ",
-            " · FAIL · ",
-            "维持 FAIL",
-            "推翻 FAIL",
-            "平均分 ",
-            "校验失败",
-        )
-        for block in blocks:
-            if block.get("type") != "callout":
-                continue
-            text = extract_block_text(block) or ""
-            if any(m in text for m in validator_markers):
-                callouts_to_delete.append(block)
+        callouts_to_delete = _collect_validator_callouts(blocks)
 
     # De-duplicate block IDs before delete — a block can be flagged by BOTH
     # the section dedup path and the wrapper-duplicate path (when a duplicate
@@ -4651,6 +4632,50 @@ def _build_editorial_args_for_pipeline(wiki_page_id: str) -> argparse.Namespace:
     )
 
 
+VALIDATOR_CALLOUT_MARKERS: Tuple[str, ...] = (
+    "DeepSeek 校验",
+    "Kimi 校验",
+    "Gemini 仲裁",
+    " · PASS · ",
+    " · FAIL · ",
+    "维持 FAIL",
+    "推翻 FAIL",
+    "平均分 ",
+    "校验失败",
+)
+
+
+def _collect_validator_callouts(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Top-level callout blocks produced by llm-validate --annotate / Gemini arbiter."""
+    result: List[Dict[str, Any]] = []
+    for block in blocks:
+        if block.get("type") != "callout":
+            continue
+        text = extract_block_text(block) or ""
+        if any(m in text for m in VALIDATOR_CALLOUT_MARKERS):
+            result.append(block)
+    return result
+
+
+def _purge_prior_validator_callouts(client: NotionClient, page_id: str) -> int:
+    """Delete existing validator/arbiter callouts on a page. Called at pipeline
+    entry so each pipeline run leaves only its own callouts behind (instead of
+    callouts accumulating across runs)."""
+    blocks = iterate_block_children(client, page_id)
+    callouts = _collect_validator_callouts(blocks)
+    deleted = 0
+    for block in callouts:
+        bid = block.get("id")
+        if not bid:
+            continue
+        try:
+            client.delete_block(bid)
+            deleted += 1
+        except NotionError as exc:
+            print(f"WARN: failed to delete prior callout {bid}: {exc}", file=sys.stderr)
+    return deleted
+
+
 def command_pipeline(
     client: NotionClient,
     env: Dict[str, str],
@@ -4691,6 +4716,15 @@ def command_pipeline(
         stages.append({"stage": "gate_skip", "reason": f"compile returned {action}; use --force-refine to override"})
         print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "skipped_by_gate", "stages": stages}), ensure_ascii=False, indent=2))
         return 0
+
+    # Purge prior-run validator/arbiter callouts so this run's callouts are the
+    # only ones left on the page (prevents callout accumulation across repeated
+    # pipeline invocations). Individual llm-validate invocations still append
+    # without purging — per-page "latest round only" only applies within pipeline.
+    if not getattr(args, "keep_prior_callouts", False):
+        purged = _purge_prior_validator_callouts(client, wiki_page_id)
+        if purged:
+            stages.append({"stage": "purge_prior_callouts", "removed": purged})
 
     # Resolve reader profile (explicit --reader overrides; else auto-infer from wiki page body)
     explicit_reader = getattr(args, "reader", None)
@@ -5140,6 +5174,7 @@ def build_parser() -> argparse.ArgumentParser:
     pipeline_parser.add_argument("--skip-refine", action="store_true", help="Skip llm-refine-page stage; go straight from compile to validate")
     pipeline_parser.add_argument("--skip-validate", action="store_true", help="Skip llm-validate + Gemini arbiter (only compile + optional refine)")
     pipeline_parser.add_argument("--reader", choices=sorted(VALID_READERS), help="Reader profile (agent / quant / general); if omitted, auto-inferred from wiki page body keywords")
+    pipeline_parser.add_argument("--keep-prior-callouts", action="store_true", help="Keep callouts from earlier pipeline runs; by default prior validator/arbiter callouts are purged before this run's annotations so only the latest round remains")
 
     return parser
 
