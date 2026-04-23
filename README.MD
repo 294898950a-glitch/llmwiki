@@ -35,11 +35,13 @@
 ### 能力概览
 
 - **编译闭环**：raw body 递归读取 + `body_hash` 幂等（同 raw 跳过 / 跨 raw 同 hash 跳过）+ `Status` / `Processed At` / `Target Wiki Page` 回写
+- **Raw / Wiki 物理分工（r16 完成）**：raw 正文**始终只在 raw 页**；compile 不再把 raw dump 到 wiki（`--append-raw-body-to-wiki` 回退）；双向 relation 自动维护（`Raw.Target Wiki Page` + `Wiki.Source` union-append）
 - **匹配分层**：`canonical_id` / `title` / `alias` / `fuzzy` 逐级降级；同策略多候选直接报错；`alias` / `fuzzy` 有 `--strict-*` 硬停
 - **merge 模式**：`--merge-mode {append,propose,replace}` 覆盖追加 / 预览 / 替换三种 compounding 路径
 - **冲突证据**：`--emit-diff` 产出段落级 unified diff 作为 `差异分析 YYYY-MM-DD` block 追加
-- **LLM 层**：`llm-refine` 单段重写 / `llm-refine-page` 整页重写 / `llm-validate --annotate` 事后 callout 批注；默认 primary = Kimi、validator = DeepSeek；prompt / reasoning / content / usage 全量落盘
-- **体检与整理**：`check-editorial` / `reference-check` 给 green / yellow / red 分级；`consolidate-evidence` / `cleanup-wiki-page` 做结构清理；`seed-related-pages` 建占位页
+- **LLM 自动化**：`pipeline` 子命令串起 compile → Kimi refine → DeepSeek validate → Gemini 仲裁（仅 FAIL 时）→ 定向重写 round 2；最多两轮 Kimi 写；`--reader` 自动推断 / 显式切换 agent|quant|general profile
+- **LLM 稳健性**：LLMClient 对 `IncompleteRead` / `URLError` / 5xx / JSON 解析失败自动 retry 最多 3 次（指数退避）；pipeline 入口 purge 前次 validator callout 避免跨轮堆积
+- **体检与整理**：`check-editorial` / `reference-check` 给 green / yellow / red 分级；`consolidate-evidence` / `cleanup-wiki-page`（含 `--drop-validator-callouts`）做结构清理；`seed-related-pages` 建占位页
 - **概念网络**：`Related Pages` self-referencing relation（`link-pages`）+ 正文 page mention（`rewrite-section --mention-map`）双实现
 
 能力细节（prompt style / JSON schema / editorial checklist / provider 抽象字段 / 落盘格式等）见下列二级文档：
@@ -51,7 +53,7 @@
 ### 配置
 
 - Notion：`NOTION_API_KEY` / `NOTION_RAW_INBOX_DB_ID` / `NOTION_WIKI_DB_ID`
-- LLM（按需）：`KIMI_API_KEY` / `DEEPSEEK_API_KEY`（或对应 `*_API_KEY_FILE`）
+- LLM（按需）：`KIMI_API_KEY` / `DEEPSEEK_API_KEY` / `GEMINI_API_KEY`（或对应 `*_API_KEY_FILE`）
 - 非 LLM 命令不依赖 provider key
 
 ## Live Examples
@@ -80,8 +82,9 @@
 
 - 相同 raw body（按 `body_hash` 比对）再跑默认 `skipped_unchanged`；若 Raw Status 仍非完成态，仍会推进到 `Done` 避免 queue 重复拉取
 - 跨 raw 同 hash → `skipped_duplicate_body`（记录 `originating_raw_page_id`），`--force` 可绕过
-- 命中已有 wiki 页面时更新属性 + 追加 `增量更新` block；`--auto-refine` 附加启发式正文；不做整页覆盖
+- 命中已有 wiki 页面时更新属性 + 回写 `Wiki.Source` relation；**r16 起默认不再 append raw 正文到 wiki**；`--auto-refine` 附加启发式骨架（结构化整理 / 补充整理）；`--append-raw-body-to-wiki` 回退到 r15 之前"同时把 raw 正文 dump 为 增量更新 block"的行为；不做整页覆盖
 - 重跑语义：**同内容跳过、内容变化继续追加而非覆盖**
+- `auto-refine` r16 起严格幂等：同一 wiki 页多次 `--force-refine` 不再累积重复的 `补充整理` wrapper
 
 手工回滚：到 Notion 删除目标 wiki 页 → 把 Raw 记录 `Status` 改回 `Not started` / 清空 `Processed At` / 清空 `Target Wiki Page`。若要重新做 smoke test，建议新建 raw page 而不是复用旧条目。
 

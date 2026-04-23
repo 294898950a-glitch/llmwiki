@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-23.r15
+> **Version**: 2026-04-23.r16
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -204,10 +204,10 @@ llmwiki/
 - `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
 - `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
 - `upsert-note`：显式传入 title/note/canonical 等直接写入 Wiki；支持 `--strict-alias`
-- `compile-from-raw <raw_page_id>`：从指定 raw page 编译到 Wiki，含 `body_hash` 幂等（含跨 raw 同 hash 的 `skipped_duplicate_body`）、raw 状态回写、可选 `--auto-refine` / `--strict-alias` / `--strict-fuzzy` / `--emit-diff` / `--force`，以及 `--merge-mode {append,propose,replace}`（propose 只输出预览不写；replace 需配 `--replace-heading <text>` 替换指定 section 内容）
-- `compile-queue --status <S> --limit N`：按 Raw Inbox Status 批量编译，失败不中断；支持 `--retry-failed` / `--filter PROP=VALUE`（可重复，和 Status 共同组成 AND 过滤）/ 同样的 strict/emit-diff/merge-mode flags
+- `compile-from-raw <raw_page_id>`：从指定 raw page 编译到 Wiki，含 `body_hash` 幂等（含跨 raw 同 hash 的 `skipped_duplicate_body`）、raw 状态回写、`Wiki.Source` relation union-append（Option B）、可选 `--auto-refine` / `--strict-alias` / `--strict-fuzzy` / `--emit-diff` / `--force`，以及 `--merge-mode {append,propose,replace}`（propose 只输出预览不写；replace 需配 `--replace-heading <text>` 替换指定 section 内容）。**r16 起默认不再把 raw 正文 append 到 wiki 页**（raw 正文只留在 raw 页；provenance 走 `Wiki.Source` relation + `compile-log.jsonl`）；`--append-raw-body-to-wiki` 恢复旧行为
+- `compile-queue --status <S> --limit N`：按 Raw Inbox Status 批量编译，失败不中断；支持 `--retry-failed` / `--filter PROP=VALUE`（可重复，和 Status 共同组成 AND 过滤）/ 同样的 strict/emit-diff/merge-mode/append-raw-body flags
 - `log-session-event --model --tier --decision --risk --notes ...`：会话层留痕入口，写 `session-log.jsonl`，用于记录语义判断的 why
-- `cleanup-wiki-page <page_id>`：去重页面内的重复 `增量更新` section，支持 `--dry-run`
+- `cleanup-wiki-page <page_id> [--drop-validator-callouts] [--dry-run]`：去重页面内的重复 `增量更新` section（richness-aware：保留含 `结构化整理` / `补充整理` wrapper 的 section，不是简单按时间取最旧）；并去重重复 wrapper heading；`--drop-validator-callouts` 清 llm-validate / Gemini 仲裁留下的 callout 批注
 - `check-editorial [<page_id>] [--all --limit N]`：按 `EDITORIAL_POLICY.md` checklist 机器化评估 wiki 页永久笔记达标度，返回 green/yellow/red
 - `consolidate-evidence <page_id> [--heading <text>] [--keep N] [--dry-run]`：对指定 heading（默认"原文证据"）下的证据 block 做截断（默认保留前 4 条，对齐 EDITORIAL_POLICY）
 - `reference-check <reference_page_id> [<target_page_id>] [--all --limit N]`：以 reference 页（如 QueryLoop 样板）为基准比对其他页的结构 / 属性 / 证据数，输出 conformance green/yellow/red + 差距清单
@@ -221,7 +221,7 @@ llmwiki/
 - `lint`：按 `Verification` 列出 Expired / Needs Review 的 Wiki 页
 - `list-review-queue [--source all|editorial|audit|verification|failures] [--editorial-limit N] [--days N] [--emit-decisions] [--dry-run]`：聚合四路风险信号（`check-editorial` yellow/red + audit-log `review_required` + `Verification = Needs Review` + compile failures）→ 输出 preview 或用 `--emit-decisions` 把新信号作为 decision record 落到 `raw/notion_dumps/decisions.jsonl`（带 sha1 截断 id / 幂等去重 / 不再次 raise 已 resolved|dropped 的 id）
 - `resolve-decision <id> --status in_review|resolved|dropped --rationale "..." [--resolver ...]`：对 decision id 追加一条 resolution record；latest-wins reader 能识别终态
-- `pipeline <raw_page_id> [--refine-provider ...] [--validate-provider ...] [--force-refine] [--skip-refine] [--skip-validate]`：一条 raw 的**全自动化**链路 = `compile-from-raw --auto-refine` → `llm-refine-page`（默认 Kimi）→ `llm-validate --annotate`（默认 DeepSeek）→ **Gemini 2.5 Flash 仲裁**（仅当 DeepSeek FAIL 时介入）→ 若 Gemini 维持 FAIL，则 Kimi 定向重写被 uphold 的段 → 再校验一次。**最多两轮 Kimi 写**，不再循环。默认 compile 返回 `skipped_unchanged` / `skipped_duplicate_body` 时停（A=Z gate），`--force-refine` 显式绕过
+- `pipeline <raw_page_id> [--refine-provider ...] [--validate-provider ...] [--force-refine] [--skip-refine] [--skip-validate] [--reader agent|quant|general] [--keep-prior-callouts]`：一条 raw 的**全自动化**链路 = `compile-from-raw --auto-refine` → `llm-refine-page`（默认 Kimi）→ `llm-validate --annotate`（默认 DeepSeek）→ **Gemini 2.5 Flash 仲裁**（仅当 DeepSeek FAIL 时介入）→ 若 Gemini 维持 FAIL，则 Kimi 定向重写被 uphold 的段 → 再校验一次。**最多两轮 Kimi 写**，不再循环。默认 compile 返回 `skipped_unchanged` / `skipped_duplicate_body` 时停（A=Z gate），`--force-refine` 显式绕过；未传 `--reader` 则按 wiki 正文关键词密度推断；默认 **pipeline 入口自动 purge 前次 validator/arbiter callout**（每页只留本次一轮批注），`--keep-prior-callouts` 保留旧批注
 
 所有子命令均写 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`（含 error 记录）。
 
@@ -240,7 +240,23 @@ llmwiki/
 - `PROFILE_HARD_TABOOS[quant|general]` — 非 agent profile 硬禁 AI 框架术语（LangChain / ReAct / AgentExecutor / AutoGPT / 工具调用循环）；启发式挡不住时这条硬兜底
 - `--reader` flag 显式选 profile；未传则 `infer_reader_profile(body)` 按关键词密度自动推断
 
-**Raw / Wiki 分工**：脚本层从不写 block 到 raw 页；只回写 raw 属性（Status / Processed At / Target Wiki Page）。`infer_semantic_title` 去除 raw 风格前缀（`第N章` / `真人测试·` / `X Raw YYYY-MM-DD`）避免 wiki 标题继承 raw 的 bookkeeping 前缀。
+**Raw / Wiki 分工（r16 完成）**：
+- **Raw 页**：脚本层从不写 block 到 raw 页；只回写 raw 属性（`Status` / `Processed At` / `Target Wiki Page`）
+- **Wiki 页**：**r16 起 compile 不再把 raw 正文 append 到 wiki**；wiki 正文只含 refined 内容（`结构化整理` / `补充整理` + Kimi 精修段落）。打开 wiki 第一屏就是 `定义` / `核心判断` 而不是原文 dump
+- **反向 relation 自动维护**：`Wiki.Source` 每次 compile 执行 union-append（若 mapping 声明且 schema 有 relation 属性）；支持"同 wiki 对象被多条 raw 编译过"的 compounding 历史
+- **标题规范化**：`infer_semantic_title` 去除 raw 风格前缀（`第N章` / `真人测试·` / `X Raw YYYY-MM-DD`）避免 wiki 标题继承 raw 的 bookkeeping 前缀
+- **网络稳健性**：`LLMClient.chat()` 对 `IncompleteRead` / `URLError` / 5xx / `JSONDecodeError` 自动 retry 最多 3 次（指数退避 2s/4s）；4xx fail fast 不重试
+
+**r16 行为变化清单**（较 r15）：
+
+| 变化 | 旧行为 | 新行为 | 回退 flag |
+|---|---|---|---|
+| compile 是否 dump raw 正文到 wiki | 总是 append `增量更新` block | 默认不 dump | `--append-raw-body-to-wiki` |
+| Wiki.Source relation 维护 | 脚本不写 | 自动 union-append | — |
+| auto-refine 再次运行是否重复 append `补充整理` | 会（marker check 有 bug） | 只 append 一次 | — |
+| pipeline 多次跑同一页 validator callout 累积 | 一直堆 | 入口自动 purge 前次 | `--keep-prior-callouts` |
+| LLM API 网络断 | 直接崩 | 3 次 retry | — |
+| cleanup-wiki-page 能否清 validator callout | 不能 | `--drop-validator-callouts` | — |
 
 LLM provider 通过 `LLM_PROVIDERS` dict 注册（`endpoint` / `default_model` / `env_key` / `env_key_file` / `fixed_temperature`）。`fixed_temperature` 字段覆盖用户传值，用于 kimi-k2.6 这种强制 `temperature=1` 的模型。key 从 `DEEPSEEK_API_KEY` / `KIMI_API_KEY` / `GEMINI_API_KEY` inline 值或对应 `*_API_KEY_FILE` 路径读取。Gemini 走 OpenAI-compat endpoint（`.../v1beta/openai/chat/completions`）共用现有 `LLMClient`。
 
