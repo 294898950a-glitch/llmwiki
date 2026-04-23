@@ -43,6 +43,15 @@ LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
         "env_key": "GEMINI_API_KEY",
         "env_key_file": "GEMINI_API_KEY_FILE",
     },
+    # deepseek-chat provider: shares deepseek credentials but points at the
+    # fast chat model for judge-role calls (cheap + fast categorical judgments,
+    # not deep reasoning). See judge_chat() for usage.
+    "deepseek-chat": {
+        "endpoint": "https://api.deepseek.com/v1/chat/completions",
+        "default_model": "deepseek-chat",
+        "env_key": "DEEPSEEK_API_KEY",
+        "env_key_file": "DEEPSEEK_API_KEY_FILE",
+    },
 }
 
 
@@ -1411,6 +1420,12 @@ def find_upsert_target(
         if match_strategy:
             matched_candidates.append((page, match_strategy))
 
+    # Phase 2 support: if the caller's judge already decided the alias hit is
+    # a different entity, drop alias matches here so downstream treats it as
+    # new-page create.
+    if getattr(args, "skip_alias_strategy", False):
+        matched_candidates = [(p, s) for p, s in matched_candidates if s != "alias"]
+
     for strategy in ("canonical_id", "title", "alias"):
         strategy_hits = [item for item in matched_candidates if item[1] == strategy]
         if len(strategy_hits) > 1:
@@ -1668,6 +1683,7 @@ def compile_raw_page(
     mapping: Dict[str, Any],
     args: argparse.Namespace,
     raw_page_id: str,
+    env: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     raw_page = client.retrieve_page(raw_page_id)
     if normalize_notion_id(database_parent_id(raw_page)) != normalize_notion_id(raw_database_id):
@@ -1892,6 +1908,49 @@ def compile_raw_page(
         }
 
     # Default: merge_mode == "append"
+    # Phase 2: if the candidate match would be via `alias`, pre-run deepseek-chat
+    # judge to decide if it's really the same entity. different_entity → force a
+    # new page by flagging skip_alias_strategy (find_upsert_target will drop
+    # alias matches). Enabled by default when judge LLM is available; bypass
+    # via --no-judge. Never fires under --strict-alias (that already hard-stops).
+    judge_result: Optional[Dict[str, Any]] = None
+    disable_judge = bool(getattr(args, "no_judge", False))
+    strict_alias = bool(getattr(args, "strict_alias", False))
+    if not disable_judge and not strict_alias and env is not None:
+        try:
+            wiki_database = client.retrieve_database(wiki_database_id)
+            preview_target = find_upsert_target(client, wiki_database, wiki_database_id, mapping, upsert_args)
+        except NotionError:
+            preview_target = None
+        if preview_target and preview_target.get("match_strategy") == "alias" and preview_target.get("exact_match"):
+            wiki_page = preview_target["exact_match"]
+            wiki_page_id_peek = wiki_page.get("id", "")
+            title_prop_peek = mapping.get("title_property") or detect_title_property(wiki_database) or "Name"
+            aliases_prop_peek = mapping.get("aliases_property") or ""
+            wiki_title_peek = extract_title(wiki_page, title_prop_peek) if title_prop_peek else ""
+            wiki_aliases_peek = extract_property_text(wiki_page, aliases_prop_peek) if aliases_prop_peek else ""
+            try:
+                wiki_body_peek = read_page_body_text(client, wiki_page_id_peek)[:1200]
+            except NotionError:
+                wiki_body_peek = ""
+            judge_result = judge_alias_match(
+                env,
+                title,
+                note,
+                wiki_title_peek,
+                wiki_aliases_peek,
+                wiki_body_peek,
+                wiki_page_id_peek,
+            )
+            if judge_result["choice"] == "different_entity" and judge_result["confidence"] >= 0.6:
+                upsert_args.skip_alias_strategy = True
+                print(
+                    f"INFO: deepseek-chat judge decided alias hit on {wiki_page_id_peek!r} is a different entity "
+                    f"(confidence {judge_result['confidence']:.2f}); creating new page instead. "
+                    f"Reasoning: {judge_result['reasoning'][:200]}",
+                    file=sys.stderr,
+                )
+
     wiki_result = upsert_note_to_wiki(client, wiki_database_id, mapping, upsert_args)
 
     # Union-append this raw_page_id into Wiki.Source relation. Keeps "this wiki
@@ -1985,6 +2044,16 @@ def compile_raw_page(
         "warnings": warnings,
         "diff_appended": diff_appended,
         "diff_summary": diff_summary[:400] if diff_summary else None,
+        "judge": (
+            {
+                "kind": "alias_match",
+                "choice": judge_result["choice"],
+                "confidence": judge_result["confidence"],
+                "reasoning": judge_result["reasoning"][:300],
+            }
+            if judge_result
+            else None
+        ),
     }
 
 
@@ -2077,8 +2146,9 @@ def command_compile_from_raw(
     wiki_database_id: str,
     mapping: Dict[str, Any],
     args: argparse.Namespace,
+    env: Optional[Dict[str, str]] = None,
 ) -> int:
-    payload = compile_raw_page(client, raw_database_id, wiki_database_id, mapping, args, args.page_id)
+    payload = compile_raw_page(client, raw_database_id, wiki_database_id, mapping, args, args.page_id, env=env)
     print(json.dumps(finalize_compile_payload(payload), ensure_ascii=False, indent=2))
     return 0
 
@@ -2181,11 +2251,12 @@ def command_compile_queue(
 
     results: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
+    queue_env = getattr(args, "_env", None)
     for page_id in raw_page_ids:
         if not page_id:
             continue
         try:
-            payload = compile_raw_page(client, raw_database_id, wiki_database_id, mapping, args, page_id)
+            payload = compile_raw_page(client, raw_database_id, wiki_database_id, mapping, args, page_id, env=queue_env)
             results.append(finalize_compile_payload(payload))
         except Exception as exc:
             failures.append({"raw_page_id": page_id, "error": str(exc)})
@@ -4885,6 +4956,156 @@ def parse_gemini_json(raw: str) -> Optional[Dict[str, Any]]:
     return parsed if isinstance(parsed, dict) else None
 
 
+# ─── Judge-role LLM (Phase 1: deepseek-chat cheap classifier) ──────────────
+
+def _append_judge_log(record: Dict[str, Any]) -> Path:
+    return append_jsonl_log(daily_log_filename("judge-log.jsonl"), record)
+
+
+def judge_chat(
+    env: Dict[str, str],
+    system_rules: str,
+    user_prompt: str,
+    choices: Tuple[str, ...],
+    context_tag: str = "",
+    max_tokens: int = 500,
+) -> Dict[str, Any]:
+    """Cheap categorical LLM classifier (deepseek-chat).
+
+    Returns {"choice": str, "reasoning": str, "confidence": float, "error": Optional[str]}.
+    choice is guaranteed to be one of `choices` (falls back to choices[-1], typically
+    'uncertain', on any parse / API failure). confidence is 0.0 on failure.
+    Every call is logged to raw/notion_dumps/YYYY-MM-DD-judge-log.jsonl for audit.
+    """
+    if not choices:
+        raise NotionError("judge_chat requires at least one choice")
+
+    fallback = choices[-1]
+    enriched_system = (
+        system_rules
+        + "\n\n## 输出格式（严格）\n"
+        + "仅输出一个 JSON 对象：\n"
+        + '{"choice": "<one of options>", "reasoning": "<一句理由>", "confidence": <0.0-1.0>}\n'
+        + f"\noptions = {list(choices)}\n"
+        + "confidence: 0.0 完全不确定 / 0.5 一般 / 1.0 非常确定。\n"
+        + "严禁 markdown 代码块、前言、多余文字。"
+    )
+
+    try:
+        client = build_llm_client(env, "deepseek-chat", None)
+    except NotionError as exc:
+        record = {
+            "timestamp": iso_now(),
+            "tag": context_tag,
+            "error": f"build_client_failed: {exc}",
+            "choice": fallback,
+            "confidence": 0.0,
+        }
+        _append_judge_log(record)
+        return {"choice": fallback, "reasoning": f"judge_unavailable: {exc}", "confidence": 0.0, "error": str(exc)}
+
+    t0 = time.time()
+    try:
+        response = client.chat(system=enriched_system, user=user_prompt, max_tokens=max_tokens, temperature=0.0)
+    except NotionError as exc:
+        record = {
+            "timestamp": iso_now(),
+            "tag": context_tag,
+            "error": f"api_error: {exc}",
+            "latency_s": round(time.time() - t0, 2),
+            "choice": fallback,
+            "confidence": 0.0,
+        }
+        _append_judge_log(record)
+        return {"choice": fallback, "reasoning": f"judge_api_error: {exc}", "confidence": 0.0, "error": str(exc)}
+
+    latency = time.time() - t0
+    content = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    parsed = parse_gemini_json(content)
+
+    if not parsed or not isinstance(parsed, dict):
+        choice, reasoning, confidence = fallback, f"parse_failed: head={content[:150]!r}", 0.0
+    else:
+        raw_choice = parsed.get("choice", "")
+        if raw_choice not in choices:
+            choice = fallback
+            reasoning = f"invalid_choice {raw_choice!r} not in {list(choices)}"
+            confidence = 0.0
+        else:
+            choice = raw_choice
+            reasoning = str(parsed.get("reasoning", ""))
+            try:
+                confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0.0))))
+            except (ValueError, TypeError):
+                confidence = 0.0
+
+    record = {
+        "timestamp": iso_now(),
+        "tag": context_tag,
+        "latency_s": round(latency, 2),
+        "choices": list(choices),
+        "choice": choice,
+        "reasoning": reasoning,
+        "confidence": confidence,
+        "model": client.model,
+        "usage": response.get("usage", {}),
+        "raw_content_head": content[:300],
+    }
+    _append_judge_log(record)
+
+    return {"choice": choice, "reasoning": reasoning, "confidence": confidence, "error": None}
+
+
+def judge_alias_match(
+    env: Dict[str, str],
+    raw_title: str,
+    raw_body: str,
+    wiki_title: str,
+    wiki_aliases: str,
+    wiki_body: str,
+    wiki_page_id: str,
+) -> Dict[str, Any]:
+    """Phase 2: decide if an alias-matched wiki candidate is the same entity
+    as a new raw page. Used before compile commits to the alias-match update;
+    'different_entity' causes compile to skip alias and treat as new-page."""
+    system_rules = (
+        "你是知识库的匹配判断助手。某条新 raw 材料的标题或别名，和一个 wiki 候选页碰撞了。判断两者是否同一实体。\n"
+        "\n"
+        "三个选项：\n"
+        "- same_entity：同一对象，raw 是对这个 wiki 对象的追加 / 更新（术语 / 别名 overlap 且核心讨论方向一致）\n"
+        "- different_entity：尽管标题或别名碰巧相同或相似，本质讨论的是不同对象（如同名异物、不同版本、不同领域）\n"
+        "- uncertain：信息不足 / 边界模糊；保留 review_required 让人类决策\n"
+        "\n"
+        "评判要点：\n"
+        "- 两者的**核心定义**是否一致？\n"
+        "- **讨论领域**（行业 / 概念空间）是否重叠？\n"
+        "- **对象粒度**是否相同？（对象 vs 对象的某个子系统，算不同）\n"
+        "- 同名歧义（如 'Agent' 在 LLM 领域 vs 房产中介）= different_entity\n"
+        "\n"
+        "confidence 阈值建议：只有当你能说出具体理由时才 >= 0.8；否则给 uncertain。"
+    )
+    user_prompt = (
+        f"【新 raw】\n"
+        f"标题：{raw_title}\n"
+        f"正文前 400 字：\n{(raw_body or '')[:400]}\n"
+        f"\n"
+        f"【候选 wiki 页】id={wiki_page_id}\n"
+        f"标题：{wiki_title}\n"
+        f"别名：{wiki_aliases or '(无)'}\n"
+        f"正文前 400 字：\n{(wiki_body or '')[:400]}\n"
+        f"\n"
+        f"是否同一实体？"
+    )
+    return judge_chat(
+        env,
+        system_rules,
+        user_prompt,
+        choices=("same_entity", "different_entity", "uncertain"),
+        context_tag=f"alias_match:{wiki_page_id}",
+        max_tokens=500,
+    )
+
+
 def gemini_arbitrate(
     gemini_client: "LLMClient",
     wiki_title: str,
@@ -5400,6 +5621,7 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--raw-compiled-status")
     compile_parser.add_argument("--force", action="store_true")
     compile_parser.add_argument("--append-raw-body-to-wiki", action="store_true", help="Legacy: also append a 增量更新 block to wiki containing raw body (default off as of 2026-04-23; raw body stays on raw page, provenance via Wiki.Source + compile-log)")
+    compile_parser.add_argument("--no-judge", action="store_true", help="Disable deepseek-chat alias judge; always fall back to alias-match + review_required (r16 default: judge on)")
     compile_parser.add_argument("--auto-refine", action="store_true")
     compile_parser.add_argument("--strict-alias", action="store_true")
     compile_parser.add_argument("--strict-fuzzy", action="store_true")
@@ -5430,6 +5652,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_parser.add_argument("--raw-compiled-status")
     queue_parser.add_argument("--force", action="store_true")
     queue_parser.add_argument("--append-raw-body-to-wiki", action="store_true", help="Legacy behavior for batch; see compile-from-raw --append-raw-body-to-wiki")
+    queue_parser.add_argument("--no-judge", action="store_true", help="Disable deepseek-chat alias judge for batch; see compile-from-raw --no-judge")
     queue_parser.add_argument("--auto-refine", action="store_true")
     queue_parser.add_argument("--strict-alias", action="store_true")
     queue_parser.add_argument("--strict-fuzzy", action="store_true")
@@ -5645,8 +5868,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             require_env(env, "NOTION_WIKI_DB_ID"),
             mapping,
             args,
+            env=env,
         )
     if args.command == "compile-queue":
+        args._env = env
         return command_compile_queue(
             client,
             require_env(env, "NOTION_RAW_INBOX_DB_ID"),
