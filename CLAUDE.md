@@ -44,7 +44,7 @@ llmwiki/
 ├── schema/
 │   └── notion_wiki_mapping.example.json
 ├── scripts/
-│   └── notion_wiki_compiler.py      # Notion API 执行层 + 多 provider LLM 封装（DeepSeek / Kimi / Gemini），含 23 个子命令
+│   └── notion_wiki_compiler.py      # Notion API 执行层 + 多 provider LLM 封装（DeepSeek / Kimi / Gemini），含 24 个子命令
 └── wiki/
     └── index.md                     # 历史调试遗留目录，当前不是主产物
 ```
@@ -199,7 +199,7 @@ llmwiki/
 
 ## 当前可用脚本
 
-`scripts/notion_wiki_compiler.py` 提供 23 个子命令：
+`scripts/notion_wiki_compiler.py` 提供 24 个子命令：
 
 - `inspect-schema --database raw|wiki`：读数据库 schema，落盘到 `raw/notion_dumps/`
 - `search <query>`：在 Wiki 库中按标题 / Aliases 查候选
@@ -223,6 +223,7 @@ llmwiki/
 - `resolve-decision <id> --status in_review|resolved|dropped --rationale "..." [--resolver ...]`：对 decision id 追加一条 resolution record；latest-wins reader 能识别终态
 - `compute-lifecycle-state [<page_id>] [--all --limit N] [--write-notion] [--notion-property Lifecycle]`：**v18 P1**。从 `Compounded Level` / `Last Compounded At` / editorial / 近 7 天 diff 冲突信号推断对象状态（`growing|stable|stale|conflicted`）；`--write-notion` 写入 Wiki.Lifecycle select 属性并自动 `ensure_select_property`
 - `compute-quality-state [<page_id>] [--all --limit N] [--write-notion] [--notion-property Quality]`：**v18 P2**。聚合 `check-editorial` 结果 + 最近一次 `llm-validate` 的 avg_score/fail_count + `Wiki.Source` 相关 open decisions → 统一 quality state（`draft|review_required|validated|ready`）
+- `autofill-missing-sections <page_id> [--provider kimi] [--no-judge] [--reader ...]`：**Phase 3 · 减少人工**。editorial=yellow 时自动补缺失的必须 heading（定义 / 核心判断 / 关联概念 / 原文证据）。deepseek-chat judge 判 `fill|skip`（body 太薄就 skip 不生成空话）；决定 fill 时用 Kimi 写新段并 append。pipeline 端每次跑完都会自动执行这一步（`autofill=True` by default）
 - `pipeline <raw_page_id> [--refine-provider ...] [--validate-provider ...] [--force-refine] [--skip-refine] [--skip-validate] [--reader agent|quant|general] [--keep-prior-callouts]`：一条 raw 的**全自动化**链路 = `compile-from-raw --auto-refine` → `llm-refine-page`（默认 Kimi）→ `llm-validate --annotate`（默认 DeepSeek）→ **Gemini 2.5 Flash 仲裁**（仅当 DeepSeek FAIL 时介入）→ 若 Gemini 维持 FAIL，则 Kimi 定向重写被 uphold 的段 → 再校验一次。**最多两轮 Kimi 写**，不再循环。默认 compile 返回 `skipped_unchanged` / `skipped_duplicate_body` 时停（A=Z gate），`--force-refine` 显式绕过；未传 `--reader` 则按 wiki 正文关键词密度推断；默认 **pipeline 入口自动 purge 前次 validator/arbiter callout**（每页只留本次一轮批注），`--keep-prior-callouts` 保留旧批注
 
 所有子命令均写 `raw/notion_dumps/YYYY-MM-DD-audit-log.jsonl`（含 error 记录）。
@@ -233,7 +234,9 @@ llmwiki/
 - **Primary generator**（默认 `kimi` / `kimi-k2.6`）：通过 `llm-refine` / `llm-refine-page` 写入"有解读"内容
 - **Post-hoc validator**（默认 `deepseek` / `deepseek-reasoner`）：`llm-validate --annotate` 按 **6 项标准**评估（第 6 项：跨领域污染硬条件判 FAIL），callout 形式批注
 - **Arbiter**（`gemini` / `gemini-2.5-flash`）：pipeline 中仅当 DeepSeek FAIL 时介入；判 DeepSeek 是否判对；若推翻则终结、若维持则触发 Kimi 定向重写被 uphold 的段
-- **Judge**（`deepseek-chat` 便宜分类器，r17 新增）：替代"简单 yes/no/分类"这类**原先人工**的判断。当前一个具体使用：`compile-from-raw` 遇 `alias` 命中时，judge 判 `same_entity` / `different_entity` / `uncertain`；`different_entity` + `confidence ≥ 0.6` 触发改走 new-page 路径。所有 judge 调用落 `raw/notion_dumps/YYYY-MM-DD-judge-log.jsonl`；`--no-judge` flag 一键关掉
+- **Judge**（`deepseek-chat` 便宜分类器，r17 新增）：替代"简单 yes/no/分类"这类**原先人工**的判断。所有 judge 调用落 `raw/notion_dumps/YYYY-MM-DD-judge-log.jsonl`；`--no-judge` flag 一键关掉。当前使用点：
+  1. **alias 匹配判断**（Phase 2）：`compile-from-raw` 遇 alias 命中时，judge 判 `same_entity` / `different_entity` / `uncertain`；`different_entity` + `confidence ≥ 0.6` 触发改走 new-page 路径
+  2. **yellow 缺段补写判断**（Phase 3）：pipeline end 见 editorial=yellow 且有 missing_heading 时，judge 对每个缺失 heading 判 `fill` / `skip`（body 太薄就 skip 不生成空话）；fill 后 Kimi 写新段并 append，页面常从 yellow 升到 green
 - **两轮上限**：pipeline 最多 Kimi 写 2 次；第二轮 DeepSeek 再校验后不管结果停止，所有 callout 保留
 - `llm-refine` / `llm-refine-page` / `llm-validate` 仍可独立调用（不强制走 pipeline）；多候选选择、tier 4 停顿、冲突 diff 证据仍归会话层
 

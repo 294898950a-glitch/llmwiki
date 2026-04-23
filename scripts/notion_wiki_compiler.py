@@ -5056,6 +5056,204 @@ def judge_chat(
     return {"choice": choice, "reasoning": reasoning, "confidence": confidence, "error": None}
 
 
+def judge_fill_section(
+    env: Dict[str, str],
+    wiki_page_id: str,
+    missing_heading: str,
+    topic_title: str,
+    current_body_head: str,
+) -> Dict[str, Any]:
+    """Phase 3: decide whether to auto-fill a missing required heading now.
+
+    'fill' → page has enough material / context for Kimi to produce a non-trivial
+    section; auto-generate + append.
+    'skip' → page too thin (placeholder / only raw excerpt); wait for more
+    material. Keeps yellow state rather than fabricate noise."""
+    system_rules = (
+        "你在决定一个 wiki 页面是否应该自动补某个缺失的 heading。判据：\n"
+        "\n"
+        "- fill：当前 body 有足够内容（定义已成型 / 核心判断清晰 / 或至少有 300 字有解读的内容），"
+        "补这一段不会是空话；而且该段对整个词条结构是必要的。\n"
+        "- skip：body 太薄（< 300 字 / 仍是 placeholder / 只有 raw 摘录没有解读）。"
+        "此时补段只会生成注水 / 空泛内容；应保持 yellow，等材料充足后再补。\n"
+        "\n"
+        "重点：只有当 Kimi 能写出有解读、贴合本主题的内容时才 fill；宁缺勿滥。"
+    )
+    user_prompt = (
+        f"词条：{topic_title}\n"
+        f"缺失的 heading：{missing_heading}\n"
+        f"\n"
+        f"当前 body 前 600 字：\n"
+        f"{(current_body_head or '')[:600]}\n"
+        f"\n"
+        f"应该 fill 还是 skip？"
+    )
+    return judge_chat(
+        env,
+        system_rules,
+        user_prompt,
+        choices=("fill", "skip"),
+        context_tag=f"fill_section:{wiki_page_id}:{missing_heading}",
+        max_tokens=400,
+    )
+
+
+def autofill_missing_sections(
+    client: NotionClient,
+    env: Optional[Dict[str, str]],
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+    reader: Optional[str] = None,
+    no_judge: bool = False,
+    provider: str = "kimi",
+) -> Dict[str, Any]:
+    """Phase 3 core: check editorial, pick missing required headings worth
+    filling (via judge), append empty heading_2 blocks, then delegate content
+    generation to command_llm_refine_page for each."""
+    editorial = check_editorial_compliance(client, wiki_database_id, mapping, wiki_page_id)
+    missing: List[str] = []
+    for issue in editorial.get("issues", []) or []:
+        if issue.get("check") == "missing_heading":
+            heading = issue.get("heading")
+            if heading:
+                missing.append(heading)
+    if not missing:
+        return {
+            "wiki_page_id": wiki_page_id,
+            "compliance_before": editorial.get("compliance"),
+            "missing_count": 0,
+            "filled": [],
+            "skipped": [],
+            "no_action_reason": "no_missing_required_heading",
+        }
+
+    priority = ["定义", "核心判断", "关联概念", "原文证据"]
+    missing_sorted = sorted(missing, key=lambda h: priority.index(h) if h in priority else 999)
+
+    # Read current body for judge context
+    try:
+        current_body = read_page_body_text(client, wiki_page_id)
+    except NotionError:
+        current_body = ""
+    page = client.retrieve_page(wiki_page_id)
+    title_prop = mapping.get("title_property") or "Name"
+    topic_title = extract_title(page, title_prop) if title_prop else ""
+
+    filled: List[Dict[str, Any]] = []
+    skipped: List[Dict[str, Any]] = []
+
+    for heading in missing_sorted:
+        # Judge: should we fill this one?
+        judge_outcome: Optional[Dict[str, Any]] = None
+        if not no_judge and env is not None:
+            judge_outcome = judge_fill_section(env, wiki_page_id, heading, topic_title, current_body)
+            if judge_outcome["choice"] == "skip":
+                skipped.append({
+                    "heading": heading,
+                    "reason": "judge_skip",
+                    "confidence": judge_outcome["confidence"],
+                    "judge_reasoning": judge_outcome["reasoning"][:200],
+                })
+                continue
+
+        # Append empty heading_2 block for this missing heading
+        try:
+            client.append_block_children(
+                wiki_page_id,
+                [
+                    {
+                        "object": "block",
+                        "type": "heading_2",
+                        "heading_2": {"rich_text": rich_text_value(heading)},
+                    }
+                ],
+            )
+        except NotionError as exc:
+            skipped.append({"heading": heading, "reason": f"append_failed: {exc}"})
+            continue
+
+        # Kimi writes body for this new heading via llm-refine-page single-section mode
+        refine_args = argparse.Namespace(
+            page_id=wiki_page_id,
+            sections=heading,
+            provider=provider,
+            model=None,
+            source_page_id=None,
+            style_from_page_id=None,
+            style_note="",
+            mention_map=None,
+            link_style="link",
+            preview=False,
+            max_tokens=16000,
+            temperature=0.4,
+            reader=reader,
+        )
+        try:
+            refine_llm = build_llm_client(env, provider, None) if env else None
+            if refine_llm is None:
+                skipped.append({"heading": heading, "reason": "no_env_for_kimi"})
+                continue
+            payload, exit_code = _capture_command_stdout_json(
+                command_llm_refine_page,
+                client,
+                refine_llm,
+                wiki_database_id,
+                mapping,
+                refine_args,
+            )
+            filled.append({
+                "heading": heading,
+                "section_count": payload.get("section_count"),
+                "judge": (
+                    {"choice": judge_outcome["choice"], "confidence": judge_outcome["confidence"]}
+                    if judge_outcome
+                    else None
+                ),
+            })
+        except NotionError as exc:
+            skipped.append({"heading": heading, "reason": f"kimi_refine_failed: {exc}"})
+
+    # Re-run editorial to observe post-fill compliance
+    try:
+        editorial_after = check_editorial_compliance(client, wiki_database_id, mapping, wiki_page_id)
+        compliance_after = editorial_after.get("compliance")
+    except NotionError:
+        compliance_after = None
+
+    return {
+        "wiki_page_id": wiki_page_id,
+        "compliance_before": editorial.get("compliance"),
+        "compliance_after": compliance_after,
+        "missing_count": len(missing),
+        "filled": filled,
+        "skipped": skipped,
+    }
+
+
+def command_autofill_missing_sections(
+    client: NotionClient,
+    env: Dict[str, str],
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    payload = autofill_missing_sections(
+        client,
+        env,
+        wiki_database_id,
+        mapping,
+        args.page_id,
+        reader=getattr(args, "reader", None),
+        no_judge=getattr(args, "no_judge", False),
+        provider=getattr(args, "provider", "kimi"),
+    )
+    print(json.dumps(audit_success("autofill-missing-sections", payload), ensure_ascii=False, indent=2))
+    if payload.get("filled"):
+        return 0
+    return 0 if payload.get("missing_count", 0) == 0 else 1
+
+
 def judge_alias_match(
     env: Dict[str, str],
     raw_title: str,
@@ -5382,7 +5580,7 @@ def command_pipeline(
 
     if args.skip_validate:
         stages.append({"stage": "validate_skipped_by_flag"})
-        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages, env=env, reader=resolved_reader, autofill=True)
         print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "incomplete_no_validate", "stages": stages}), ensure_ascii=False, indent=2))
         return 0
 
@@ -5392,7 +5590,7 @@ def command_pipeline(
 
     round_1_fails = _collect_fails(validate_round_1)
     if not round_1_fails:
-        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages, env=env, reader=resolved_reader, autofill=True)
         print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "passed_round_1", "stages": stages}), ensure_ascii=False, indent=2))
         return 0
 
@@ -5437,7 +5635,7 @@ def command_pipeline(
     _append_arbiter_callout(client, wiki_page_id, gemini_client.model, arbiter_results)
 
     if not upheld:
-        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+        _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages, env=env, reader=resolved_reader, autofill=True)
         print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": "passed_via_gemini_override", "stages": stages}), ensure_ascii=False, indent=2))
         return 0
 
@@ -5466,7 +5664,7 @@ def command_pipeline(
     stages.append({"stage": "validate_round_2", **_summarize_validate(validate_round_2)})
 
     round_2_fails = _collect_fails(validate_round_2)
-    _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages)
+    _run_and_append_editorial(client, wiki_database_id, mapping, wiki_page_id, stages, env=env, reader=resolved_reader, autofill=True)
 
     overall = "passed_round_2" if not round_2_fails else "round_2_still_failing"
     print(json.dumps(audit_success("pipeline", {"raw_page_id": args.raw_page_id, "wiki_page_id": wiki_page_id, "overall_status": overall, "stages": stages}), ensure_ascii=False, indent=2))
@@ -5516,6 +5714,9 @@ def _run_and_append_editorial(
     mapping: Dict[str, Any],
     wiki_page_id: str,
     stages: List[Dict[str, Any]],
+    env: Optional[Dict[str, str]] = None,
+    reader: Optional[str] = None,
+    autofill: bool = True,
 ) -> None:
     try:
         result = check_editorial_compliance(client, wiki_database_id, mapping, wiki_page_id)
@@ -5526,6 +5727,40 @@ def _run_and_append_editorial(
         })
     except NotionError as exc:
         stages.append({"stage": "check_editorial", "error": str(exc)})
+        result = None
+
+    # Phase 3: if editorial yellow with missing_heading issues, auto-fill via
+    # judge + Kimi. Only fires when env is available (LLM reachable) and
+    # autofill flag is true. Best-effort — failures landed in stages but never
+    # abort the pipeline.
+    if autofill and env is not None and result is not None:
+        missing = [
+            i.get("heading")
+            for i in (result.get("issues") or [])
+            if i.get("check") == "missing_heading" and i.get("heading")
+        ]
+        if missing:
+            try:
+                fill_payload = autofill_missing_sections(
+                    client,
+                    env,
+                    wiki_database_id,
+                    mapping,
+                    wiki_page_id,
+                    reader=reader,
+                    no_judge=False,
+                    provider="kimi",
+                )
+                stages.append({
+                    "stage": "autofill_missing_sections",
+                    "compliance_before": fill_payload.get("compliance_before"),
+                    "compliance_after": fill_payload.get("compliance_after"),
+                    "filled_count": len(fill_payload.get("filled", [])),
+                    "skipped_count": len(fill_payload.get("skipped", [])),
+                    "filled": [f.get("heading") for f in fill_payload.get("filled", [])],
+                })
+            except NotionError as exc:
+                stages.append({"stage": "autofill_missing_sections", "error": str(exc)})
 
     # v18 P1 / P2: compute lifecycle + quality states at pipeline end and
     # propagate to Notion (auto-create the Lifecycle / Quality select
@@ -5829,6 +6064,15 @@ def build_parser() -> argparse.ArgumentParser:
     quality_parser.add_argument("--write-notion", action="store_true", help="Write the computed state to Wiki.<notion-property> (select). Auto-creates the property with {draft,review_required,validated,ready} options if missing.")
     quality_parser.add_argument("--notion-property", default="Quality", help="Target select property name (default: Quality)")
 
+    autofill_parser = subparsers.add_parser(
+        "autofill-missing-sections",
+        help="Phase 3 · For a wiki page with editorial=yellow (missing required heading), decide via deepseek-chat judge whether the page has enough content to fill; if fill, append an empty heading_2 and delegate content generation to llm-refine-page (Kimi).",
+    )
+    autofill_parser.add_argument("page_id", help="Wiki page id")
+    autofill_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="Generator provider for the new section body (default: kimi)")
+    autofill_parser.add_argument("--no-judge", action="store_true", help="Skip fill/skip judge; fill every missing required heading in priority order")
+    autofill_parser.add_argument("--reader", choices=sorted(VALID_READERS), help="Reader profile for prompt composition; auto-inferred if omitted")
+
     pipeline_parser = subparsers.add_parser(
         "pipeline",
         help="Full T1+T2 flow for one raw: compile-from-raw --auto-refine → llm-refine-page (Kimi) → llm-validate (DeepSeek, annotate) → Gemini arbiter on FAIL → Kimi round 2 if upheld → check-editorial. Max 2 Kimi rounds.",
@@ -5936,6 +6180,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_compute_lifecycle_state(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "compute-quality-state":
         return command_compute_quality_state(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "autofill-missing-sections":
+        return command_autofill_missing_sections(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "pipeline":
         return command_pipeline(
             client,
