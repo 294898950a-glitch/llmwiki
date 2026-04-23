@@ -4508,6 +4508,344 @@ def command_resolve_decision(args: argparse.Namespace) -> int:
     return 0
 
 
+# =========================================================================
+# v18 P1 · 对象生命周期状态机 (Lifecycle) — growing / stable / stale / conflicted
+# v18 P2 · 统一质量状态 (Quality)            — draft / review_required / validated / ready
+# =========================================================================
+
+LIFECYCLE_STATES = ("growing", "stable", "stale", "conflicted")
+QUALITY_STATES = ("draft", "review_required", "validated", "ready")
+
+
+def ensure_select_property(
+    client: NotionClient,
+    wiki_database_id: str,
+    prop_name: str,
+    options: Tuple[str, ...],
+    color_map: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """Create a select property on the Wiki DB if absent, with the given options.
+
+    Idempotent: if property exists with correct type, no-op.  If exists as a
+    non-select type, raises.  If exists but missing options, patches them in."""
+    db = client.retrieve_database(wiki_database_id)
+    existing = db.get("properties", {}).get(prop_name)
+    default_color = color_map or {}
+    if existing:
+        if existing.get("type") != "select":
+            raise NotionError(
+                f"property {prop_name!r} exists but type is {existing.get('type')!r}, expected 'select'"
+            )
+        current_options = {o.get("name") for o in existing.get("select", {}).get("options", [])}
+        missing = [o for o in options if o not in current_options]
+        if not missing:
+            return {"action": "already_exists", "property": prop_name}
+        merged = list(existing.get("select", {}).get("options", [])) + [
+            {"name": o, "color": default_color.get(o, "default")} for o in missing
+        ]
+        client.update_database(
+            wiki_database_id,
+            {"properties": {prop_name: {"select": {"options": merged}}}},
+        )
+        return {"action": "options_extended", "property": prop_name, "added": missing}
+    payload = {
+        "properties": {
+            prop_name: {
+                "select": {
+                    "options": [
+                        {"name": o, "color": default_color.get(o, "default")} for o in options
+                    ]
+                }
+            }
+        }
+    }
+    client.update_database(wiki_database_id, payload)
+    return {"action": "created", "property": prop_name, "options": list(options)}
+
+
+def find_latest_llm_validate_for_page(wiki_page_id: str, days: int = 30) -> Optional[Dict[str, Any]]:
+    """Scan recent audit-log.jsonl for the most recent llm-validate entry whose
+    wiki_page_id matches. Returns the full audit record or None."""
+    records = iter_recent_audit_records(days=days)
+    candidates = []
+    norm = normalize_notion_id(wiki_page_id)
+    for r in records:
+        if r.get("command") != "llm-validate":
+            continue
+        if normalize_notion_id(r.get("wiki_page_id", "")) != norm:
+            continue
+        candidates.append(r)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    return candidates[0]
+
+
+def find_recent_conflicts_for_page(wiki_page_id: str, days: int = 7) -> List[Dict[str, Any]]:
+    """Compile records for this wiki page that emitted a diff (conflict signal)."""
+    norm = normalize_notion_id(wiki_page_id)
+    hits = []
+    for r in iter_recent_audit_records(days=days):
+        cmd = r.get("command", "")
+        if not cmd.startswith("compile-"):
+            continue
+        wiki_block = r.get("wiki") or {}
+        if normalize_notion_id(wiki_block.get("page_id", "")) != norm:
+            continue
+        if r.get("diff_appended"):
+            hits.append(r)
+    return hits
+
+
+def open_decisions_for_page(wiki_page_id: str) -> List[Dict[str, Any]]:
+    """Decisions whose subject_page_id matches and whose latest status is not terminal."""
+    state = load_decisions_state()
+    norm = normalize_notion_id(wiki_page_id)
+    out = []
+    for rec in state.values():
+        if normalize_notion_id(rec.get("subject_page_id", "") or "") != norm:
+            continue
+        if rec.get("status") in ("open", "in_review"):
+            out.append(rec)
+    return out
+
+
+def compute_lifecycle_state(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+) -> Dict[str, Any]:
+    page = client.retrieve_page(wiki_page_id)
+    props = page.get("properties", {})
+
+    level_prop = mapping.get("compounded_level_property") or "Compounded Level"
+    level = props.get(level_prop, {}).get("number") or 0
+
+    last_prop = mapping.get("last_compounded_at_property") or "Last Compounded At"
+    last_date_str = (props.get(last_prop, {}).get("date") or {}).get("start", "") or ""
+    last_date: Optional[dt.date] = None
+    try:
+        last_date = dt.date.fromisoformat(last_date_str[:10]) if last_date_str else None
+    except ValueError:
+        last_date = None
+    today = dt.date.today()
+    days_since = (today - last_date).days if last_date else 9999
+
+    source_prop = mapping.get("source_property") or "Source"
+    source_count = len(props.get(source_prop, {}).get("relation", []) or [])
+
+    conflicts = find_recent_conflicts_for_page(wiki_page_id, days=7)
+
+    editorial = check_editorial_compliance(client, wiki_database_id, mapping, wiki_page_id)
+    compliance = editorial.get("compliance")
+
+    if conflicts:
+        state = "conflicted"
+    elif compliance == "green" and level >= 3 and days_since >= 7:
+        state = "stable"
+    elif days_since >= 30 and compliance not in ("green", "placeholder"):
+        state = "stale"
+    else:
+        state = "growing"
+
+    return {
+        "wiki_page_id": wiki_page_id,
+        "lifecycle": state,
+        "evidence": {
+            "compounded_level": level,
+            "last_compounded_at": last_date_str or None,
+            "days_since_compound": days_since if last_date else None,
+            "source_count": source_count,
+            "compliance": compliance,
+            "recent_conflicts": len(conflicts),
+        },
+    }
+
+
+def compute_quality_state(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+) -> Dict[str, Any]:
+    editorial = check_editorial_compliance(client, wiki_database_id, mapping, wiki_page_id)
+    compliance = editorial.get("compliance")
+
+    latest_validate = find_latest_llm_validate_for_page(wiki_page_id, days=30)
+    avg_score = latest_validate.get("avg_score") if latest_validate else None
+    fail_count = latest_validate.get("fail_count") if latest_validate else None
+
+    open_decisions = open_decisions_for_page(wiki_page_id)
+
+    if compliance == "placeholder":
+        state = "draft"
+    elif compliance == "red":
+        state = "draft"
+    elif latest_validate is None:
+        # editorial yellow/green but never validated
+        state = "draft"
+    elif fail_count and fail_count > 0:
+        state = "review_required"
+    elif compliance == "yellow":
+        state = "review_required"
+    elif open_decisions:
+        state = "review_required"
+    elif compliance == "green" and isinstance(avg_score, (int, float)) and avg_score >= 8:
+        # ready requires reference-check conformance; skip for MVP, default to validated.
+        # Future: if caller passes a reference_page_id, compute conformance and upgrade to ready.
+        state = "validated"
+    else:
+        state = "review_required"
+
+    return {
+        "wiki_page_id": wiki_page_id,
+        "quality": state,
+        "evidence": {
+            "compliance": compliance,
+            "editorial_issue_count": editorial.get("issue_count"),
+            "latest_validate_avg_score": avg_score,
+            "latest_validate_fail_count": fail_count,
+            "latest_validate_timestamp": latest_validate.get("timestamp") if latest_validate else None,
+            "open_decisions_count": len(open_decisions),
+        },
+    }
+
+
+def _write_state_to_notion(
+    client: NotionClient,
+    wiki_page_id: str,
+    prop_name: str,
+    state_value: str,
+) -> None:
+    client.update_page(
+        wiki_page_id,
+        {"properties": {prop_name: {"select": {"name": state_value}}}},
+    )
+
+
+def _append_states_log(record: Dict[str, Any]) -> Path:
+    return append_jsonl_log(daily_log_filename("states-log.jsonl"), record)
+
+
+LIFECYCLE_COLOR_MAP = {"growing": "blue", "stable": "green", "stale": "gray", "conflicted": "red"}
+QUALITY_COLOR_MAP = {"draft": "gray", "review_required": "yellow", "validated": "green", "ready": "purple"}
+
+
+def command_compute_lifecycle_state(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    prop_name = getattr(args, "notion_property", None) or "Lifecycle"
+    if args.write_notion:
+        ensure_select_property(client, wiki_database_id, prop_name, LIFECYCLE_STATES, LIFECYCLE_COLOR_MAP)
+
+    if args.all:
+        pages = query_database_pages(client, wiki_database_id, None, page_size=20, max_pages=5)
+        if args.limit:
+            pages = pages[: args.limit]
+        results: List[Dict[str, Any]] = []
+        for p in pages:
+            pid = p.get("id")
+            if not pid:
+                continue
+            try:
+                r = compute_lifecycle_state(client, wiki_database_id, mapping, pid)
+            except NotionError as exc:
+                results.append({"wiki_page_id": pid, "error": str(exc)})
+                continue
+            r["timestamp"] = iso_now()
+            _append_states_log({**r, "kind": "lifecycle"})
+            if args.write_notion:
+                try:
+                    _write_state_to_notion(client, pid, prop_name, r["lifecycle"])
+                    r["notion_written"] = True
+                except NotionError as exc:
+                    r["notion_write_error"] = str(exc)
+            results.append(r)
+        summary = {
+            "scope": "all",
+            "count": len(results),
+            "by_state": {s: sum(1 for r in results if r.get("lifecycle") == s) for s in LIFECYCLE_STATES},
+            "results": results,
+        }
+        print(json.dumps(audit_success("compute-lifecycle-state", summary), ensure_ascii=False, indent=2))
+        return 0
+
+    if not args.page_id:
+        raise NotionError("compute-lifecycle-state requires either <page_id> or --all")
+    r = compute_lifecycle_state(client, wiki_database_id, mapping, args.page_id)
+    r["timestamp"] = iso_now()
+    _append_states_log({**r, "kind": "lifecycle"})
+    if args.write_notion:
+        try:
+            _write_state_to_notion(client, args.page_id, prop_name, r["lifecycle"])
+            r["notion_written"] = True
+        except NotionError as exc:
+            r["notion_write_error"] = str(exc)
+    print(json.dumps(audit_success("compute-lifecycle-state", r), ensure_ascii=False, indent=2))
+    return 0
+
+
+def command_compute_quality_state(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    prop_name = getattr(args, "notion_property", None) or "Quality"
+    if args.write_notion:
+        ensure_select_property(client, wiki_database_id, prop_name, QUALITY_STATES, QUALITY_COLOR_MAP)
+
+    if args.all:
+        pages = query_database_pages(client, wiki_database_id, None, page_size=20, max_pages=5)
+        if args.limit:
+            pages = pages[: args.limit]
+        results: List[Dict[str, Any]] = []
+        for p in pages:
+            pid = p.get("id")
+            if not pid:
+                continue
+            try:
+                r = compute_quality_state(client, wiki_database_id, mapping, pid)
+            except NotionError as exc:
+                results.append({"wiki_page_id": pid, "error": str(exc)})
+                continue
+            r["timestamp"] = iso_now()
+            _append_states_log({**r, "kind": "quality"})
+            if args.write_notion:
+                try:
+                    _write_state_to_notion(client, pid, prop_name, r["quality"])
+                    r["notion_written"] = True
+                except NotionError as exc:
+                    r["notion_write_error"] = str(exc)
+            results.append(r)
+        summary = {
+            "scope": "all",
+            "count": len(results),
+            "by_state": {s: sum(1 for r in results if r.get("quality") == s) for s in QUALITY_STATES},
+            "results": results,
+        }
+        print(json.dumps(audit_success("compute-quality-state", summary), ensure_ascii=False, indent=2))
+        return 0
+
+    if not args.page_id:
+        raise NotionError("compute-quality-state requires either <page_id> or --all")
+    r = compute_quality_state(client, wiki_database_id, mapping, args.page_id)
+    r["timestamp"] = iso_now()
+    _append_states_log({**r, "kind": "quality"})
+    if args.write_notion:
+        try:
+            _write_state_to_notion(client, args.page_id, prop_name, r["quality"])
+            r["notion_written"] = True
+        except NotionError as exc:
+            r["notion_write_error"] = str(exc)
+    print(json.dumps(audit_success("compute-quality-state", r), ensure_ascii=False, indent=2))
+    return 0
+
+
 GEMINI_ARBITER_SYSTEM_PROMPT = (
     "你是永久笔记质量的第三方仲裁员。你将看到一段 Kimi 产出的永久笔记 heading 内容，以及 DeepSeek 对它的 FAIL 校验意见。\n"
     "\n"
@@ -4968,6 +5306,29 @@ def _run_and_append_editorial(
     except NotionError as exc:
         stages.append({"stage": "check_editorial", "error": str(exc)})
 
+    # v18 P1 / P2: compute lifecycle + quality states at pipeline end and
+    # propagate to Notion (auto-create the Lifecycle / Quality select
+    # properties on Wiki DB if missing). Best-effort — failures are logged
+    # into stages but never abort the pipeline.
+    try:
+        ensure_select_property(client, wiki_database_id, "Lifecycle", LIFECYCLE_STATES, LIFECYCLE_COLOR_MAP)
+        lifecycle = compute_lifecycle_state(client, wiki_database_id, mapping, wiki_page_id)
+        lifecycle["timestamp"] = iso_now()
+        _append_states_log({**lifecycle, "kind": "lifecycle", "source": "pipeline"})
+        _write_state_to_notion(client, wiki_page_id, "Lifecycle", lifecycle["lifecycle"])
+        stages.append({"stage": "lifecycle_state", "state": lifecycle["lifecycle"], "notion_written": True})
+    except NotionError as exc:
+        stages.append({"stage": "lifecycle_state", "error": str(exc)})
+    try:
+        ensure_select_property(client, wiki_database_id, "Quality", QUALITY_STATES, QUALITY_COLOR_MAP)
+        quality = compute_quality_state(client, wiki_database_id, mapping, wiki_page_id)
+        quality["timestamp"] = iso_now()
+        _append_states_log({**quality, "kind": "quality", "source": "pipeline"})
+        _write_state_to_notion(client, wiki_page_id, "Quality", quality["quality"])
+        stages.append({"stage": "quality_state", "state": quality["quality"], "notion_written": True})
+    except NotionError as exc:
+        stages.append({"stage": "quality_state", "error": str(exc)})
+
 
 def _append_arbiter_callout(
     client: NotionClient,
@@ -5225,6 +5586,26 @@ def build_parser() -> argparse.ArgumentParser:
     resolve_parser.add_argument("--rationale", default="", help="Free-text explanation of the decision")
     resolve_parser.add_argument("--resolver", default="", help="Who made the decision; defaults to 'session-layer'")
 
+    lifecycle_parser = subparsers.add_parser(
+        "compute-lifecycle-state",
+        help="v18 P1: compute lifecycle state (growing / stable / stale / conflicted) for a wiki page from observable signals (Compounded Level / Last Compounded At / editorial / recent diff conflicts).",
+    )
+    lifecycle_parser.add_argument("page_id", nargs="?", default="", help="Wiki page id; omit when using --all")
+    lifecycle_parser.add_argument("--all", action="store_true", help="Compute for every page in the Wiki database")
+    lifecycle_parser.add_argument("--limit", type=int, default=50)
+    lifecycle_parser.add_argument("--write-notion", action="store_true", help="Write the computed state to Wiki.<notion-property> (select). Auto-creates the property with {growing,stable,stale,conflicted} options if missing.")
+    lifecycle_parser.add_argument("--notion-property", default="Lifecycle", help="Target select property name (default: Lifecycle)")
+
+    quality_parser = subparsers.add_parser(
+        "compute-quality-state",
+        help="v18 P2: aggregate check-editorial + latest llm-validate + open decisions into a single quality state (draft / review_required / validated / ready) for a wiki page.",
+    )
+    quality_parser.add_argument("page_id", nargs="?", default="", help="Wiki page id; omit when using --all")
+    quality_parser.add_argument("--all", action="store_true", help="Compute for every page in the Wiki database")
+    quality_parser.add_argument("--limit", type=int, default=50)
+    quality_parser.add_argument("--write-notion", action="store_true", help="Write the computed state to Wiki.<notion-property> (select). Auto-creates the property with {draft,review_required,validated,ready} options if missing.")
+    quality_parser.add_argument("--notion-property", default="Quality", help="Target select property name (default: Quality)")
+
     pipeline_parser = subparsers.add_parser(
         "pipeline",
         help="Full T1+T2 flow for one raw: compile-from-raw --auto-refine → llm-refine-page (Kimi) → llm-validate (DeepSeek, annotate) → Gemini arbiter on FAIL → Kimi round 2 if upheld → check-editorial. Max 2 Kimi rounds.",
@@ -5326,6 +5707,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_list_review_queue(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "resolve-decision":
         return command_resolve_decision(args)
+    if args.command == "compute-lifecycle-state":
+        return command_compute_lifecycle_state(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "compute-quality-state":
+        return command_compute_quality_state(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "pipeline":
         return command_pipeline(
             client,
