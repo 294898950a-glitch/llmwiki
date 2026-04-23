@@ -1473,6 +1473,48 @@ def find_upsert_target(
     }
 
 
+def _ensure_wiki_source_contains_raw(
+    client: NotionClient,
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+    raw_page_id: str,
+) -> Optional[str]:
+    """Union-append raw_page_id into Wiki.Source relation. Silent no-op if:
+    - mapping lacks source_property
+    - schema lacks the configured property
+    - property is not a relation
+    - property's relation target is not the raw inbox DB
+    - raw_page_id already in the list (idempotent)
+    Returns 'added' / 'already_present' / None (skipped)."""
+    source_prop_name = mapping.get("source_property")
+    if not source_prop_name:
+        return None
+    try:
+        database = client.retrieve_database(wiki_database_id)
+    except NotionError:
+        return None
+    prop_meta = database.get("properties", {}).get(source_prop_name)
+    if not prop_meta or prop_meta.get("type") != "relation":
+        return None
+    try:
+        wiki_page = client.retrieve_page(wiki_page_id)
+    except NotionError:
+        return None
+    existing = wiki_page.get("properties", {}).get(source_prop_name, {}).get("relation", []) or []
+    existing_ids = {normalize_notion_id(r.get("id", "")) for r in existing if r.get("id")}
+    normalized_raw = normalize_notion_id(raw_page_id)
+    if normalized_raw in existing_ids:
+        return "already_present"
+    new_relation = list(existing) + [{"id": raw_page_id}]
+    try:
+        client.update_page(wiki_page_id, {"properties": {source_prop_name: {"relation": new_relation}}})
+    except NotionError as exc:
+        print(f"WARN: failed to update Wiki.Source on {wiki_page_id}: {exc}", file=sys.stderr)
+        return None
+    return "added"
+
+
 def upsert_note_to_wiki(
     client: NotionClient,
     database_id: str,
@@ -1819,6 +1861,8 @@ def compile_raw_page(
         if raw_updates:
             client.update_page(raw_page_id, {"properties": raw_updates})
 
+        _ensure_wiki_source_contains_raw(client, wiki_database_id, mapping, wiki_page_id, raw_page_id)
+
         return {
             "timestamp": iso_now(),
             "action": "section_replaced",
@@ -1840,6 +1884,13 @@ def compile_raw_page(
 
     # Default: merge_mode == "append"
     wiki_result = upsert_note_to_wiki(client, wiki_database_id, mapping, upsert_args)
+
+    # Union-append this raw_page_id into Wiki.Source relation. Keeps "this wiki
+    # object was built from these raws" auditable on the Notion side and
+    # supports object-level compounding history (same wiki updated by multiple
+    # raws over time). Silent no-op if the wiki DB has no Source property or
+    # the property isn't a relation.
+    _ensure_wiki_source_contains_raw(client, wiki_database_id, mapping, wiki_result["page_id"], raw_page_id)
 
     raw_props_meta = raw_database.get("properties", {})
     raw_updates: Dict[str, Any] = {}
