@@ -1453,6 +1453,7 @@ def find_upsert_target(
         )
 
     fuzzy_candidate_ids: List[str] = []
+    fuzzy_candidates: List[Dict[str, Any]] = []
     if not exact_match:
         fuzzy_candidates = find_fuzzy_candidates(
             client,
@@ -1478,11 +1479,37 @@ def find_upsert_target(
                 file=sys.stderr,
             )
 
+    # Support forcing a specific fuzzy candidate as the exact match, for
+    # Phase 2b fuzzy-judge: if judge decided a fuzzy candidate really is
+    # the same entity, upstream sets `force_exact_match_id` and find_upsert_target
+    # picks up that id from the fuzzy list and promotes it.
+    force_id = getattr(args, "force_exact_match_id", None)
+    if not exact_match and force_id:
+        norm_force = normalize_notion_id(force_id)
+        forced = next(
+            (
+                p
+                for p in (fuzzy_candidates if not exact_match else [])
+                if normalize_notion_id(p.get("id", "")) == norm_force
+            ),
+            None,
+        )
+        if forced is None:
+            # Fall back to candidates (in case caller forced a non-fuzzy match id)
+            forced = next(
+                (p for p in candidates if normalize_notion_id(p.get("id", "")) == norm_force),
+                None,
+            )
+        if forced is not None:
+            exact_match = forced
+            match_strategy = "fuzzy_promoted"
+
     return {
         "exact_match": exact_match,
         "match_strategy": match_strategy,
         "candidates": candidates,
         "fuzzy_candidate_ids": fuzzy_candidate_ids,
+        "fuzzy_candidates_full": list(fuzzy_candidates) if not exact_match or match_strategy == "fuzzy_promoted" else [],
         "title_prop": title_prop,
         "title_prop_type": title_prop_type,
     }
@@ -1914,19 +1941,32 @@ def compile_raw_page(
     # alias matches). Enabled by default when judge LLM is available; bypass
     # via --no-judge. Never fires under --strict-alias (that already hard-stops).
     judge_result: Optional[Dict[str, Any]] = None
+    fuzzy_judge_results: List[Dict[str, Any]] = []
     disable_judge = bool(getattr(args, "no_judge", False))
     strict_alias = bool(getattr(args, "strict_alias", False))
-    if not disable_judge and not strict_alias and env is not None:
+    strict_fuzzy = bool(getattr(args, "strict_fuzzy", False))
+    if not disable_judge and env is not None:
         try:
             wiki_database = client.retrieve_database(wiki_database_id)
             preview_target = find_upsert_target(client, wiki_database, wiki_database_id, mapping, upsert_args)
         except NotionError:
             preview_target = None
-        if preview_target and preview_target.get("match_strategy") == "alias" and preview_target.get("exact_match"):
+        title_prop_peek = (
+            mapping.get("title_property")
+            or (detect_title_property(wiki_database) if preview_target else None)
+            or "Name"
+        )
+        aliases_prop_peek = mapping.get("aliases_property") or ""
+
+        # A) alias judge — same_entity keeps alias update; different_entity forces new-page path
+        if (
+            not strict_alias
+            and preview_target
+            and preview_target.get("match_strategy") == "alias"
+            and preview_target.get("exact_match")
+        ):
             wiki_page = preview_target["exact_match"]
             wiki_page_id_peek = wiki_page.get("id", "")
-            title_prop_peek = mapping.get("title_property") or detect_title_property(wiki_database) or "Name"
-            aliases_prop_peek = mapping.get("aliases_property") or ""
             wiki_title_peek = extract_title(wiki_page, title_prop_peek) if title_prop_peek else ""
             wiki_aliases_peek = extract_property_text(wiki_page, aliases_prop_peek) if aliases_prop_peek else ""
             try:
@@ -1950,6 +1990,47 @@ def compile_raw_page(
                     f"Reasoning: {judge_result['reasoning'][:200]}",
                     file=sys.stderr,
                 )
+
+        # B) fuzzy judge — no exact_match but fuzzy candidates exist. Each candidate
+        # is evaluated; same_entity + conf >= 0.7 promotes it to exact_match (merge
+        # into instead of create).  different_entity / uncertain → proceed with
+        # new-page create as before.
+        if (
+            not strict_fuzzy
+            and preview_target
+            and not preview_target.get("exact_match")
+            and preview_target.get("fuzzy_candidates_full")
+        ):
+            candidates_to_judge = preview_target["fuzzy_candidates_full"][:3]
+            for cand in candidates_to_judge:
+                cand_id = cand.get("id", "")
+                if not cand_id:
+                    continue
+                cand_title = extract_title(cand, title_prop_peek) if title_prop_peek else ""
+                cand_aliases = extract_property_text(cand, aliases_prop_peek) if aliases_prop_peek else ""
+                try:
+                    cand_body = read_page_body_text(client, cand_id)[:1200]
+                except NotionError:
+                    cand_body = ""
+                verdict = judge_fuzzy_match(
+                    env, title, note, cand_title, cand_aliases, cand_body, cand_id,
+                )
+                fuzzy_judge_results.append({
+                    "candidate_id": cand_id,
+                    "candidate_title": cand_title,
+                    "choice": verdict["choice"],
+                    "confidence": verdict["confidence"],
+                    "reasoning": verdict["reasoning"][:300],
+                })
+                if verdict["choice"] == "same_entity" and verdict["confidence"] >= 0.7:
+                    upsert_args.force_exact_match_id = cand_id
+                    print(
+                        f"INFO: deepseek-chat judge promoted fuzzy candidate {cand_id!r} "
+                        f"({cand_title!r}) to exact match (confidence {verdict['confidence']:.2f}); "
+                        f"merging into instead of creating new page. Reasoning: {verdict['reasoning'][:200]}",
+                        file=sys.stderr,
+                    )
+                    break  # first high-confidence merge wins; don't waste API on rest
 
     wiki_result = upsert_note_to_wiki(client, wiki_database_id, mapping, upsert_args)
 
@@ -2054,6 +2135,7 @@ def compile_raw_page(
             if judge_result
             else None
         ),
+        "fuzzy_judge": fuzzy_judge_results or None,
     }
 
 
@@ -4739,6 +4821,7 @@ def compute_quality_state(
     wiki_database_id: str,
     mapping: Dict[str, Any],
     wiki_page_id: str,
+    reference_page_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     editorial = check_editorial_compliance(client, wiki_database_id, mapping, wiki_page_id)
     compliance = editorial.get("compliance")
@@ -4763,11 +4846,25 @@ def compute_quality_state(
     elif open_decisions:
         state = "review_required"
     elif compliance == "green" and isinstance(avg_score, (int, float)) and avg_score >= 8:
-        # ready requires reference-check conformance; skip for MVP, default to validated.
-        # Future: if caller passes a reference_page_id, compute conformance and upgrade to ready.
         state = "validated"
     else:
         state = "review_required"
+
+    # Phase 4b: upgrade validated → ready if reference-check conformance is green
+    conformance: Optional[str] = None
+    if state == "validated" and reference_page_id:
+        if normalize_notion_id(reference_page_id) == normalize_notion_id(wiki_page_id):
+            # Self-reference: the reference page itself counts as ready by definition
+            state = "ready"
+            conformance = "self"
+        else:
+            try:
+                ref = compare_page_to_reference(client, wiki_database_id, mapping, reference_page_id, wiki_page_id)
+                conformance = ref.get("conformance")
+                if conformance == "green":
+                    state = "ready"
+            except NotionError as exc:
+                conformance = f"error:{exc}"
 
     return {
         "wiki_page_id": wiki_page_id,
@@ -4779,6 +4876,7 @@ def compute_quality_state(
             "latest_validate_fail_count": fail_count,
             "latest_validate_timestamp": latest_validate.get("timestamp") if latest_validate else None,
             "open_decisions_count": len(open_decisions),
+            "reference_conformance": conformance,
         },
     }
 
@@ -4880,7 +4978,7 @@ def command_compute_quality_state(
             if not pid:
                 continue
             try:
-                r = compute_quality_state(client, wiki_database_id, mapping, pid)
+                r = compute_quality_state(client, wiki_database_id, mapping, pid, reference_page_id=getattr(args, "reference_page_id", None) or mapping.get("reference_page_id"))
             except NotionError as exc:
                 results.append({"wiki_page_id": pid, "error": str(exc)})
                 continue
@@ -4904,7 +5002,7 @@ def command_compute_quality_state(
 
     if not args.page_id:
         raise NotionError("compute-quality-state requires either <page_id> or --all")
-    r = compute_quality_state(client, wiki_database_id, mapping, args.page_id)
+    r = compute_quality_state(client, wiki_database_id, mapping, args.page_id, reference_page_id=getattr(args, "reference_page_id", None) or mapping.get("reference_page_id"))
     r["timestamp"] = iso_now()
     _append_states_log({**r, "kind": "quality"})
     if args.write_notion:
@@ -5252,6 +5350,312 @@ def command_autofill_missing_sections(
     if payload.get("filled"):
         return 0
     return 0 if payload.get("missing_count", 0) == 0 else 1
+
+
+def judge_concept_candidates(
+    env: Dict[str, str],
+    topic_title: str,
+    body_head: str,
+    wiki_page_id: str,
+    existing_titles: Optional[List[str]] = None,
+    max_candidates: int = 8,
+) -> Dict[str, Any]:
+    """Phase 4a: ask deepseek-chat to list likely-related concept names for a
+    wiki page. When `existing_titles` is provided, the judge is instructed
+    to PICK FROM that list — this dramatically improves match rate downstream
+    (otherwise judge emits generic concept names that rarely match concrete
+    wiki page titles)."""
+    if existing_titles:
+        pool_hint = (
+            "**重要**：只从下面这份已存在的 wiki 页标题里挑选（不要发明新名字）。只挑和当前词条真正相关的：\n"
+            + "\n".join(f"- {t}" for t in existing_titles[:60])
+        )
+    else:
+        pool_hint = ""
+
+    system_rules = (
+        "你在为一个 wiki 页面找'关联概念'——其他在同一概念空间、该页自然会提到或被读者接下来想看的主题。\n"
+        "\n"
+        "判据：\n"
+        "- 候选必须是名词性概念（一个术语 / 一个对象），不是动词短语或句子\n"
+        "- 候选要和当前主题**在同一领域**（agent 话题就是 agent 相关；量化话题就是量化相关；Pop Mart 商业话题就是商业相关）\n"
+        "- 避免超级泛（如'概念'、'系统'）\n"
+        f"- 最多返回 {max_candidates} 个，宁缺勿滥；只有明显相关才列\n"
+        f"- 如果找不到够格的候选，可以返回空数组\n"
+        f"\n{pool_hint}\n"
+        "\n"
+        "输出格式（严格）：\n"
+        '{"candidates": ["概念1", "概念2", ...], "reasoning": "一句概括"}\n'
+    )
+    user_prompt = (
+        f"当前词条：{topic_title}\n\n"
+        f"正文前 1500 字：\n{(body_head or '')[:1500]}\n\n"
+        + ("从上面给出的已有 wiki 列表里挑选。" if existing_titles else "请列出值得链接为'关联概念'的其他术语名。")
+    )
+    try:
+        client = build_llm_client(env, "deepseek-chat", None)
+    except NotionError as exc:
+        _append_judge_log({
+            "timestamp": iso_now(),
+            "tag": f"concept_candidates:{wiki_page_id}",
+            "error": f"build_client_failed: {exc}",
+            "candidates": [],
+        })
+        return {"candidates": [], "reasoning": f"judge_unavailable: {exc}", "error": str(exc)}
+
+    t0 = time.time()
+    try:
+        response = client.chat(system=system_rules, user=user_prompt, max_tokens=600, temperature=0.2)
+    except NotionError as exc:
+        _append_judge_log({
+            "timestamp": iso_now(),
+            "tag": f"concept_candidates:{wiki_page_id}",
+            "error": f"api_error: {exc}",
+            "latency_s": round(time.time() - t0, 2),
+            "candidates": [],
+        })
+        return {"candidates": [], "reasoning": f"api_error: {exc}", "error": str(exc)}
+
+    latency = time.time() - t0
+    content = (response.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+    parsed = parse_gemini_json(content)
+    candidates: List[str] = []
+    reasoning = ""
+    if isinstance(parsed, dict):
+        raw_list = parsed.get("candidates")
+        if isinstance(raw_list, list):
+            for c in raw_list:
+                if isinstance(c, str) and c.strip():
+                    candidates.append(c.strip())
+        reasoning = str(parsed.get("reasoning", ""))
+    candidates = candidates[:max_candidates]
+
+    _append_judge_log({
+        "timestamp": iso_now(),
+        "tag": f"concept_candidates:{wiki_page_id}",
+        "latency_s": round(latency, 2),
+        "candidates": candidates,
+        "reasoning": reasoning,
+        "model": client.model,
+        "usage": response.get("usage", {}),
+        "raw_content_head": content[:400],
+    })
+    return {"candidates": candidates, "reasoning": reasoning}
+
+
+def discover_related_concepts(
+    client: NotionClient,
+    env: Optional[Dict[str, str]],
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    wiki_page_id: str,
+) -> Dict[str, Any]:
+    """Phase 4a core: use deepseek-chat to nominate related concept names,
+    resolve them against the Wiki DB, and union-append the matched page ids
+    into Wiki.Related Pages. Non-matches are reported but not created
+    (seed-related-pages already exists for creating placeholders)."""
+    rel_prop = mapping.get("related_pages_property") or "Related Pages"
+    if env is None:
+        return {"wiki_page_id": wiki_page_id, "error": "env unavailable for judge call"}
+
+    # Read topic + body for the judge
+    database = client.retrieve_database(wiki_database_id)
+    page = client.retrieve_page(wiki_page_id)
+    title_prop = mapping.get("title_property") or detect_title_property(database) or "Name"
+    topic_title = extract_title(page, title_prop) if title_prop else ""
+    try:
+        body_head = read_page_body_text(client, wiki_page_id)[:1500]
+    except NotionError:
+        body_head = ""
+
+    # Pre-fetch existing wiki page titles (minus self) to give judge a concrete
+    # pool to pick from. Dramatically improves match rate vs free-form generation.
+    self_norm = normalize_notion_id(wiki_page_id)
+    all_pages = query_database_pages(client, wiki_database_id, None, page_size=50, max_pages=5)
+    existing_titles: List[str] = []
+    for p in all_pages:
+        pid = p.get("id", "")
+        if not pid or normalize_notion_id(pid) == self_norm:
+            continue
+        t = extract_title(p, title_prop) if title_prop else ""
+        if t and t.strip():
+            existing_titles.append(t.strip())
+
+    judge_outcome = judge_concept_candidates(env, topic_title, body_head, wiki_page_id, existing_titles=existing_titles)
+    candidates = judge_outcome.get("candidates", [])
+
+    if not candidates:
+        return {
+            "wiki_page_id": wiki_page_id,
+            "topic_title": topic_title,
+            "candidates": [],
+            "matched": [],
+            "unmatched": [],
+            "added_to_related": [],
+            "reasoning": judge_outcome.get("reasoning"),
+        }
+
+    # Resolve each candidate against Wiki DB
+    database = client.retrieve_database(wiki_database_id)
+    aliases_prop = mapping.get("aliases_property")
+    if aliases_prop not in database.get("properties", {}):
+        aliases_prop = None
+    aliases_prop_type = database.get("properties", {}).get(aliases_prop, {}).get("type") if aliases_prop else None
+    title_prop_type = database.get("properties", {}).get(title_prop, {}).get("type", "title")
+
+    self_norm = normalize_notion_id(wiki_page_id)
+    matched: List[Dict[str, Any]] = []
+    unmatched: List[str] = []
+    for concept in candidates:
+        try:
+            hits = search_in_database(
+                client,
+                wiki_database_id,
+                concept,
+                title_prop,
+                title_prop_type,
+                aliases_prop,
+                aliases_prop_type,
+            )
+        except NotionError:
+            hits = []
+        hit = None
+        for p in hits:
+            if normalize_notion_id(p.get("id", "")) == self_norm:
+                continue
+            t = extract_title(p, title_prop) if title_prop else ""
+            if normalize(t) == normalize(concept):
+                hit = p
+                break
+        if hit is None:
+            for p in hits:
+                if normalize_notion_id(p.get("id", "")) != self_norm:
+                    hit = p
+                    break
+        if hit:
+            matched.append({
+                "candidate": concept,
+                "resolved_page_id": hit.get("id"),
+                "resolved_title": extract_title(hit, title_prop) if title_prop else "",
+            })
+        else:
+            unmatched.append(concept)
+
+    # Union-append matched pages to Related Pages relation
+    added_to_related: List[str] = []
+    if matched:
+        # Ensure property exists
+        if rel_prop not in database.get("properties", {}):
+            try:
+                ensure_related_pages_property(client, wiki_database_id, rel_prop)
+            except NotionError as exc:
+                return {
+                    "wiki_page_id": wiki_page_id,
+                    "topic_title": topic_title,
+                    "candidates": candidates,
+                    "matched": matched,
+                    "unmatched": unmatched,
+                    "added_to_related": [],
+                    "error": f"ensure_property_failed: {exc}",
+                }
+        existing = page.get("properties", {}).get(rel_prop, {}).get("relation", []) or []
+        existing_ids = {normalize_notion_id(r.get("id", "")): r.get("id") for r in existing if r.get("id")}
+        for m in matched:
+            pid = m.get("resolved_page_id", "")
+            if not pid:
+                continue
+            norm = normalize_notion_id(pid)
+            if norm in existing_ids or norm == self_norm:
+                continue
+            existing_ids[norm] = pid
+            added_to_related.append(pid)
+        if added_to_related:
+            new_relation = [{"id": rid} for rid in existing_ids.values()]
+            try:
+                client.update_page(wiki_page_id, {"properties": {rel_prop: {"relation": new_relation}}})
+            except NotionError as exc:
+                return {
+                    "wiki_page_id": wiki_page_id,
+                    "topic_title": topic_title,
+                    "candidates": candidates,
+                    "matched": matched,
+                    "unmatched": unmatched,
+                    "added_to_related": [],
+                    "error": f"update_failed: {exc}",
+                }
+
+    return {
+        "wiki_page_id": wiki_page_id,
+        "topic_title": topic_title,
+        "candidates": candidates,
+        "matched": matched,
+        "unmatched": unmatched,
+        "added_to_related": added_to_related,
+        "reasoning": judge_outcome.get("reasoning"),
+    }
+
+
+def command_discover_related_concepts(
+    client: NotionClient,
+    env: Dict[str, str],
+    wiki_database_id: str,
+    mapping: Dict[str, Any],
+    args: argparse.Namespace,
+) -> int:
+    payload = discover_related_concepts(client, env, wiki_database_id, mapping, args.page_id)
+    print(json.dumps(audit_success("discover-related-concepts", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
+def judge_fuzzy_match(
+    env: Dict[str, str],
+    raw_title: str,
+    raw_body: str,
+    wiki_title: str,
+    wiki_aliases: str,
+    wiki_body: str,
+    wiki_page_id: str,
+) -> Dict[str, Any]:
+    """Phase 2b: fuzzy candidate promotion. Same prompt shape as alias judge
+    but phrased for fuzzy (no alias / canonical overlap exists; only title
+    similarity or topic overlap). same_entity here UPGRADES the fuzzy candidate
+    to exact match (merge into it). different_entity means proceed with new page."""
+    system_rules = (
+        "你在判断一个新 raw 和一个 fuzzy 候选 wiki 页是否同一实体。"
+        "fuzzy 意味着标题没严格等号、也没共用别名或 canonical id，只是主题相近。\n"
+        "\n"
+        "三个选项：\n"
+        "- same_entity：它们其实说的是同一对象（新材料应该合并进该 wiki），只是标题写法不同 / 措辞差异\n"
+        "- different_entity：虽然主题相近，但属于独立对象（同一领域内的不同话题、或粒度不同的父子概念）\n"
+        "- uncertain：信息不足 / 边界模糊\n"
+        "\n"
+        "判据：\n"
+        "- 核心定义是否相同？\n"
+        "- 讨论的抽象层级是否一致？（概念 vs 实例、体系 vs 子系统 = different）\n"
+        "- 时间 / 版本差异是否构成独立对象？\n"
+        "\n"
+        "confidence 阈值：只有非常明确时才 >= 0.8；稍有疑虑应 uncertain（会走新建流程）。"
+    )
+    user_prompt = (
+        f"【新 raw】\n"
+        f"标题：{raw_title}\n"
+        f"正文前 400 字：\n{(raw_body or '')[:400]}\n"
+        f"\n"
+        f"【fuzzy 候选 wiki 页】id={wiki_page_id}\n"
+        f"标题：{wiki_title}\n"
+        f"别名：{wiki_aliases or '(无)'}\n"
+        f"正文前 400 字：\n{(wiki_body or '')[:400]}\n"
+        f"\n"
+        f"它们是否同一实体？"
+    )
+    return judge_chat(
+        env,
+        system_rules,
+        user_prompt,
+        choices=("same_entity", "different_entity", "uncertain"),
+        context_tag=f"fuzzy_match:{wiki_page_id}",
+        max_tokens=500,
+    )
 
 
 def judge_alias_match(
@@ -5777,7 +6181,7 @@ def _run_and_append_editorial(
         stages.append({"stage": "lifecycle_state", "error": str(exc)})
     try:
         ensure_select_property(client, wiki_database_id, "Quality", QUALITY_STATES, QUALITY_COLOR_MAP)
-        quality = compute_quality_state(client, wiki_database_id, mapping, wiki_page_id)
+        quality = compute_quality_state(client, wiki_database_id, mapping, wiki_page_id, reference_page_id=mapping.get("reference_page_id"))
         quality["timestamp"] = iso_now()
         _append_states_log({**quality, "kind": "quality", "source": "pipeline"})
         _write_state_to_notion(client, wiki_page_id, "Quality", quality["quality"])
@@ -6063,6 +6467,7 @@ def build_parser() -> argparse.ArgumentParser:
     quality_parser.add_argument("--limit", type=int, default=50)
     quality_parser.add_argument("--write-notion", action="store_true", help="Write the computed state to Wiki.<notion-property> (select). Auto-creates the property with {draft,review_required,validated,ready} options if missing.")
     quality_parser.add_argument("--notion-property", default="Quality", help="Target select property name (default: Quality)")
+    quality_parser.add_argument("--reference-page-id", help="Wiki page id to use as reference for ready upgrade; when the page would be 'validated', runs reference-check; if conform=green → 'ready'. If omitted, mapping.reference_page_id is used; if still absent, ready never triggers (stays validated).")
 
     autofill_parser = subparsers.add_parser(
         "autofill-missing-sections",
@@ -6072,6 +6477,12 @@ def build_parser() -> argparse.ArgumentParser:
     autofill_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="Generator provider for the new section body (default: kimi)")
     autofill_parser.add_argument("--no-judge", action="store_true", help="Skip fill/skip judge; fill every missing required heading in priority order")
     autofill_parser.add_argument("--reader", choices=sorted(VALID_READERS), help="Reader profile for prompt composition; auto-inferred if omitted")
+
+    discover_parser = subparsers.add_parser(
+        "discover-related-concepts",
+        help="Phase 4a · deepseek-chat nominates related concept names from the page's content, resolves each to an existing Wiki page by title/aliases, and union-appends matches to Wiki.Related Pages. Non-matches are reported (not auto-created — use seed-related-pages for placeholders).",
+    )
+    discover_parser.add_argument("page_id", help="Wiki page id")
 
     pipeline_parser = subparsers.add_parser(
         "pipeline",
@@ -6182,6 +6593,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         return command_compute_quality_state(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "autofill-missing-sections":
         return command_autofill_missing_sections(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "discover-related-concepts":
+        return command_discover_related_concepts(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "pipeline":
         return command_pipeline(
             client,

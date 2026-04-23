@@ -41,8 +41,14 @@
 - **冲突证据**：`--emit-diff` 产出段落级 unified diff 作为 `差异分析 YYYY-MM-DD` block 追加
 - **LLM 自动化**：`pipeline` 子命令串起 compile → Kimi refine → DeepSeek validate → Gemini 仲裁（仅 FAIL 时）→ 定向重写 round 2；最多两轮 Kimi 写；`--reader` 自动推断 / 显式切换 agent|quant|general profile
 - **LLM 稳健性**：LLMClient 对 `IncompleteRead` / `URLError` / 5xx / JSON 解析失败自动 retry 最多 3 次（指数退避）；pipeline 入口 purge 前次 validator callout 避免跨轮堆积
+- **Judge · 减少人工**（r17-r18）：deepseek-chat 作为第 4 个 LLM 角色处理"原先人工"的判断。四个使用点：
+  - alias 命中判 `same_entity/different_entity/uncertain`（Phase 2）
+  - fuzzy 候选晋升 `same_entity → exact_match`（Phase 2b）
+  - yellow 缺段自动补写（Phase 3, `autofill-missing-sections`）
+  - 关联概念自动发现（Phase 4a, `discover-related-concepts`）
+- **状态机（r17-r18）**：`Lifecycle` (growing/stable/stale/conflicted) + `Quality` (draft/review_required/validated/ready) 由脚本 compute 并自动写入 Wiki select 属性；`ready` 通过 reference-check conform=green 自动升级（Phase 4b）
 - **体检与整理**：`check-editorial` / `reference-check` 给 green / yellow / red 分级；`consolidate-evidence` / `cleanup-wiki-page`（含 `--drop-validator-callouts`）做结构清理；`seed-related-pages` 建占位页
-- **概念网络**：`Related Pages` self-referencing relation（`link-pages`）+ 正文 page mention（`rewrite-section --mention-map`）双实现
+- **概念网络**：`Related Pages` self-referencing relation（`link-pages` / `discover-related-concepts` 自动 append）+ 正文 page mention（`rewrite-section --mention-map`）双实现
 
 能力细节（prompt style / JSON schema / editorial checklist / provider 抽象字段 / 落盘格式等）见下列二级文档：
 - `LLM_EXTRACTION_DESIGN.md`（LLM 层 prompt / provider / 校验协议）
