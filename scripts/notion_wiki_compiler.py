@@ -1529,6 +1529,7 @@ def upsert_note_to_wiki(
     fuzzy_candidate_ids = target["fuzzy_candidate_ids"]
 
     append_heading = args.append_heading or mapping.get("append_heading", "增量更新")
+    skip_note_append = bool(getattr(args, "skip_note_append", False))
     if exact_match:
         properties = build_properties(database, mapping, args)
         if args.increment_compounded_level:
@@ -1537,8 +1538,9 @@ def upsert_note_to_wiki(
                 current_number = exact_match.get("properties", {}).get(level_prop_name, {}).get("number") or 0
                 properties[level_prop_name] = {"number": current_number + 1}
         client.update_page(exact_match["id"], {"properties": properties})
-        blocks = build_append_blocks(args.note, append_heading, args.source_url)
-        client.append_block_children(exact_match["id"], blocks)
+        if not skip_note_append:
+            blocks = build_append_blocks(args.note, append_heading, args.source_url)
+            client.append_block_children(exact_match["id"], blocks)
         return {
             "action": "updated",
             "page_id": exact_match["id"],
@@ -1551,8 +1553,9 @@ def upsert_note_to_wiki(
     payload: Dict[str, Any] = {
         "parent": {"database_id": database_id},
         "properties": build_properties(database, mapping, args),
-        "children": build_append_blocks(args.note, append_heading, args.source_url),
     }
+    if not skip_note_append:
+        payload["children"] = build_append_blocks(args.note, append_heading, args.source_url)
     created = client.create_page(payload)
     return {
         "action": "created",
@@ -1746,6 +1749,11 @@ def compile_raw_page(
     source_prop_name = args.raw_source_url_property or mapping.get("raw_source_url_property")
     source_url = extract_property_text(raw_page, source_prop_name) if source_prop_name else None
 
+    # compile-from-raw no longer dumps raw body to wiki by default (option A,
+    # 2026-04-23). Raw material lives only on raw page; wiki holds refined
+    # content only; provenance via Wiki.Source relation + compile-log.jsonl.
+    # --append-raw-body-to-wiki flag opts back into the legacy behavior.
+    append_raw_body = bool(getattr(args, "append_raw_body_to_wiki", False))
     upsert_args = argparse.Namespace(
         title=title,
         note=note,
@@ -1763,6 +1771,7 @@ def compile_raw_page(
         last_compounded_at_property=args.last_compounded_at_property,
         strict_alias=getattr(args, "strict_alias", False),
         strict_fuzzy=getattr(args, "strict_fuzzy", False),
+        skip_note_append=not append_raw_body,
     )
 
     merge_mode = getattr(args, "merge_mode", "append")
@@ -5029,6 +5038,7 @@ def build_parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--raw-target-wiki-page-property")
     compile_parser.add_argument("--raw-compiled-status")
     compile_parser.add_argument("--force", action="store_true")
+    compile_parser.add_argument("--append-raw-body-to-wiki", action="store_true", help="Legacy: also append a 增量更新 block to wiki containing raw body (default off as of 2026-04-23; raw body stays on raw page, provenance via Wiki.Source + compile-log)")
     compile_parser.add_argument("--auto-refine", action="store_true")
     compile_parser.add_argument("--strict-alias", action="store_true")
     compile_parser.add_argument("--strict-fuzzy", action="store_true")
@@ -5058,6 +5068,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_parser.add_argument("--raw-target-wiki-page-property")
     queue_parser.add_argument("--raw-compiled-status")
     queue_parser.add_argument("--force", action="store_true")
+    queue_parser.add_argument("--append-raw-body-to-wiki", action="store_true", help="Legacy behavior for batch; see compile-from-raw --append-raw-body-to-wiki")
     queue_parser.add_argument("--auto-refine", action="store_true")
     queue_parser.add_argument("--strict-alias", action="store_true")
     queue_parser.add_argument("--strict-fuzzy", action="store_true")
