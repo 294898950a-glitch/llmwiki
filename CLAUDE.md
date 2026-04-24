@@ -1,6 +1,6 @@
 # LLM Wiki · Notion Wiki 运行蓝图
 
-> **Version**: 2026-04-23.r18
+> **Version**: 2026-04-24.r19
 > 每次实质性修改本文件需要 bump 版本号（日期.rN），并在 git 中提交。`DESIGN_REVIEW.md` 的评审锚点同时引用本版本号与对应 commit SHA。
 
 这是一个以 Notion Wiki 为主库的 LLM Wiki 系统。目标不是把资料归档成越来越多的文件，而是把新资料持续编译进已有知识对象，让知识密度随着时间增加。
@@ -233,9 +233,9 @@ llmwiki/
 
 **LLM API 立场（2026-04-23 `r15` 更新）**：进入模式 B 的**三 provider 自动化链路**，由 `pipeline` 子命令编排。
 - **Primary generator**（默认 `kimi` / `kimi-k2.6`）：通过 `llm-refine` / `llm-refine-page` 写入"有解读"内容
-- **Post-hoc validator**（默认 `deepseek` / `deepseek-reasoner`）：`llm-validate --annotate` 按 **6 项标准**评估（第 6 项：跨领域污染硬条件判 FAIL），callout 形式批注
+- **Post-hoc validator**（默认 `deepseek` / `deepseek-v4-pro`，r19 起；原 `deepseek-reasoner`）：`llm-validate --annotate` 按 **6 项标准**评估（第 6 项：跨领域污染硬条件判 FAIL），callout 形式批注
 - **Arbiter**（`gemini` / `gemini-2.5-flash`）：pipeline 中仅当 DeepSeek FAIL 时介入；判 DeepSeek 是否判对；若推翻则终结、若维持则触发 Kimi 定向重写被 uphold 的段
-- **Judge**（`deepseek-chat` 便宜分类器，r17 新增）：替代"简单 yes/no/分类"这类**原先人工**的判断。所有 judge 调用落 `raw/notion_dumps/YYYY-MM-DD-judge-log.jsonl`；`--no-judge` flag 一键关掉。当前使用点（r18 扩到 4 个）：
+- **Judge**（`deepseek-chat` 便宜分类器，默认 `deepseek-v4-flash`，r19 升级；r17 新增）：替代"简单 yes/no/分类"这类**原先人工**的判断。注意 v4-flash 默认开 reasoning_content，judge 调用 `max_tokens` 设 3000 给 reasoning + content 双预算。所有调用落 `raw/notion_dumps/YYYY-MM-DD-judge-log.jsonl`；`--no-judge` flag 一键关掉。当前使用点（r18 扩到 4 个）：
   1. **alias 匹配判断**（Phase 2）：`compile-from-raw` 遇 alias 命中时，judge 判 `same_entity` / `different_entity` / `uncertain`；`different_entity` + `confidence ≥ 0.6` 触发改走 new-page 路径
   2. **fuzzy 候选晋升**（Phase 2b, r18）：`compile-from-raw` 无 exact_match 但有 fuzzy 候选时，judge 对 top 3 逐一判定；`same_entity` + `confidence ≥ 0.7` 晋升为 exact_match（合并进入而非新建）
   3. **yellow 缺段补写**（Phase 3）：pipeline end 见 editorial=yellow 且有 missing_heading 时，judge 对每个缺失 heading 判 `fill` / `skip`；fill 后 Kimi 写新段并 append，页面常从 yellow 升到 green

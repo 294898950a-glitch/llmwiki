@@ -26,7 +26,7 @@ DEFAULT_DEEPSEEK_MODEL = "deepseek-reasoner"
 LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
     "deepseek": {
         "endpoint": "https://api.deepseek.com/v1/chat/completions",
-        "default_model": "deepseek-reasoner",
+        "default_model": "deepseek-v4-pro",
         "env_key": "DEEPSEEK_API_KEY",
         "env_key_file": "DEEPSEEK_API_KEY_FILE",
     },
@@ -44,11 +44,13 @@ LLM_PROVIDERS: Dict[str, Dict[str, str]] = {
         "env_key_file": "GEMINI_API_KEY_FILE",
     },
     # deepseek-chat provider: shares deepseek credentials but points at the
-    # fast chat model for judge-role calls (cheap + fast categorical judgments,
-    # not deep reasoning). See judge_chat() for usage.
+    # fast flash model for judge-role calls (cheap + fast categorical judgments).
+    # Note: deepseek-v4-flash DOES emit reasoning_content by default — judge
+    # callers must budget enough max_tokens that 'content' survives after
+    # reasoning is consumed. See judge_chat() for usage.
     "deepseek-chat": {
         "endpoint": "https://api.deepseek.com/v1/chat/completions",
-        "default_model": "deepseek-chat",
+        "default_model": "deepseek-v4-flash",
         "env_key": "DEEPSEEK_API_KEY",
         "env_key_file": "DEEPSEEK_API_KEY_FILE",
     },
@@ -5066,7 +5068,7 @@ def judge_chat(
     user_prompt: str,
     choices: Tuple[str, ...],
     context_tag: str = "",
-    max_tokens: int = 500,
+    max_tokens: int = 3000,
 ) -> Dict[str, Any]:
     """Cheap categorical LLM classifier (deepseek-chat).
 
@@ -5192,7 +5194,7 @@ def judge_fill_section(
         user_prompt,
         choices=("fill", "skip"),
         context_tag=f"fill_section:{wiki_page_id}:{missing_heading}",
-        max_tokens=400,
+        max_tokens=3000,
     )
 
 
@@ -5405,7 +5407,7 @@ def judge_concept_candidates(
 
     t0 = time.time()
     try:
-        response = client.chat(system=system_rules, user=user_prompt, max_tokens=600, temperature=0.2)
+        response = client.chat(system=system_rules, user=user_prompt, max_tokens=3500, temperature=0.2)
     except NotionError as exc:
         _append_judge_log({
             "timestamp": iso_now(),
@@ -5654,7 +5656,7 @@ def judge_fuzzy_match(
         user_prompt,
         choices=("same_entity", "different_entity", "uncertain"),
         context_tag=f"fuzzy_match:{wiki_page_id}",
-        max_tokens=500,
+        max_tokens=3000,
     )
 
 
@@ -5704,7 +5706,7 @@ def judge_alias_match(
         user_prompt,
         choices=("same_entity", "different_entity", "uncertain"),
         context_tag=f"alias_match:{wiki_page_id}",
-        max_tokens=500,
+        max_tokens=3000,
     )
 
 
