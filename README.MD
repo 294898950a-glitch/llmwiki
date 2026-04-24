@@ -29,8 +29,11 @@
 | 编译核心 | `compile-from-raw` · `compile-queue` · `upsert-note` |
 | 审计 / 留痕 | `log-session-event` · `lint` |
 | 结构体检与清理 | `check-editorial` · `consolidate-evidence` · `reference-check` · `cleanup-wiki-page` |
-| 概念网络 | `seed-related-pages` · `rewrite-section` · `link-pages` · `link-concepts-in-page` |
+| 概念网络 | `seed-related-pages` · `rewrite-section` · `link-pages` · `link-concepts-in-page` · `discover-related-concepts` |
 | LLM 层 | `llm-refine` · `llm-refine-page` · `llm-validate` |
+| 自动化全链路 | `pipeline` · `autofill-missing-sections` |
+| 决策队列 | `list-review-queue` · `resolve-decision` |
+| 状态机 | `compute-lifecycle-state` · `compute-quality-state` |
 
 ### 能力概览
 
@@ -39,7 +42,7 @@
 - **匹配分层**：`canonical_id` / `title` / `alias` / `fuzzy` 逐级降级；同策略多候选直接报错；`alias` / `fuzzy` 有 `--strict-*` 硬停
 - **merge 模式**：`--merge-mode {append,propose,replace}` 覆盖追加 / 预览 / 替换三种 compounding 路径
 - **冲突证据**：`--emit-diff` 产出段落级 unified diff 作为 `差异分析 YYYY-MM-DD` block 追加
-- **LLM 自动化**：`pipeline` 子命令串起 compile → Kimi refine → DeepSeek validate → Gemini 仲裁（仅 FAIL 时）→ 定向重写 round 2；最多两轮 Kimi 写；`--reader` 自动推断 / 显式切换 agent|quant|general profile
+- **LLM 自动化**（r19）：`pipeline` 子命令串起 compile → **v4-flash** refine → **Kimi** validate → **Gemini** 仲裁（仅 FAIL 时）→ 定向重写 round 2 → yellow 时 autofill 补段 → `compute-lifecycle-state` + `compute-quality-state` 写 Notion；最多两轮 v4-flash 写；`--reader` 自动推断 / 显式切换 agent|quant|general profile
 - **LLM + Notion 稳健性**（r16/r19）：LLMClient 和 NotionClient 都有 3 次指数退避 retry（2s/4s）；覆盖 `IncompleteRead` / `URLError` / 5xx / `TimeoutError` / JSON 解析失败；4xx fail fast；pipeline 入口 purge 前次 validator callout 避免跨轮堆积
 - **Judge · 减少人工**（r17-r19）：deepseek-v4-pro 作为第 4 个 LLM 角色处理"原先人工"的判断。四个使用点：
   - alias 命中判 `same_entity/different_entity/uncertain`（Phase 2）
@@ -64,10 +67,12 @@
 
 ## Live Examples
 
-两条已验证、不会漂移的真实引用；进行中的精修状态与占位页进度见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md) §1.1–§1.2。
+稳定引用 + r19 pipeline 实际运行过的 wiki 页（状态截至 2026-04-25）。进行中的精修状态与占位页进度见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md) §1.1–§1.2。
 
 - **Smoke test 闭环**：raw `3496e2cd-6e4f-81a2-988a-c9fd757c1b42` → wiki `3496e2cd-6e4f-816e-919b-fd80753dcc9b`，`raw → wiki → raw 回写` 闭环已验证
-- **QueryLoop 样板页**：wiki `3496e2cd-6e4f-81b2-b037-d76d653b9c1f`，用作 `reference-check` 的对标基准
+- **QueryLoop 样板页**：wiki `3496e2cd-6e4f-81b2-b037-d76d653b9c1f`，用作 `reference-check` 的对标基准；r19 pipeline 下 Quality=review_required（1 段仍被 Kimi validator 判 FAIL）
+- **Pop Mart（唯一 Quality=validated）**：wiki `3496e2cd-6e4f-8198-a9bc-dfaa19650dc6`，r19 pipeline `passed_round_1` · avg 8.5 · editorial green · Quality=validated
+- **量化入门 / 可转债强赎博弈**：走完 r19 双轮 pipeline，editorial green，Quality=review_required（Kimi validator 对"定义段"严格导致 fail_count=1）
 
 ## Known Limits
 
@@ -77,10 +82,12 @@
 2. **决策层仍偏弱**：`same-object / new-facet / distinct-object / ambiguous` 分流不够稳；高风险 merge / split / review 仍留在会话层。
 3. **深度整理依赖会话层**：脚本能给骨架 + 启发式段落 + LLM 单段 / 整页重写，但高质量永久笔记仍需会话层做取舍；Style J prompt 已固化，但候选选择 / 冲突解释 / 核心判断是否重写不下沉。
 4. **概念网络未进入自增长**：占位页需手动 `seed-related-pages` + 会话层精修；还没有稳定的"页派生页"机制。
-5. **validator 批注不自动改正文**：`llm-validate --annotate` 只留 callout，采信或驳回仍归会话层。
-6. **`check-editorial` 驱动的自动补段**：当前只评估不行动，缺段页面报 yellow / red，脚本尚无"按 check-editorial 缺口批量补骨架"能力。
+5. **validator 批注不自动改正文**：`llm-validate --annotate` 只留 callout；pipeline 里 validator FAIL 会走 Gemini 仲裁 + Kimi round 2，但独立调用 validate 仍是只留批注。
+6. ~~**`check-editorial` 驱动的自动补段**~~：**r18 Phase 3 已做**（`autofill-missing-sections` + pipeline 端 yellow 自动补；judge 判 fill/skip，Kimi 写新段，常能 yellow → green）。
 7. **基于 diff 的核心判断重写**：`--emit-diff` 只记录差异，摘要重写是会话层 editorial 决策，脚本不代做。
-8. **自动回滚缺失**：手工回滚见下文"幂等性与回滚"。
+8. **Kimi-as-validator 对"定义段"偏严**（r19 观察）：定义段容易被判"类比偏离职责 / 不够精炼"→ fail_count=1 卡住 Quality=validated。可接受（严格是 validator 的本分）或调 `LLM_VALIDATION_SYSTEM_PROMPT`"段职责"项放松。
+9. **Topic 字段仍由硬编码 topic map 识别**：非 agent / system 主题（如可转债、金融）会错分类为 Agent Runtime；Kimi 正文不受影响（reader profile 自动推断另走一套），但 Notion 端 Topic 属性显示奇怪。
+10. **自动回滚缺失**：手工回滚见下文"幂等性与回滚"。
 
 ## 幂等性与回滚
 
@@ -103,7 +110,15 @@
 - **Compounding → Reviewable**：decision log / evidence-preserving update / review queue
 - **Reviewable → Productized**：capture UI / review UI / task / job 状态流
 
-具体执行清单见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。当前最值得做的三件事（v15 建议）：把 QueryLoop 打成真正样板页 / 长出相邻页（QueryEngine · Context Governance · Recovery Logic）/ 把"更新已有知识对象"做稳。
+具体执行清单见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。
+
+**r17-r19 实际兑现**（较 v15 建议）：
+- v18 P0（review queue + decision object）已做 — `list-review-queue` / `resolve-decision` / `decisions.jsonl`
+- v18 P1（对象生命周期状态机）已做 — `compute-lifecycle-state` 写入 Wiki.Lifecycle
+- v18 P2（统一 quality state）已做 — `compute-quality-state` 写入 Wiki.Quality，`ready` 通过 reference-check 自动升级
+- 减少人工（r17-r18 Phase 2-4a + r19 角色洗牌）— 4 个 judge 使用点替代了 alias 确认 / fuzzy 合并决策 / 缺段补写 / 关联概念发现四类原来需会话层介入的判断
+
+**剩余最值得做**：QueryLoop / 量化入门 / 可转债 的 Kimi validator fail_count=1 根因分析（定义段的类比边界是否放松）；样板页精修到 `ready`（Pop Mart 已达 validated）；真实新 raw 的持续注入。
 
 ## 版本控制
 
