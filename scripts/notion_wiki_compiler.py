@@ -3659,8 +3659,18 @@ def command_llm_validate(
     annotated_blocks_count = 0
     if getattr(args, "annotate", False):
         callout_blocks: List[Dict[str, Any]] = []
+        # Brand-correct intro (r19: Kimi is validator, not DeepSeek).
+        # PROVIDER_DISPLAY_NAMES keeps the casing correct per brand;
+        # VALIDATOR_CALLOUT_MARKERS (cleanup side) already covers both
+        # "DeepSeek 校验" + "Kimi 校验" so detection still works on both.
+        provider_display = {
+            "deepseek": "DeepSeek",
+            "deepseek-chat": "DeepSeek",
+            "kimi": "Kimi",
+            "gemini": "Gemini",
+        }.get(validator_client.provider, validator_client.provider.capitalize())
         intro_text = (
-            f"DeepSeek 校验 · {today_iso_date()} · {validator_client.provider}/{validator_client.model}\n"
+            f"{provider_display} 校验 · {today_iso_date()} · {validator_client.provider}/{validator_client.model}\n"
             f"平均分 {avg_score}/10 · pass={pass_count}, fail={fail_count}, error={error_count}"
         )
         callout_blocks.append(
@@ -5864,7 +5874,7 @@ def _build_refine_page_args_for_pipeline(
         mention_map=None,
         link_style="link",
         preview=False,
-        max_tokens=16000,
+        max_tokens=32000,
         temperature=0.4,
         reader=reader,
     )
@@ -6401,7 +6411,7 @@ def build_parser() -> argparse.ArgumentParser:
     llm_page_parser.add_argument("--style-note", default="")
     llm_page_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek-chat", help="LLM provider for generation (default: deepseek-chat=v4-flash; r19 swap role)")
     llm_page_parser.add_argument("--model", default="", help="Model override; default uses provider's default_model")
-    llm_page_parser.add_argument("--max-tokens", type=int, default=16000)
+    llm_page_parser.add_argument("--max-tokens", type=int, default=32000)
     llm_page_parser.add_argument("--temperature", type=float, default=0.4)
     llm_page_parser.add_argument("--mention-map")
     llm_page_parser.add_argument("--link-style", choices=["mention", "link", "both"], default="link")
