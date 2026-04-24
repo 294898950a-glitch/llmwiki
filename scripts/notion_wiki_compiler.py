@@ -3658,10 +3658,8 @@ def command_llm_validate(
 
     annotated_blocks_count = 0
     if getattr(args, "annotate", False):
-        callout_blocks: List[Dict[str, Any]] = []
         # Brand-correct intro (r19: Kimi is validator, not DeepSeek).
-        # PROVIDER_DISPLAY_NAMES keeps the casing correct per brand;
-        # VALIDATOR_CALLOUT_MARKERS (cleanup side) already covers both
+        # VALIDATOR_CALLOUT_MARKERS (cleanup side) already covers
         # "DeepSeek 校验" + "Kimi 校验" so detection still works on both.
         provider_display = {
             "deepseek": "DeepSeek",
@@ -3673,16 +3671,21 @@ def command_llm_validate(
             f"{provider_display} 校验 · {today_iso_date()} · {validator_client.provider}/{validator_client.model}\n"
             f"平均分 {avg_score}/10 · pass={pass_count}, fail={fail_count}, error={error_count}"
         )
-        callout_blocks.append(
-            {
-                "object": "block",
-                "type": "callout",
-                "callout": {
-                    "icon": {"emoji": "🔍"},
-                    "rich_text": rich_text_value(intro_text),
-                },
-            }
-        )
+        intro_block = {
+            "object": "block",
+            "type": "callout",
+            "callout": {
+                "icon": {"emoji": "🔍"},
+                "rich_text": rich_text_value(intro_text),
+            },
+        }
+
+        # Build per-section callout + find its anchor position (last body block
+        # of that section, or the heading itself if body is empty). Co-locating
+        # each critique with its subject section means reader can see validator
+        # feedback right below the段 it references instead of scrolling to page
+        # end.
+        per_section: List[Tuple[Dict[str, Any], Optional[str]]] = []  # (block, anchor_id)
         for r in results:
             if r.get("error"):
                 text = f"[{r['heading']}] 校验失败：{r['error']}"
@@ -3691,28 +3694,48 @@ def command_llm_validate(
                 score = r.get("score", "?")
                 issues = " / ".join(r.get("issues") or [])
                 suggestion = r.get("suggestion") or ""
-                lines = [
-                    f"[{r['heading']}] · {status} · {score}/10",
-                ]
+                lines = [f"[{r['heading']}] · {status} · {score}/10"]
                 if issues:
                     lines.append(f"问题：{issues}")
                 if suggestion:
                     lines.append(f"建议：{suggestion}")
                 text = "\n".join(lines)
             emoji = "✅" if r.get("pass") else ("❌" if r.get("pass") is False else "⚠️")
-            callout_blocks.append(
-                {
-                    "object": "block",
-                    "type": "callout",
-                    "callout": {
-                        "icon": {"emoji": emoji},
-                        "rich_text": rich_text_value(text),
-                    },
-                }
-            )
+            section_callout = {
+                "object": "block",
+                "type": "callout",
+                "callout": {
+                    "icon": {"emoji": emoji},
+                    "rich_text": rich_text_value(text),
+                },
+            }
+            heading_block, section_body = find_section_body(top_blocks, r["heading"])
+            if heading_block is None:
+                anchor_id = None  # section not found — fall back to page-end append
+            elif section_body:
+                anchor_id = section_body[-1].get("id")
+            else:
+                anchor_id = heading_block.get("id")
+            per_section.append((section_callout, anchor_id))
+
         if not getattr(args, "dry_run", False):
-            notion_client.append_block_children(page_id, callout_blocks)
-        annotated_blocks_count = len(callout_blocks)
+            # Insert per-section callouts first (after each section's last body)
+            for block, anchor in per_section:
+                if anchor:
+                    try:
+                        notion_client.append_block_children(page_id, [block], after=anchor)
+                        annotated_blocks_count += 1
+                    except NotionError as exc:
+                        print(f"WARN: failed to insert per-section callout after {anchor}: {exc}", file=sys.stderr)
+                else:
+                    # Orphan (section not found on page) → append at end
+                    notion_client.append_block_children(page_id, [block])
+                    annotated_blocks_count += 1
+            # Overview callout goes to page end as summary anchor
+            notion_client.append_block_children(page_id, [intro_block])
+            annotated_blocks_count += 1
+        else:
+            annotated_blocks_count = 1 + len(per_section)
 
     payload = {
         "wiki_page_id": page_id,
