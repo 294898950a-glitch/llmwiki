@@ -90,14 +90,49 @@ class NotionClient:
         if payload is not None:
             body = json.dumps(payload).encode("utf-8")
         request = urllib.request.Request(url, data=body, method=method.upper(), headers=headers)
-        try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace")
-            raise NotionError(f"HTTP {exc.code} for {method} {path}: {detail}") from exc
-        except urllib.error.URLError as exc:
-            raise NotionError(f"Network error for {method} {path}: {exc}") from exc
+
+        # Retry on transient errors: socket timeout / URLError (DNS / TLS) /
+        # IncompleteRead / connection reset / 5xx / JSON decode. 4xx errors
+        # (auth / bad request / 404) fail fast — caller needs to see them.
+        # Matches the shape of LLMClient.chat() retry from r16.
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                with urllib.request.urlopen(request, timeout=60) as response:
+                    return json.loads(response.read().decode("utf-8"))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", errors="replace")
+                if 500 <= exc.code < 600 and attempt < max_attempts:
+                    print(
+                        f"WARN: Notion HTTP {exc.code} on {method} {path} (attempt {attempt}/{max_attempts}); "
+                        f"retrying in {attempt * 2}s",
+                        file=sys.stderr,
+                    )
+                    time.sleep(attempt * 2)
+                    continue
+                raise NotionError(f"HTTP {exc.code} for {method} {path}: {detail}") from exc
+            except (urllib.error.URLError, http.client.IncompleteRead, ConnectionError, TimeoutError) as exc:
+                if attempt < max_attempts:
+                    print(
+                        f"WARN: Notion transient error on {method} {path} (attempt {attempt}/{max_attempts}): "
+                        f"{exc}; retrying in {attempt * 2}s",
+                        file=sys.stderr,
+                    )
+                    time.sleep(attempt * 2)
+                    continue
+                raise NotionError(f"Network error for {method} {path} after {max_attempts} attempts: {exc}") from exc
+            except json.JSONDecodeError as exc:
+                if attempt < max_attempts:
+                    print(
+                        f"WARN: Notion JSON decode error on {method} {path} (attempt {attempt}/{max_attempts}); "
+                        f"retrying in {attempt * 2}s",
+                        file=sys.stderr,
+                    )
+                    time.sleep(attempt * 2)
+                    continue
+                raise NotionError(f"JSON decode failure for {method} {path} after {max_attempts} attempts: {exc}") from exc
+        # Unreachable: loop body always either returns or raises on the final attempt
+        raise NotionError(f"Notion request failed after {max_attempts} attempts: {method} {path}")
 
     def retrieve_database(self, database_id: str) -> Dict[str, Any]:
         return self.request("GET", f"databases/{database_id}")
