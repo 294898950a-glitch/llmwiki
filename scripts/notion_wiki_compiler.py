@@ -1112,27 +1112,50 @@ def merge_alias_values(*groups: str) -> str:
 
 
 def infer_topics(title: str, note: str) -> str:
-    haystack = normalize(f"{title}\n{note}")
+    """Assign a Topic label by keyword lookup.
+
+    Previously matched needle-as-substring across TITLE + NOTE body. That was
+    too aggressive: 可转债 raw (金融/量化 topic) got tagged 'Agent Runtime'
+    because some English noise word matched. Now we only match against TITLE
+    (keeps signal high), and for English needles require word boundaries so
+    "agent" doesn't match inside "management" etc. Chinese needles still do
+    substring (no word boundaries in CJK).
+
+    Result: if title doesn't obviously match, returns empty string instead of
+    a wrong label. Empty is better than misleading in the Notion Topic property.
+    """
+    title_norm = normalize(title)
     topic_map = [
+        ("queryloop", "Query Loop"),
         ("query loop", "Query Loop"),
         ("queryengine", "Query Engine"),
-        ("agent", "Agent Runtime"),
-        ("runtime", "Agent Runtime"),
-        ("state", "State Management"),
-        ("session", "State Management"),
-        ("tool_use", "Tool Orchestration"),
-        ("tool", "Tool Orchestration"),
+        ("query engine", "Query Engine"),
+        ("agent runtime", "Agent Runtime"),
+        ("state management", "State Management"),
+        ("session management", "State Management"),
+        ("tool orchestration", "Tool Orchestration"),
+        ("recovery logic", "Recovery Logic"),
         ("prompt-too-long", "Recovery Logic"),
         ("max-output", "Recovery Logic"),
         ("恢复", "Recovery Logic"),
-        ("context", "Context Governance"),
-        ("compact", "Context Governance"),
-        ("history snip", "Context Governance"),
+        ("context governance", "Context Governance"),
         ("中断", "Interrupt Handling"),
+        ("interrupt handling", "Interrupt Handling"),
     ]
     topics: List[str] = []
     for needle, label in topic_map:
-        if needle in haystack and label not in topics:
+        if not needle.strip():
+            continue
+        needle_norm = normalize(needle)
+        matched = False
+        # Whole-word match for English needles; substring for CJK (any non-ASCII).
+        if all(ord(c) < 128 for c in needle_norm):
+            if re.search(r"(?<![A-Za-z0-9])" + re.escape(needle_norm) + r"(?![A-Za-z0-9])", title_norm):
+                matched = True
+        else:
+            if needle_norm in title_norm:
+                matched = True
+        if matched and label not in topics:
             topics.append(label)
     return " / ".join(topics[:4])
 
@@ -6258,6 +6281,69 @@ def _run_and_append_editorial(
         stages.append({"stage": "quality_state", "state": quality["quality"], "notion_written": True})
     except NotionError as exc:
         stages.append({"stage": "quality_state", "error": str(exc)})
+
+    # Phase 4a auto-call: discover related concepts and append to Related Pages
+    # relation. Also insert page mentions inline in body blocks for matched
+    # concepts so readers can click through from content (not just from the
+    # properties sidebar). Fills the "跳转连接" gap — without this, pipeline
+    # produces pages whose Related Pages is always empty.
+    try:
+        discover = discover_related_concepts(client, env, wiki_database_id, mapping, wiki_page_id)
+        matched = discover.get("matched") or []
+        added = discover.get("added_to_related") or []
+        stages.append({
+            "stage": "discover_related_concepts",
+            "candidates_count": len(discover.get("candidates") or []),
+            "matched_count": len(matched),
+            "added_to_related_count": len(added),
+        })
+        # Insert inline mentions for each matched concept (so its name in body
+        # becomes a clickable page link). Idempotent: link-concepts logic skips
+        # blocks already containing a mention/link unless --force.
+        if matched:
+            mention_map = {m["resolved_title"]: m["resolved_page_id"] for m in matched if m.get("resolved_title") and m.get("resolved_page_id")}
+            if mention_map:
+                _inline_link_concepts(client, wiki_page_id, mention_map, link_style="link")
+                stages.append({"stage": "link_concepts_inline", "labels": sorted(mention_map.keys())})
+    except NotionError as exc:
+        stages.append({"stage": "discover_related_concepts", "error": str(exc)})
+
+
+def _inline_link_concepts(client: NotionClient, page_id: str, mention_map: Dict[str, str], link_style: str = "link") -> int:
+    """Reusable core of command_link_concepts_in_page: for each top-level
+    paragraph/heading/quote/list-item block on the page, if its text contains
+    any label from mention_map AND has no existing mention/link, replace the
+    plain text with rich_text containing page mentions/links for those labels.
+    Returns count of blocks touched. Skips silently on partial failures."""
+    linkable_block_types = {"paragraph", "heading_2", "heading_3", "quote", "bulleted_list_item", "numbered_list_item"}
+    top_blocks = iterate_block_children(client, page_id)
+    touched = 0
+    for block in top_blocks:
+        btype = block.get("type")
+        if btype not in linkable_block_types:
+            continue
+        rt = block.get(btype, {}).get("rich_text", []) or []
+        plain = rich_text_plain_text(rt)
+        if not plain:
+            continue
+        if not any(label in plain for label in mention_map):
+            continue
+        has_existing_link = any(
+            seg.get("type") == "mention" or (seg.get("type") == "text" and seg.get("text", {}).get("link"))
+            for seg in rt
+        )
+        if has_existing_link:
+            continue
+        new_rt = build_rich_text_with_mentions(plain, mention_map, link_style)
+        bid = block.get("id")
+        if not bid:
+            continue
+        try:
+            client.update_block(bid, {btype: {"rich_text": new_rt}})
+            touched += 1
+        except NotionError:
+            continue
+    return touched
 
 
 def _append_arbiter_callout(
