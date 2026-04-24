@@ -13,7 +13,7 @@
 
 1. **Notion I/O 层**：双库配置、schema 探测、数据库内查询、属性回写。
 2. **启发式编译层**：`compile-from-raw` / `compile-queue` / `--auto-refine` 的规则化"骨架 + 摘要 + 启发式正文"；匹配按 `Canonical ID → 标题 → Aliases` 逐级降级，冲突有 tier 3 / tier 4 门控。
-3. **LLM refine / validate 层**：Primary generator（默认 Kimi / `kimi-k2.6`）通过 `llm-refine` / `llm-refine-page` 写入"有解读"内容；Post-hoc validator（默认 DeepSeek / `deepseek-reasoner`）通过 `llm-validate --annotate` 以 callout 形式批注，不阻塞写入。
+3. **LLM 四角色层（r19 洗牌）**：Primary generator `deepseek-v4-flash` 写内容（`llm-refine` / `llm-refine-page` / autofill 补段）；Validator `kimi-k2.6` 事后校验（`llm-validate --annotate`，6 项标准含跨领域污染硬 FAIL）；Judge `deepseek-v4-pro` 做 yes/no/分类判断（alias 匹配 / fuzzy 晋升 / 缺段 fill-skip / 概念发现）；Arbiter `gemini-2.5-flash` 在 validator FAIL 时介入。所有 LLM + Notion 调用都有 3 次指数退避 retry。
 
 项目已越过"能不能写进去"，正在回答"写进去之后能不能形成持续复利的知识对象库"。单页质量、对象级 compounding、概念网络自增长仍在推进中，完整路线图见 [`V15_EXECUTION_PLAN.md`](./V15_EXECUTION_PLAN.md)。
 
@@ -40,8 +40,8 @@
 - **merge 模式**：`--merge-mode {append,propose,replace}` 覆盖追加 / 预览 / 替换三种 compounding 路径
 - **冲突证据**：`--emit-diff` 产出段落级 unified diff 作为 `差异分析 YYYY-MM-DD` block 追加
 - **LLM 自动化**：`pipeline` 子命令串起 compile → Kimi refine → DeepSeek validate → Gemini 仲裁（仅 FAIL 时）→ 定向重写 round 2；最多两轮 Kimi 写；`--reader` 自动推断 / 显式切换 agent|quant|general profile
-- **LLM 稳健性**：LLMClient 对 `IncompleteRead` / `URLError` / 5xx / JSON 解析失败自动 retry 最多 3 次（指数退避）；pipeline 入口 purge 前次 validator callout 避免跨轮堆积
-- **Judge · 减少人工**（r17-r18）：deepseek-chat 作为第 4 个 LLM 角色处理"原先人工"的判断。四个使用点：
+- **LLM + Notion 稳健性**（r16/r19）：LLMClient 和 NotionClient 都有 3 次指数退避 retry（2s/4s）；覆盖 `IncompleteRead` / `URLError` / 5xx / `TimeoutError` / JSON 解析失败；4xx fail fast；pipeline 入口 purge 前次 validator callout 避免跨轮堆积
+- **Judge · 减少人工**（r17-r19）：deepseek-v4-pro 作为第 4 个 LLM 角色处理"原先人工"的判断。四个使用点：
   - alias 命中判 `same_entity/different_entity/uncertain`（Phase 2）
   - fuzzy 候选晋升 `same_entity → exact_match`（Phase 2b）
   - yellow 缺段自动补写（Phase 3, `autofill-missing-sections`）
