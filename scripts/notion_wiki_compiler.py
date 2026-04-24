@@ -5092,7 +5092,7 @@ def judge_chat(
     )
 
     try:
-        client = build_llm_client(env, "deepseek-chat", None)
+        client = build_llm_client(env, "deepseek", None)
     except NotionError as exc:
         record = {
             "timestamp": iso_now(),
@@ -5206,7 +5206,7 @@ def autofill_missing_sections(
     wiki_page_id: str,
     reader: Optional[str] = None,
     no_judge: bool = False,
-    provider: str = "kimi",
+    provider: str = "deepseek-chat",
 ) -> Dict[str, Any]:
     """Phase 3 core: check editorial, pick missing required headings worth
     filling (via judge), append empty heading_2 blocks, then delegate content
@@ -5395,7 +5395,7 @@ def judge_concept_candidates(
         + ("从上面给出的已有 wiki 列表里挑选。" if existing_titles else "请列出值得链接为'关联概念'的其他术语名。")
     )
     try:
-        client = build_llm_client(env, "deepseek-chat", None)
+        client = build_llm_client(env, "deepseek", None)
     except NotionError as exc:
         _append_judge_log({
             "timestamp": iso_now(),
@@ -6155,7 +6155,7 @@ def _run_and_append_editorial(
                     wiki_page_id,
                     reader=reader,
                     no_judge=False,
-                    provider="kimi",
+                    provider="deepseek-chat",
                 )
                 stages.append({
                     "stage": "autofill_missing_sections",
@@ -6364,7 +6364,7 @@ def build_parser() -> argparse.ArgumentParser:
     llm_page_parser.add_argument("--source-page-id")
     llm_page_parser.add_argument("--style-from-page-id")
     llm_page_parser.add_argument("--style-note", default="")
-    llm_page_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="LLM provider for generation (default: kimi, with deepseek as validator)")
+    llm_page_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek-chat", help="LLM provider for generation (default: deepseek-chat=v4-flash; r19 swap role)")
     llm_page_parser.add_argument("--model", default="", help="Model override; default uses provider's default_model")
     llm_page_parser.add_argument("--max-tokens", type=int, default=16000)
     llm_page_parser.add_argument("--temperature", type=float, default=0.4)
@@ -6376,7 +6376,7 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser = subparsers.add_parser("llm-validate")
     validate_parser.add_argument("page_id")
     validate_parser.add_argument("--heading", default="", help="Validate single heading; omit for all registered sections")
-    validate_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek", help="Validator provider (default: deepseek)")
+    validate_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="Validator provider (default: kimi; r19 swap role)")
     validate_parser.add_argument("--model", default="")
     validate_parser.add_argument("--max-tokens", type=int, default=10000)
     validate_parser.add_argument("--annotate", action="store_true", help="Append callout blocks to the wiki page with validation results")
@@ -6389,7 +6389,7 @@ def build_parser() -> argparse.ArgumentParser:
     llm_parser.add_argument("--extra-instruction", default="", help="Optional extra instruction appended to the prompt")
     llm_parser.add_argument("--style-from-page-id", help="Wiki page id whose 定义 / 核心判断 / 关联概念 sections are fed as few-shot style samples")
     llm_parser.add_argument("--style-note", default="", help="Inline style guidance appended to system prompt (禁令 / 倾向 / 读者层次描述)")
-    llm_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="LLM provider for generation (default: kimi, with deepseek as validator)")
+    llm_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek-chat", help="LLM provider for generation (default: deepseek-chat=v4-flash; r19 swap role)")
     llm_parser.add_argument("--model", default="", help="Model override; default uses provider's default_model")
     llm_parser.add_argument("--max-tokens", type=int, default=10000)
     llm_parser.add_argument("--temperature", type=float, default=0.4)
@@ -6476,7 +6476,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Phase 3 · For a wiki page with editorial=yellow (missing required heading), decide via deepseek-chat judge whether the page has enough content to fill; if fill, append an empty heading_2 and delegate content generation to llm-refine-page (Kimi).",
     )
     autofill_parser.add_argument("page_id", help="Wiki page id")
-    autofill_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="Generator provider for the new section body (default: kimi)")
+    autofill_parser.add_argument("--provider", choices=sorted(LLM_PROVIDERS), default="deepseek-chat", help="Generator provider for the new section body (default: deepseek-chat=v4-flash; r19 swap role)")
     autofill_parser.add_argument("--no-judge", action="store_true", help="Skip fill/skip judge; fill every missing required heading in priority order")
     autofill_parser.add_argument("--reader", choices=sorted(VALID_READERS), help="Reader profile for prompt composition; auto-inferred if omitted")
 
@@ -6491,8 +6491,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="Full T1+T2 flow for one raw: compile-from-raw --auto-refine → llm-refine-page (Kimi) → llm-validate (DeepSeek, annotate) → Gemini arbiter on FAIL → Kimi round 2 if upheld → check-editorial. Max 2 Kimi rounds.",
     )
     pipeline_parser.add_argument("raw_page_id", help="Raw Inbox page id to compile")
-    pipeline_parser.add_argument("--refine-provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="Primary generator (default: kimi)")
-    pipeline_parser.add_argument("--validate-provider", choices=sorted(LLM_PROVIDERS), default="deepseek", help="Validator (default: deepseek)")
+    pipeline_parser.add_argument("--refine-provider", choices=sorted(LLM_PROVIDERS), default="deepseek-chat", help="Primary generator (default: deepseek-chat=v4-flash; r19 swap role)")
+    pipeline_parser.add_argument("--validate-provider", choices=sorted(LLM_PROVIDERS), default="kimi", help="Validator (default: kimi; r19 swap role)")
     pipeline_parser.add_argument("--force-refine", action="store_true", help="Even if compile returns skipped_unchanged/skipped_duplicate_body, continue into LLM refine (default: stop)")
     pipeline_parser.add_argument("--skip-refine", action="store_true", help="Skip llm-refine-page stage; go straight from compile to validate")
     pipeline_parser.add_argument("--skip-validate", action="store_true", help="Skip llm-validate + Gemini arbiter (only compile + optional refine)")
