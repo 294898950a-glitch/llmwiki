@@ -4859,6 +4859,26 @@ def find_latest_llm_validate_for_page(wiki_page_id: str, days: int = 30) -> Opti
     return candidates[0]
 
 
+def find_latest_pipeline_for_page(wiki_page_id: str, days: int = 30) -> Optional[Dict[str, Any]]:
+    """Scan recent audit-log for the most recent pipeline run whose wiki_page_id
+    matches. Used by compute_quality_state to detect Gemini override paths —
+    overall_status=passed_via_gemini_override is an effective pass even when
+    raw llm-validate fail_count is > 0."""
+    records = iter_recent_audit_records(days=days)
+    norm = normalize_notion_id(wiki_page_id)
+    candidates = []
+    for r in records:
+        if r.get("command") != "pipeline":
+            continue
+        if normalize_notion_id(r.get("wiki_page_id", "")) != norm:
+            continue
+        candidates.append(r)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda r: r.get("timestamp", ""), reverse=True)
+    return candidates[0]
+
+
 def find_recent_conflicts_for_page(wiki_page_id: str, days: int = 7) -> List[Dict[str, Any]]:
     """Compile records for this wiki page that emitted a diff (conflict signal)."""
     norm = normalize_notion_id(wiki_page_id)
@@ -4955,22 +4975,39 @@ def compute_quality_state(
     avg_score = latest_validate.get("avg_score") if latest_validate else None
     fail_count = latest_validate.get("fail_count") if latest_validate else None
 
+    # If a pipeline ran more recently and overall_status indicates a pass
+    # (including Gemini override), treat as effective pass — raw validate's
+    # fail_count alone misses the arbiter-override path.
+    latest_pipeline = find_latest_pipeline_for_page(wiki_page_id, days=30)
+    pipeline_overall = latest_pipeline.get("overall_status") if latest_pipeline else None
+    effective_pass_overall_statuses = {"passed_round_1", "passed_round_2", "passed_via_gemini_override"}
+    pipeline_latest_ts = latest_pipeline.get("timestamp") if latest_pipeline else ""
+    validate_latest_ts = latest_validate.get("timestamp") if latest_validate else ""
+    pipeline_supersedes = (
+        latest_pipeline is not None
+        and pipeline_latest_ts >= validate_latest_ts
+        and pipeline_overall in effective_pass_overall_statuses
+    )
+
     open_decisions = open_decisions_for_page(wiki_page_id)
 
     if compliance == "placeholder":
         state = "draft"
     elif compliance == "red":
         state = "draft"
-    elif latest_validate is None:
-        # editorial yellow/green but never validated
+    elif latest_validate is None and not pipeline_supersedes:
+        # editorial yellow/green but never validated or pipeline-passed
         state = "draft"
-    elif fail_count and fail_count > 0:
+    elif fail_count and fail_count > 0 and not pipeline_supersedes:
         state = "review_required"
     elif compliance == "yellow":
         state = "review_required"
     elif open_decisions:
         state = "review_required"
-    elif compliance == "green" and isinstance(avg_score, (int, float)) and avg_score >= 8:
+    elif compliance == "green" and (
+        (isinstance(avg_score, (int, float)) and avg_score >= 8)
+        or pipeline_supersedes
+    ):
         state = "validated"
     else:
         state = "review_required"
@@ -5000,6 +5037,8 @@ def compute_quality_state(
             "latest_validate_avg_score": avg_score,
             "latest_validate_fail_count": fail_count,
             "latest_validate_timestamp": latest_validate.get("timestamp") if latest_validate else None,
+            "latest_pipeline_overall": pipeline_overall,
+            "pipeline_supersedes_validate": pipeline_supersedes,
             "open_decisions_count": len(open_decisions),
             "reference_conformance": conformance,
         },
@@ -5709,6 +5748,32 @@ def discover_related_concepts(
                     "error": f"update_failed: {exc}",
                 }
 
+    # Notion's Related Pages relation here is NOT synced (`synced_from=none`),
+    # so A→B doesn't imply B→A. Script-side maintain symmetry: for EVERY match
+    # (not only this-run-added, since historical A→B may have been written
+    # without the reverse), write B→A if not yet present. Idempotent — skips
+    # partners that already have self_norm in their relation list.
+    symmetric_added: List[Dict[str, str]] = []
+    for m in matched:
+        pid = m.get("resolved_page_id", "")
+        if not pid:
+            continue
+        try:
+            partner_page = client.retrieve_page(pid)
+        except NotionError:
+            continue
+        partner_rel = partner_page.get("properties", {}).get(rel_prop, {}).get("relation", []) or []
+        partner_ids = {normalize_notion_id(r.get("id", "")): r.get("id") for r in partner_rel if r.get("id")}
+        if self_norm in partner_ids:
+            continue  # already symmetric
+        partner_ids[self_norm] = wiki_page_id
+        new_partner_relation = [{"id": rid} for rid in partner_ids.values()]
+        try:
+            client.update_page(pid, {"properties": {rel_prop: {"relation": new_partner_relation}}})
+            symmetric_added.append({"partner_id": pid, "added_self": wiki_page_id})
+        except NotionError:
+            continue
+
     return {
         "wiki_page_id": wiki_page_id,
         "topic_title": topic_title,
@@ -5716,6 +5781,7 @@ def discover_related_concepts(
         "matched": matched,
         "unmatched": unmatched,
         "added_to_related": added_to_related,
+        "symmetric_added": symmetric_added,
         "reasoning": judge_outcome.get("reasoning"),
     }
 
