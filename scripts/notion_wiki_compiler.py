@@ -1046,7 +1046,7 @@ def build_properties(database: Dict[str, Any], mapping: Dict[str, Any], args: ar
     if not title_name or title_name not in props_meta:
         raise NotionError("Unable to determine title property")
 
-    properties: Dict[str, Any] = {title_name: title_property_payload(args.title)}
+    properties: Dict[str, Any] = {title_name: title_property_payload(getattr(args, 'title', None))}
     optional_writes: List[Tuple[Optional[str], Any]] = [
         (args.canonical_id_property or mapping.get("canonical_id_property"), args.canonical_id),
         (args.verification_property or mapping.get("verification_property"), args.verification),
@@ -1451,7 +1451,7 @@ def find_upsert_target(
     mapping: Dict[str, Any],
     args: argparse.Namespace,
 ) -> Dict[str, Any]:
-    """Resolve which wiki page args.title / args.canonical_id should land on.
+    """Resolve which wiki page getattr(args, 'title', None) / args.canonical_id should land on.
 
     Returns a dict with exact_match, match_strategy, candidates,
     fuzzy_candidate_ids, title_prop / title_prop_type. Raises NotionError
@@ -1491,7 +1491,7 @@ def find_upsert_target(
         candidates = search_in_database(
             client,
             database_id,
-            args.title,
+            getattr(args, 'title', None),
             title_prop,
             title_prop_type,
             aliases_prop,
@@ -1502,7 +1502,7 @@ def find_upsert_target(
     for page in candidates:
         match_strategy = classify_page_match(
             page,
-            args.title,
+            getattr(args, 'title', None),
             title_prop,
             aliases_prop,
             args.canonical_id,
@@ -1550,7 +1550,7 @@ def find_upsert_target(
         fuzzy_candidates = find_fuzzy_candidates(
             client,
             database_id,
-            args.title,
+            getattr(args, 'title', None),
             title_prop,
             title_prop_type,
             exclude_page_ids=[p.get("id") for p, _ in matched_candidates],
@@ -1561,7 +1561,7 @@ def find_upsert_target(
                 f"{extract_title(p, title_prop)}<{p.get('id')}>" for p in fuzzy_candidates[:5]
             )
             raise NotionError(
-                f"No tier 1-3 match for {args.title!r} but {len(fuzzy_candidates)} fuzzy candidate(s) exist: "
+                f"No tier 1-3 match for {getattr(args, 'title', None)!r} but {len(fuzzy_candidates)} fuzzy candidate(s) exist: "
                 f"{preview}. Rerun without --strict-fuzzy after review or set Canonical ID/title first."
             )
         if fuzzy_candidates:
@@ -1664,6 +1664,7 @@ def upsert_note_to_wiki(
 
     append_heading = args.append_heading or mapping.get("append_heading", "增量更新")
     skip_note_append = bool(getattr(args, "skip_note_append", False))
+    unreachable_fallback = False
     if exact_match:
         properties = build_properties(database, mapping, args)
         if args.increment_compounded_level:
@@ -1671,18 +1672,34 @@ def upsert_note_to_wiki(
             if level_prop_name and level_prop_name in database.get("properties", {}):
                 current_number = exact_match.get("properties", {}).get(level_prop_name, {}).get("number") or 0
                 properties[level_prop_name] = {"number": current_number + 1}
-        client.update_page(exact_match["id"], {"properties": properties})
-        if not skip_note_append:
-            blocks = build_append_blocks(args.note, append_heading, args.source_url)
-            client.append_block_children(exact_match["id"], blocks)
-        return {
-            "action": "updated",
-            "page_id": exact_match["id"],
-            "title": args.title,
-            "match_strategy": match_strategy,
-            "candidate_count": len(candidates),
-            "review_required": match_strategy == "alias",
-        }
+        try:
+            client.update_page(exact_match["id"], {"properties": properties})
+            if not skip_note_append:
+                blocks = build_append_blocks(args.note, append_heading, args.source_url)
+                client.append_block_children(exact_match["id"], blocks)
+            return {
+                "action": "updated",
+                "page_id": exact_match["id"],
+                "title": getattr(args, 'title', None),
+                "match_strategy": match_strategy,
+                "candidate_count": len(candidates),
+                "review_required": match_strategy == "alias",
+            }
+        except NotionError as exc:
+            # Graceful fallback: page shows up in DB listings (integration has
+            # DB-level access) but per-page access was revoked → 404. Can't
+            # update this page. Instead of failing the whole compile, fall
+            # through to create-new-page path. User can delete the orphan in
+            # Notion UI at their leisure.
+            if "HTTP 404" in str(exc):
+                print(
+                    f"WARN: target wiki page {exact_match.get('id')!r} is unreachable (integration 404); "
+                    f"creating a fresh wiki page instead. Delete the orphan in Notion UI when convenient.",
+                    file=sys.stderr,
+                )
+                unreachable_fallback = True
+            else:
+                raise
 
     payload: Dict[str, Any] = {
         "parent": {"database_id": database_id},
@@ -1692,12 +1709,13 @@ def upsert_note_to_wiki(
         payload["children"] = build_append_blocks(args.note, append_heading, args.source_url)
     created = client.create_page(payload)
     return {
-        "action": "created",
+        "action": "created_fallback_from_unreachable" if unreachable_fallback else "created",
         "page_id": created.get("id"),
-        "title": args.title,
-        "match_strategy": match_strategy,
+        "title": getattr(args, 'title', None),
+        "match_strategy": "unreachable_orphan_replaced" if unreachable_fallback else match_strategy,
         "candidate_count": len(candidates),
         "fuzzy_candidate_ids": fuzzy_candidate_ids,
+        "orphan_page_id": exact_match["id"] if unreachable_fallback and exact_match else None,
     }
 
 
@@ -1813,7 +1831,7 @@ def compile_raw_page(
     if not raw_title_property:
         raise NotionError("Unable to determine raw title property")
 
-    title = args.title or extract_title(raw_page, raw_title_property)
+    title = getattr(args, 'title', None) or extract_title(raw_page, raw_title_property)
     if not title:
         raise NotionError("Raw page title is empty; pass --title explicitly")
 
@@ -2303,7 +2321,7 @@ def command_upsert(client: NotionClient, database_id: str, mapping: Dict[str, An
                 "upsert-note",
                 {
                     "database_id": database_id,
-                    "title": args.title,
+                    "title": getattr(args, 'title', None),
                     "wiki": result,
                 },
             ),
