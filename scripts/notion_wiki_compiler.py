@@ -6800,6 +6800,14 @@ def build_parser() -> argparse.ArgumentParser:
     discover_parser.add_argument("--skip-placeholder", action="store_true", default=True, help="With --all, skip pages whose body starts with <placeholder> marker")
     discover_parser.add_argument("--include-placeholder", action="store_false", dest="skip_placeholder", help="With --all, also process placeholder pages")
 
+    take_all_parser = subparsers.add_parser(
+        "take-all",
+        help="Short alias for `discover-related-concepts --all`. Iterates every wiki page, finds / populates Related Pages, writes symmetric reverse edges.",
+    )
+    take_all_parser.add_argument("--limit", type=int, default=50, help="Cap processed page count (default 50)")
+    take_all_parser.add_argument("--skip-placeholder", action="store_true", default=True)
+    take_all_parser.add_argument("--include-placeholder", action="store_false", dest="skip_placeholder", help="Also process placeholder pages")
+
     pipeline_parser = subparsers.add_parser(
         "pipeline",
         help="Full T1+T2 flow for one raw: compile-from-raw --auto-refine → llm-refine-page (Kimi) → llm-validate (DeepSeek, annotate) → Gemini arbiter on FAIL → Kimi round 2 if upheld → check-editorial. Max 2 Kimi rounds.",
@@ -6910,6 +6918,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "autofill-missing-sections":
         return command_autofill_missing_sections(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "discover-related-concepts":
+        return command_discover_related_concepts(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "take-all":
+        # Alias: treat as discover-related-concepts --all
+        args.all = True
+        args.page_id = ""
         return command_discover_related_concepts(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "pipeline":
         return command_pipeline(
