@@ -1078,16 +1078,67 @@ def append_block_children_batched(
     return total
 
 
-def build_paragraph_blocks(text: str, max_len: int = 1800) -> List[Dict[str, Any]]:
+def _rich_text_for_chunk(
+    chunk: str, mention_map: Optional[Dict[str, str]], link_style: str
+) -> List[Dict[str, Any]]:
+    """Either pass-through plain rich_text or weave page mentions / links
+    into the chunk based on mention_map. Used by all block-builders below."""
+    if mention_map:
+        return build_rich_text_with_mentions(chunk, mention_map, link_style)
+    return rich_text_value(chunk)
+
+
+def build_paragraph_blocks(
+    text: str,
+    max_len: int = 1800,
+    mention_map: Optional[Dict[str, str]] = None,
+    link_style: str = "link",
+) -> List[Dict[str, Any]]:
     """Chunk arbitrary text by Notion's 2000-char rich_text limit and wrap
-    each chunk as a paragraph block. Shared helper for every place that
-    needs 'turn this string into Notion paragraph blocks' — build_append_blocks,
-    command_ingest_pdf, and various LLM-refine fall-through paths."""
+    each chunk as a paragraph block. Optional mention_map weaves page
+    mentions for matching labels."""
     return [
         {
             "object": "block",
             "type": "paragraph",
-            "paragraph": {"rich_text": rich_text_value(chunk)},
+            "paragraph": {"rich_text": _rich_text_for_chunk(chunk, mention_map, link_style)},
+        }
+        for chunk in chunk_text(text, max_len=max_len)
+    ]
+
+
+def build_bullet_blocks(
+    text: str,
+    max_len: int = 1800,
+    mention_map: Optional[Dict[str, str]] = None,
+    link_style: str = "link",
+) -> List[Dict[str, Any]]:
+    """Same shape as build_paragraph_blocks but emits bulleted_list_item.
+    Used by llm-refine list-mode sections (关键机制 / 实现信号) and rewrite-section."""
+    return [
+        {
+            "object": "block",
+            "type": "bulleted_list_item",
+            "bulleted_list_item": {
+                "rich_text": _rich_text_for_chunk(chunk, mention_map, link_style)
+            },
+        }
+        for chunk in chunk_text(text, max_len=max_len)
+    ]
+
+
+def build_code_blocks(
+    text: str,
+    language: str = "plain text",
+    max_len: int = 1800,
+) -> List[Dict[str, Any]]:
+    """Chunk text into code blocks of the given language. Used by --emit-diff
+    when appending unified-diff '差异分析' sections."""
+    return [
+        {
+            "object": "block",
+            "type": "code",
+            "code": {"rich_text": rich_text_value(chunk), "language": language},
         }
         for chunk in chunk_text(text, max_len=max_len)
     ]
@@ -2010,15 +2061,7 @@ def compile_raw_page(
                 deleted_ids.append(bid)
             except NotionError as exc:
                 print(f"WARN: failed to delete block {bid}: {exc}", file=sys.stderr)
-        new_blocks: List[Dict[str, Any]] = []
-        for chunk in chunk_text(note):
-            new_blocks.append(
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": rich_text_value(chunk)},
-                }
-            )
+        new_blocks: List[Dict[str, Any]] = build_paragraph_blocks(note)
         if source_url:
             new_blocks.append(
                 {
@@ -2231,14 +2274,7 @@ def compile_raw_page(
                         "heading_3": {"rich_text": rich_text_value(f"差异分析 {today_iso_date()}")},
                     }
                 ]
-                for chunk in chunk_text(diff_text):
-                    diff_blocks.append(
-                        {
-                            "object": "block",
-                            "type": "code",
-                            "code": {"rich_text": rich_text_value(chunk), "language": "plain text"},
-                        }
-                    )
+                diff_blocks.extend(build_code_blocks(diff_text, language="plain text"))
                 client.append_block_children(wiki_result["page_id"], diff_blocks)
                 diff_appended = True
         else:
@@ -3320,19 +3356,7 @@ def command_llm_refine(
     if list_items:
         render_mode = "bulleted_list_item"
         for item in list_items:
-            for chunk in chunk_text(item):
-                rich = (
-                    build_rich_text_with_mentions(chunk, mention_map, link_style)
-                    if mention_map
-                    else rich_text_value(chunk)
-                )
-                new_blocks.append(
-                    {
-                        "object": "block",
-                        "type": "bulleted_list_item",
-                        "bulleted_list_item": {"rich_text": rich},
-                    }
-                )
+            new_blocks.extend(build_bullet_blocks(item, mention_map=mention_map, link_style=link_style))
     else:
         if list_spec:
             print(
@@ -3343,19 +3367,7 @@ def command_llm_refine(
         if not paragraphs:
             paragraphs = [new_body]
         for para in paragraphs:
-            for chunk in chunk_text(para):
-                rich = (
-                    build_rich_text_with_mentions(chunk, mention_map, link_style)
-                    if mention_map
-                    else rich_text_value(chunk)
-                )
-                new_blocks.append(
-                    {
-                        "object": "block",
-                        "type": "paragraph",
-                        "paragraph": {"rich_text": rich},
-                    }
-                )
+            new_blocks.extend(build_paragraph_blocks(para, mention_map=mention_map, link_style=link_style))
     if new_blocks:
         notion_client.append_block_children(page_id, new_blocks, after=heading_block["id"])
 
@@ -3583,38 +3595,14 @@ def command_llm_refine_page(
             for item in section_rewrite["items"]:
                 if not isinstance(item, str) or not item.strip():
                     continue
-                for chunk in chunk_text(item.strip()):
-                    rich = (
-                        build_rich_text_with_mentions(chunk, mention_map, link_style)
-                        if mention_map
-                        else rich_text_value(chunk)
-                    )
-                    new_blocks.append(
-                        {
-                            "object": "block",
-                            "type": "bulleted_list_item",
-                            "bulleted_list_item": {"rich_text": rich},
-                        }
-                    )
+                new_blocks.extend(build_bullet_blocks(item.strip(), mention_map=mention_map, link_style=link_style))
         elif "content" in section_rewrite and isinstance(section_rewrite["content"], str):
             content_text = section_rewrite["content"]
             paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content_text) if p.strip()]
             if not paragraphs:
                 paragraphs = [content_text]
             for para in paragraphs:
-                for chunk in chunk_text(para):
-                    rich = (
-                        build_rich_text_with_mentions(chunk, mention_map, link_style)
-                        if mention_map
-                        else rich_text_value(chunk)
-                    )
-                    new_blocks.append(
-                        {
-                            "object": "block",
-                            "type": "paragraph",
-                            "paragraph": {"rich_text": rich},
-                        }
-                    )
+                new_blocks.extend(build_paragraph_blocks(para, mention_map=mention_map, link_style=link_style))
         else:
             print(f"WARN: section {s!r} rewrite has neither items nor content", file=sys.stderr)
             continue
@@ -4009,19 +3997,7 @@ def command_rewrite_section(client: NotionClient, args: argparse.Namespace) -> i
     if not paragraphs:
         paragraphs = [body]
     for para in paragraphs:
-        for chunk in chunk_text(para):
-            rich = (
-                build_rich_text_with_mentions(chunk, mention_map, link_style)
-                if mention_map
-                else rich_text_value(chunk)
-            )
-            new_blocks.append(
-                {
-                    "object": "block",
-                    "type": "paragraph",
-                    "paragraph": {"rich_text": rich},
-                }
-            )
+        new_blocks.extend(build_paragraph_blocks(para, mention_map=mention_map, link_style=link_style))
     if not dry_run:
         client.append_block_children(page_id, new_blocks, after=heading_block["id"])
 
