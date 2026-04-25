@@ -5624,7 +5624,21 @@ def discover_related_concepts(
 
     # Read topic + body for the judge
     database = client.retrieve_database(wiki_database_id)
-    page = client.retrieve_page(wiki_page_id)
+    try:
+        page = client.retrieve_page(wiki_page_id)
+    except NotionError as exc:
+        # e.g. 404 — the integration can see the DB listing but was never shared
+        # with this page. Return a no-op payload so `--all` batches can skip it.
+        return {
+            "wiki_page_id": wiki_page_id,
+            "topic_title": "",
+            "candidates": [],
+            "matched": [],
+            "unmatched": [],
+            "added_to_related": [],
+            "symmetric_added": [],
+            "error": f"retrieve_page_failed: {exc}",
+        }
     title_prop = mapping.get("title_property") or detect_title_property(database) or "Name"
     topic_title = extract_title(page, title_prop) if title_prop else ""
     try:
@@ -5793,6 +5807,50 @@ def command_discover_related_concepts(
     mapping: Dict[str, Any],
     args: argparse.Namespace,
 ) -> int:
+    if getattr(args, "all", False):
+        pages = query_database_pages(client, wiki_database_id, None, page_size=50, max_pages=5)
+        if args.limit:
+            pages = pages[: args.limit]
+        results: List[Dict[str, Any]] = []
+        skipped: List[Dict[str, Any]] = []
+        title_prop = mapping.get("title_property") or detect_title_property(client.retrieve_database(wiki_database_id)) or "Name"
+        for p in pages:
+            pid = p.get("id", "")
+            if not pid:
+                continue
+            # Skip placeholder pages — judge on their empty bodies produces noise
+            if getattr(args, "skip_placeholder", True):
+                try:
+                    body_text = read_page_body_text(client, pid)
+                except NotionError:
+                    body_text = ""
+                if is_placeholder_page(body_text):
+                    skipped.append({"wiki_page_id": pid, "title": extract_title(p, title_prop) if title_prop else "", "reason": "placeholder"})
+                    continue
+            r = discover_related_concepts(client, env, wiki_database_id, mapping, pid)
+            results.append({
+                "wiki_page_id": pid,
+                "topic_title": r.get("topic_title"),
+                "matched_count": len(r.get("matched") or []),
+                "added_to_related_count": len(r.get("added_to_related") or []),
+                "symmetric_added_count": len(r.get("symmetric_added") or []),
+                "error": r.get("error"),
+            })
+        summary = {
+            "scope": "all",
+            "processed": len(results),
+            "skipped": len(skipped),
+            "total_added": sum(r["added_to_related_count"] for r in results),
+            "total_symmetric": sum(r["symmetric_added_count"] for r in results),
+            "errors": [r for r in results if r.get("error")],
+            "results": results,
+            "skipped_details": skipped,
+        }
+        print(json.dumps(audit_success("discover-related-concepts", summary), ensure_ascii=False, indent=2))
+        return 0
+
+    if not args.page_id:
+        raise NotionError("discover-related-concepts requires either <page_id> or --all")
     payload = discover_related_concepts(client, env, wiki_database_id, mapping, args.page_id)
     print(json.dumps(audit_success("discover-related-concepts", payload), ensure_ascii=False, indent=2))
     return 0
@@ -6734,9 +6792,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     discover_parser = subparsers.add_parser(
         "discover-related-concepts",
-        help="Phase 4a · deepseek-chat nominates related concept names from the page's content, resolves each to an existing Wiki page by title/aliases, and union-appends matches to Wiki.Related Pages. Non-matches are reported (not auto-created — use seed-related-pages for placeholders).",
+        help="Phase 4a · deepseek-v4-pro nominates related concept names from the page's content, resolves each to an existing Wiki page by title/aliases, and union-appends matches to Wiki.Related Pages (with symmetric B→A writeback). Non-matches are reported (not auto-created — use seed-related-pages for placeholders). Tolerates per-page 404 (integration not shared with target page).",
     )
-    discover_parser.add_argument("page_id", help="Wiki page id")
+    discover_parser.add_argument("page_id", nargs="?", default="", help="Wiki page id; omit when using --all")
+    discover_parser.add_argument("--all", action="store_true", help="Iterate every page in the Wiki database (skips placeholders by default)")
+    discover_parser.add_argument("--limit", type=int, default=50, help="With --all, cap processed page count")
+    discover_parser.add_argument("--skip-placeholder", action="store_true", default=True, help="With --all, skip pages whose body starts with <placeholder> marker")
+    discover_parser.add_argument("--include-placeholder", action="store_false", dest="skip_placeholder", help="With --all, also process placeholder pages")
 
     pipeline_parser = subparsers.add_parser(
         "pipeline",
