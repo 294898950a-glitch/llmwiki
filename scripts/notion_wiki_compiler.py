@@ -102,6 +102,23 @@ class NotionClient:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
+                # 429 rate limit — Notion emits this when we exceed ~3 rps.
+                # Respect Retry-After header if present; otherwise exp backoff.
+                if exc.code == 429 and attempt < max_attempts:
+                    retry_after_raw = ""
+                    if exc.headers:
+                        retry_after_raw = exc.headers.get("Retry-After", "") or ""
+                    try:
+                        retry_after = max(1, int(float(retry_after_raw))) if retry_after_raw else attempt * 2
+                    except (ValueError, TypeError):
+                        retry_after = attempt * 2
+                    print(
+                        f"WARN: Notion 429 rate limit on {method} {path} "
+                        f"(attempt {attempt}/{max_attempts}); retry-after={retry_after}s",
+                        file=sys.stderr,
+                    )
+                    time.sleep(retry_after)
+                    continue
                 if 500 <= exc.code < 600 and attempt < max_attempts:
                     print(
                         f"WARN: Notion HTTP {exc.code} on {method} {path} (attempt {attempt}/{max_attempts}); "
@@ -231,6 +248,21 @@ class LLMClient:
                     return json.loads(response.read().decode("utf-8"))
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
+                # 429 rate limit — respect Retry-After header from provider
+                if exc.code == 429 and attempt < max_attempts:
+                    retry_after_raw = ""
+                    if exc.headers:
+                        retry_after_raw = exc.headers.get("Retry-After", "") or ""
+                    try:
+                        retry_after = max(1, int(float(retry_after_raw))) if retry_after_raw else attempt * 3
+                    except (ValueError, TypeError):
+                        retry_after = attempt * 3
+                    print(
+                        f"WARN: {self.provider} 429 rate limit (attempt {attempt}/{max_attempts}); retry-after={retry_after}s",
+                        file=sys.stderr,
+                    )
+                    time.sleep(retry_after)
+                    continue
                 # Only retry on 5xx; surface 4xx immediately
                 if 500 <= exc.code < 600 and attempt < max_attempts:
                     last_exc = NotionError(f"{self.provider} HTTP {exc.code} (attempt {attempt}/{max_attempts}): {detail[:300]}")
