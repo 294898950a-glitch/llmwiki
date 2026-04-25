@@ -1063,6 +1063,36 @@ def build_properties(database: Dict[str, Any], mapping: Dict[str, Any], args: ar
     return properties
 
 
+def append_block_children_batched(
+    client: NotionClient, parent_id: str, children: List[Dict[str, Any]], batch_size: int = 100
+) -> int:
+    """Notion API caps append_block_children at 100 children per call.
+    Loop in batches; return total appended count. Order preserved."""
+    total = 0
+    i = 0
+    while i < len(children):
+        batch = children[i : i + batch_size]
+        client.append_block_children(parent_id, batch)
+        total += len(batch)
+        i += batch_size
+    return total
+
+
+def build_paragraph_blocks(text: str, max_len: int = 1800) -> List[Dict[str, Any]]:
+    """Chunk arbitrary text by Notion's 2000-char rich_text limit and wrap
+    each chunk as a paragraph block. Shared helper for every place that
+    needs 'turn this string into Notion paragraph blocks' — build_append_blocks,
+    command_ingest_pdf, and various LLM-refine fall-through paths."""
+    return [
+        {
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": rich_text_value(chunk)},
+        }
+        for chunk in chunk_text(text, max_len=max_len)
+    ]
+
+
 def build_append_blocks(note: str, heading: str, source_url: Optional[str]) -> List[Dict[str, Any]]:
     timestamp = iso_now()
     blocks: List[Dict[str, Any]] = [
@@ -1072,14 +1102,7 @@ def build_append_blocks(note: str, heading: str, source_url: Optional[str]) -> L
             "heading_2": {"rich_text": rich_text_value(f"{heading} {timestamp[:10]}")},
         }
     ]
-    for chunk in chunk_text(note):
-        blocks.append(
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": rich_text_value(chunk)},
-            }
-        )
+    blocks.extend(build_paragraph_blocks(note))
     if source_url:
         blocks.append(
             {
@@ -4286,33 +4309,19 @@ def command_ingest_pdf(
     if args.source_url and source_url_prop_name:
         properties[source_url_prop_name] = {"url": args.source_url}
 
-    children: List[Dict[str, Any]] = []
-    for chunk in chunk_text(full_text, max_len=1800):
-        children.append(
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": rich_text_value(chunk)},
-            }
-        )
+    children = build_paragraph_blocks(full_text, max_len=1800)
 
-    # Notion API caps create_page children at 100; rest gets append'd in batches.
-    first_chunk = children[:100]
-    remaining = children[100:]
+    # Notion API caps create_page children at 100; the rest gets append'd in
+    # batches via the shared helper.
     created = client.create_page(
         {
             "parent": {"database_id": raw_database_id},
             "properties": properties,
-            "children": first_chunk,
+            "children": children[:100],
         }
     )
     new_id = created.get("id", "")
-    appended_batches = 0
-    while remaining:
-        batch = remaining[:100]
-        remaining = remaining[100:]
-        client.append_block_children(new_id, batch)
-        appended_batches += 1
+    extra_appended = append_block_children_batched(client, new_id, children[100:])
 
     payload = {
         "raw_page_id": new_id,
@@ -4321,7 +4330,7 @@ def command_ingest_pdf(
         "pages_in_pdf": len(reader.pages),
         "extracted_chars": len(full_text),
         "block_count": len(children),
-        "extra_append_batches": appended_batches,
+        "extra_appended_blocks": extra_appended,
         "status_set_to": args.status if status_prop_name else "(no status property in DB)",
         "source_url": args.source_url or None,
     }
