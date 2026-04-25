@@ -2444,12 +2444,39 @@ def command_compile_queue(
     results: List[Dict[str, Any]] = []
     failures: List[Dict[str, Any]] = []
     queue_env = getattr(args, "_env", None)
+    use_pipeline = bool(getattr(args, "pipeline", False))
     for page_id in raw_page_ids:
         if not page_id:
             continue
         try:
-            payload = compile_raw_page(client, raw_database_id, wiki_database_id, mapping, args, page_id, env=queue_env)
-            results.append(finalize_compile_payload(payload))
+            if use_pipeline:
+                # Run the full pipeline (compile + LLM refine + validate +
+                # arbiter + autofill + state writes) per raw, instead of just
+                # compile. command_pipeline prints its own JSON; capture it so
+                # the queue's aggregate output stays single-payload.
+                pipe_args = argparse.Namespace(
+                    raw_page_id=page_id,
+                    refine_provider="deepseek-chat",
+                    validate_provider="kimi",
+                    force_refine=getattr(args, "force", False),
+                    skip_refine=False,
+                    skip_validate=False,
+                    reader=None,
+                    keep_prior_callouts=False,
+                )
+                payload, _exit = _capture_command_stdout_json(
+                    command_pipeline,
+                    client,
+                    queue_env,
+                    raw_database_id,
+                    wiki_database_id,
+                    mapping,
+                    pipe_args,
+                )
+                results.append(payload)
+            else:
+                payload = compile_raw_page(client, raw_database_id, wiki_database_id, mapping, args, page_id, env=queue_env)
+                results.append(finalize_compile_payload(payload))
         except Exception as exc:
             failures.append({"raw_page_id": page_id, "error": str(exc)})
 
@@ -6626,6 +6653,7 @@ def build_parser() -> argparse.ArgumentParser:
     queue_parser.add_argument("--force", action="store_true")
     queue_parser.add_argument("--append-raw-body-to-wiki", action="store_true", help="Legacy behavior for batch; see compile-from-raw --append-raw-body-to-wiki")
     queue_parser.add_argument("--no-judge", action="store_true", help="Disable deepseek-chat alias judge for batch; see compile-from-raw --no-judge")
+    queue_parser.add_argument("--pipeline", action="store_true", help="For each Not started raw, run the full pipeline (compile + Kimi/DeepSeek/Gemini LLM chain + autofill + state writes) instead of compile-only. Heavier but produces validated wiki pages in one batch.")
     queue_parser.add_argument("--auto-refine", action="store_true")
     queue_parser.add_argument("--strict-alias", action="store_true")
     queue_parser.add_argument("--strict-fuzzy", action="store_true")
