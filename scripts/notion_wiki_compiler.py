@@ -1069,12 +1069,10 @@ def append_block_children_batched(
     """Notion API caps append_block_children at 100 children per call.
     Loop in batches; return total appended count. Order preserved."""
     total = 0
-    i = 0
-    while i < len(children):
+    for i in range(0, len(children), batch_size):
         batch = children[i : i + batch_size]
         client.append_block_children(parent_id, batch)
         total += len(batch)
-        i += batch_size
     return total
 
 
@@ -4270,14 +4268,13 @@ def command_ingest_pdf(
     if not title:
         raise NotionError("--title is empty and PDF stem is empty; can't derive a title")
 
-    db = client.retrieve_database(raw_database_id)
-    status_prop_name: Optional[str] = None
-    source_url_prop_name: Optional[str] = None
-    for name, meta in db.get("properties", {}).items():
-        if meta.get("type") == "status" and status_prop_name is None:
-            status_prop_name = name
-        if meta.get("type") == "url" and source_url_prop_name is None:
-            source_url_prop_name = name
+    props_meta = client.retrieve_database(raw_database_id).get("properties", {})
+    status_prop_name = next(
+        (n for n, m in props_meta.items() if m.get("type") == "status"), None
+    )
+    source_url_prop_name = next(
+        (n for n, m in props_meta.items() if m.get("type") == "url"), None
+    )
 
     properties: Dict[str, Any] = {"Name": title_property_payload(title)}
     if status_prop_name:
@@ -4285,7 +4282,7 @@ def command_ingest_pdf(
     if args.source_url and source_url_prop_name:
         properties[source_url_prop_name] = {"url": args.source_url}
 
-    children = build_paragraph_blocks(full_text, max_len=1800)
+    children = build_paragraph_blocks(full_text)
 
     # Notion API caps create_page children at 100; the rest gets append'd in
     # batches via the shared helper.
