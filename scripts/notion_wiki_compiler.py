@@ -4236,6 +4236,99 @@ def build_placeholder_blocks(concept_label: str, source_title: str, source_page_
     ]
 
 
+def command_ingest_pdf(
+    client: NotionClient,
+    raw_database_id: str,
+    args: argparse.Namespace,
+) -> int:
+    """Read a local PDF, push its text as a Notion raw page (Status=Not started).
+    Designed to be a one-shot ingestion entry: user puts PDF on disk, runs
+    `ingest-pdf <path>`, the page lands in Raw Inbox. Hermes / take-all picks
+    it up next sweep and runs the full pipeline."""
+    pdf_path = Path(args.path).expanduser()
+    if not pdf_path.exists():
+        raise NotionError(f"PDF not found: {pdf_path}")
+
+    try:
+        import pypdf  # type: ignore
+    except ImportError:
+        raise NotionError(
+            "pypdf not installed. Run: pip3 install --user --break-system-packages pypdf"
+        )
+
+    reader = pypdf.PdfReader(str(pdf_path))
+    parts: List[str] = []
+    for p in reader.pages:
+        try:
+            parts.append(p.extract_text() or "")
+        except Exception as exc:
+            print(f"WARN: page extract failed: {exc}", file=sys.stderr)
+    full_text = "\n\n".join(part.strip() for part in parts if part.strip()).strip()
+    if not full_text:
+        raise NotionError(f"PDF yielded zero extractable text: {pdf_path}")
+
+    title = (args.title or pdf_path.stem).strip()
+    if not title:
+        raise NotionError("--title is empty and PDF stem is empty; can't derive a title")
+
+    db = client.retrieve_database(raw_database_id)
+    status_prop_name: Optional[str] = None
+    source_url_prop_name: Optional[str] = None
+    for name, meta in db.get("properties", {}).items():
+        if meta.get("type") == "status" and status_prop_name is None:
+            status_prop_name = name
+        if meta.get("type") == "url" and source_url_prop_name is None:
+            source_url_prop_name = name
+
+    properties: Dict[str, Any] = {"Name": title_property_payload(title)}
+    if status_prop_name:
+        properties[status_prop_name] = {"status": {"name": args.status}}
+    if args.source_url and source_url_prop_name:
+        properties[source_url_prop_name] = {"url": args.source_url}
+
+    children: List[Dict[str, Any]] = []
+    for chunk in chunk_text(full_text, max_len=1800):
+        children.append(
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": rich_text_value(chunk)},
+            }
+        )
+
+    # Notion API caps create_page children at 100; rest gets append'd in batches.
+    first_chunk = children[:100]
+    remaining = children[100:]
+    created = client.create_page(
+        {
+            "parent": {"database_id": raw_database_id},
+            "properties": properties,
+            "children": first_chunk,
+        }
+    )
+    new_id = created.get("id", "")
+    appended_batches = 0
+    while remaining:
+        batch = remaining[:100]
+        remaining = remaining[100:]
+        client.append_block_children(new_id, batch)
+        appended_batches += 1
+
+    payload = {
+        "raw_page_id": new_id,
+        "title": title,
+        "pdf_path": str(pdf_path),
+        "pages_in_pdf": len(reader.pages),
+        "extracted_chars": len(full_text),
+        "block_count": len(children),
+        "extra_append_batches": appended_batches,
+        "status_set_to": args.status if status_prop_name else "(no status property in DB)",
+        "source_url": args.source_url or None,
+    }
+    print(json.dumps(audit_success("ingest-pdf", payload), ensure_ascii=False, indent=2))
+    return 0
+
+
 def command_seed_related_pages(
     client: NotionClient,
     wiki_database_id: str,
@@ -6778,6 +6871,15 @@ def build_parser() -> argparse.ArgumentParser:
     reference_parser.add_argument("--all", action="store_true", help="Compare every page in the Wiki database (excluding reference itself)")
     reference_parser.add_argument("--limit", type=int, default=50)
 
+    ingest_parser = subparsers.add_parser(
+        "ingest-pdf",
+        help="Read a local PDF, extract its text, and create a new raw page in Raw Inbox with Status=Not started. Hermes / take-all will pipeline it on next sweep.",
+    )
+    ingest_parser.add_argument("path", help="Path to PDF file (absolute or relative)")
+    ingest_parser.add_argument("--title", default="", help="Override raw page title; defaults to PDF filename stem")
+    ingest_parser.add_argument("--status", default="Not started", help="Initial Status (default: 'Not started')")
+    ingest_parser.add_argument("--source-url", default="", help="Optional Source URL to set on the raw page")
+
     seed_parser = subparsers.add_parser("seed-related-pages")
     seed_parser.add_argument("source_page_id", help="Source wiki page whose inferred related concepts seed placeholder pages")
     seed_parser.add_argument("--dry-run", action="store_true", help="List would-be-created concepts without calling Notion create API")
@@ -6958,6 +7060,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if args.command == "reference-check":
         return command_reference_check(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+    if args.command == "ingest-pdf":
+        return command_ingest_pdf(client, require_env(env, "NOTION_RAW_INBOX_DB_ID"), args)
     if args.command == "seed-related-pages":
         return command_seed_related_pages(client, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "lint":
