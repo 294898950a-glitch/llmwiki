@@ -6852,11 +6852,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     take_all_parser = subparsers.add_parser(
         "take-all",
-        help="Short alias for `discover-related-concepts --all`. Iterates every wiki page, finds / populates Related Pages, writes symmetric reverse edges.",
+        help="One-shot end-to-end: (1) compile-queue --pipeline --status 'Not started' (all pending raws → full LLM chain) then (2) discover-related-concepts --all (refresh Related Pages + symmetric across the whole wiki). Skip stage with --skip-pipeline / --skip-discover.",
     )
-    take_all_parser.add_argument("--limit", type=int, default=50, help="Cap processed page count (default 50)")
+    take_all_parser.add_argument("--status", default="Not started", help="Raw Inbox status to filter for stage 1 (default: 'Not started')")
+    take_all_parser.add_argument("--raw-limit", type=int, default=20, help="Stage 1: max raws to process (default 20)")
+    take_all_parser.add_argument("--limit", type=int, default=50, help="Stage 2: max wiki pages to discover (default 50)")
     take_all_parser.add_argument("--skip-placeholder", action="store_true", default=True)
-    take_all_parser.add_argument("--include-placeholder", action="store_false", dest="skip_placeholder", help="Also process placeholder pages")
+    take_all_parser.add_argument("--include-placeholder", action="store_false", dest="skip_placeholder", help="Stage 2: also process placeholder pages")
+    take_all_parser.add_argument("--skip-pipeline", action="store_true", help="Skip stage 1 (only run discover sweep)")
+    take_all_parser.add_argument("--skip-discover", action="store_true", help="Skip stage 2 (only run pipeline batch)")
+    take_all_parser.add_argument("--force", action="store_true", help="Stage 1: --force-refine pass-through (re-pipeline even if body_hash unchanged)")
 
     pipeline_parser = subparsers.add_parser(
         "pipeline",
@@ -6970,10 +6975,64 @@ def main(argv: Optional[List[str]] = None) -> int:
     if args.command == "discover-related-concepts":
         return command_discover_related_concepts(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
     if args.command == "take-all":
-        # Alias: treat as discover-related-concepts --all
-        args.all = True
-        args.page_id = ""
-        return command_discover_related_concepts(client, env, require_env(env, "NOTION_WIKI_DB_ID"), mapping, args)
+        # End-to-end one-shot: pipeline-batch all pending raws THEN discover sweep
+        # all wiki pages. Either stage can be opted out via flag.
+        summary: Dict[str, Any] = {"stages": []}
+        wiki_db = require_env(env, "NOTION_WIKI_DB_ID")
+        raw_db = require_env(env, "NOTION_RAW_INBOX_DB_ID")
+
+        if not getattr(args, "skip_pipeline", False):
+            queue_args = argparse.Namespace(
+                status=args.status,
+                limit=args.raw_limit,
+                pipeline=True,
+                force=getattr(args, "force", False),
+                retry_failed=False,
+                filter=[],
+                # all the property override flags compile-queue normally accepts
+                canonical_id=None, verification=None, compounded_level=None,
+                last_compounded_at=None, append_heading=None,
+                increment_compounded_level=False,
+                title_property=None, canonical_id_property=None,
+                verification_property=None, compounded_level_property=None,
+                last_compounded_at_property=None, raw_title_property=None,
+                raw_source_url_property=None, raw_status_property=None,
+                raw_processed_at_property=None, raw_target_wiki_page_property=None,
+                raw_compiled_status=None,
+                auto_refine=False, strict_alias=False, strict_fuzzy=False,
+                emit_diff=False, append_raw_body_to_wiki=False, no_judge=False,
+                merge_mode="append", replace_heading=None,
+                _env=env,
+            )
+            try:
+                queue_payload, _ = _capture_command_stdout_json(
+                    command_compile_queue, client, raw_db, wiki_db, mapping, queue_args
+                )
+                summary["stages"].append({"stage": "pipeline_queue", "result": queue_payload})
+            except NotionError as exc:
+                summary["stages"].append({"stage": "pipeline_queue", "error": str(exc)})
+        else:
+            summary["stages"].append({"stage": "pipeline_queue", "skipped": True})
+
+        if not getattr(args, "skip_discover", False):
+            discover_args = argparse.Namespace(
+                page_id="",
+                all=True,
+                limit=args.limit,
+                skip_placeholder=getattr(args, "skip_placeholder", True),
+            )
+            try:
+                discover_payload, _ = _capture_command_stdout_json(
+                    command_discover_related_concepts, client, env, wiki_db, mapping, discover_args
+                )
+                summary["stages"].append({"stage": "discover_sweep", "result": discover_payload})
+            except NotionError as exc:
+                summary["stages"].append({"stage": "discover_sweep", "error": str(exc)})
+        else:
+            summary["stages"].append({"stage": "discover_sweep", "skipped": True})
+
+        print(json.dumps(audit_success("take-all", summary), ensure_ascii=False, indent=2))
+        return 0
     if args.command == "pipeline":
         return command_pipeline(
             client,
